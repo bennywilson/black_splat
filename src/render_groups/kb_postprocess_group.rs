@@ -11,6 +11,9 @@ pub struct KbPostprocessRenderGroup {
     pub uniform_bind_group: wgpu::BindGroup,
     pub bind_group: wgpu::BindGroup,
     pub postprocess_tex_handle: KbTextureHandle,
+    // Linear sampler used to read the scene color, so a sub-native render_scale
+    // upscales smoothly instead of point-sampling (blocky) onto the surface.
+    pub scene_sampler: wgpu::Sampler,
     // When true, the postprocess pass applies the ACES tonemap.
     pub tonemap_enabled: bool,
 }
@@ -148,6 +151,19 @@ impl KbPostprocessRenderGroup {
                 device_resources,
             )
             .await;
+        // Linear filtering so a sub-native render_scale upscales smoothly onto the
+        // surface.  Repeat address mode matches the filter texture's sampler so the
+        // scanline/warp effects keep wrapping as before.
+        let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         let postprocess_tex = asset_manager.get_texture(&postprocess_tex_handle);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &bind_group_layout,
@@ -158,7 +174,7 @@ impl KbPostprocessRenderGroup {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&postprocess_tex.sampler),
+                    resource: wgpu::BindingResource::Sampler(&scene_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -188,6 +204,7 @@ impl KbPostprocessRenderGroup {
             vertex_buffer,
             index_buffer,
             postprocess_tex_handle,
+            scene_sampler,
             tonemap_enabled: false,
         }
     }
@@ -321,7 +338,7 @@ impl KbPostprocessRenderGroup {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&postprocess_tex.sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,

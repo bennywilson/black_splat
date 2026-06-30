@@ -19,3 +19,10 @@ glob = "0.3"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4.42"
 web-sys =  { version = "0.3.69", features = [] }
+
+# Local fork of wgpu 0.20.1 that drops the `maxInterStageShaderComponents` limit
+# from requestDevice -- Chrome 129+ removed it from the WebGPU spec and rejects it,
+# which otherwise panics the web build at device creation.  This example is its own
+# workspace root, so the patch must be declared here (not just the engine's manifest).
+[patch.crates-io]
+wgpu = { path = "../../third_party/wgpu-0.20.1" }

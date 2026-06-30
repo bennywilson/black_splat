@@ -9,6 +9,10 @@ pub struct KbConfig {
     pub max_render_instances: u32,
     pub window_width: u32,
     pub window_height: u32,
+    // Offscreen scene render resolution as a fraction of the window size (1.0 =
+    // full res).  The window/surface stays at window_width x window_height; the
+    // scene renders into smaller targets and the postprocess pass upscales it.
+    pub render_scale: f32,
     pub fov: f32,
     pub foreground_fov: f32,
     pub graphics_backend: wgpu::Backends,
@@ -49,6 +53,9 @@ impl KbConfig {
 
         let json_val = json_file["window_height"].as_u32();
         let window_height: u32 = json_val.unwrap_or(720);
+
+        // Optional; clamp to a sane range so a typo can't make 0-sized targets.
+        let render_scale = json_file["render_scale"].as_f32().unwrap_or(1.0).clamp(0.1, 1.0);
 
         let graphics_backend = {
             #[cfg(target_arch = "wasm32")]
@@ -142,6 +149,7 @@ impl KbConfig {
             max_render_instances,
             window_width,
             window_height,
+            render_scale,
             fov: 75.0,
             foreground_fov: 50.0,
             graphics_backend,
@@ -160,6 +168,14 @@ impl KbConfig {
             start_position,
             start_rotation,
         }
+    }
+
+    /// Offscreen scene render resolution (window size * render_scale), clamped to
+    /// at least 1x1.  The window/surface stays at window_width x window_height.
+    pub fn render_resolution(&self) -> (u32, u32) {
+        let w = ((self.window_width as f32 * self.render_scale).round() as u32).max(1);
+        let h = ((self.window_height as f32 * self.render_scale).round() as u32).max(1);
+        (w, h)
     }
 
     pub fn update_frame_times(&mut self) {

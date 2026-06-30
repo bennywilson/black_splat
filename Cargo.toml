@@ -49,3 +49,10 @@ web-sys = { version = "0.3.69", features = [
 wasm_include_2d = [] # feature has no explicit dependencies
 wasm_include_3d = [] # feature has no explicit dependencies
 wasm_include_key = [] # feature has no explicit dependencies
+
+# Local fork of wgpu 0.20.1 that drops the `maxInterStageShaderComponents` limit
+# from requestDevice -- Chrome 129+ removed it from the WebGPU spec and rejects it,
+# which otherwise panics the web build at device creation.  See
+# third_party/wgpu-0.20.1/src/backend/webgpu.rs.
+[patch.crates-io]
+wgpu = { path = "third_party/wgpu-0.20.1" }

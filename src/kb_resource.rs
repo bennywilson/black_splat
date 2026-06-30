@@ -152,11 +152,13 @@ pub struct KbTexture {
 impl KbTexture {
     pub fn new_depth_texture(
         device: &Device,
-        surface_config: &SurfaceConfiguration,
+        _surface_config: &SurfaceConfiguration,
+        width: u32,
+        height: u32,
     ) -> Result<Self> {
         let size = wgpu::Extent3d {
-            width: surface_config.width,
-            height: surface_config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         };
         let desc = wgpu::TextureDescriptor {
@@ -194,12 +196,14 @@ impl KbTexture {
     pub fn new_render_texture(
         device: &Device,
         surface_config: &wgpu::SurfaceConfiguration,
+        width: u32,
+        height: u32,
     ) -> Result<Self> {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Target"),
             size: wgpu::Extent3d {
-                width: surface_config.width,
-                height: surface_config.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -426,12 +430,15 @@ impl<'a> KbDeviceResources<'a> {
         self.surface_config.height = game_config.window_height;
         self.surface.configure(&self.device, &self.surface_config);
 
+        // Offscreen scene targets render at render_scale; the postprocess pass
+        // upscales them onto the full-size surface.
+        let (rw, rh) = game_config.render_resolution();
         self.render_textures[0] =
-            KbTexture::new_render_texture(&self.device, &self.surface_config).unwrap();
+            KbTexture::new_render_texture(&self.device, &self.surface_config, rw, rh).unwrap();
         self.render_textures[1] =
-            KbTexture::new_depth_texture(&self.device, &self.surface_config).unwrap();
+            KbTexture::new_depth_texture(&self.device, &self.surface_config, rw, rh).unwrap();
         self.render_textures[2] =
-            KbTexture::new_render_texture(&self.device, &self.surface_config).unwrap();
+            KbTexture::new_render_texture(&self.device, &self.surface_config, rw, rh).unwrap();
     }
 
     pub async fn new(window: Arc<winit::window::Window>, game_config: &KbConfig) -> Self {
@@ -529,14 +536,19 @@ impl<'a> KbDeviceResources<'a> {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Offscreen scene targets render at render_scale; the postprocess pass
+        // upscales them onto the full-size surface.
+        let (rw, rh) = game_config.render_resolution();
         let mut render_textures = Vec::<KbTexture>::new();
-        let render_texture = KbTexture::new_render_texture(&device, &surface_config).unwrap();
+        let render_texture =
+            KbTexture::new_render_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(render_texture);
 
-        let depth_texture = KbTexture::new_depth_texture(&device, &surface_config).unwrap();
+        let depth_texture = KbTexture::new_depth_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(depth_texture);
 
-        let render_texture = KbTexture::new_render_texture(&device, &surface_config).unwrap();
+        let render_texture =
+            KbTexture::new_render_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(render_texture);
 
         log!("  Creating Font");

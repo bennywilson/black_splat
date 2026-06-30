@@ -380,7 +380,15 @@ impl KbModel {
         let mut hole_texture = None; //
         let mut tex_2_bind = wgpu::BindingResource::TextureView(&texture.view);
         if use_holes {
-            hole_texture = Some(KbTexture::new_render_texture(device, &surface_config).unwrap());
+            hole_texture = Some(
+                KbTexture::new_render_texture(
+                    device,
+                    &surface_config,
+                    surface_config.width,
+                    surface_config.height,
+                )
+                .unwrap(),
+            );
             tex_2_bind = wgpu::BindingResource::TextureView(&hole_texture.as_ref().unwrap().view);
         }
         let tex_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
