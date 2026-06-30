@@ -1,0 +1,15 @@
+{
+    "max_instances": 2000,
+
+    "window_width": 1280,
+    "window_height": 720,
+
+    "_comment": "Gaussian splatting needs shader storage buffers, so it requires the WebGPU backend (in the browser) or a native dx12/vulkan/metal backend.  'webgpu' selects the right thing on both.",
+    "graphics_back_end": "webgpu",
+
+    "_comment2": "Valid values for 'graphics_power_pref' are default, low, and high",
+    "graphics_power_pref": "high",
+
+    "_comment3": "Valid values for 'vsync' are true and false",
+    "vsync": true
+}

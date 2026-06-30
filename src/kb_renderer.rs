@@ -10,8 +10,8 @@ use crate::{
     kb_utils::*,
     log,
     render_groups::{
-        kb_bullet_hole_group::*, kb_line_group::*, kb_model_group::*, kb_postprocess_group::*,
-        kb_sprite_group::*, kb_sunbeam_group::*,
+        kb_bullet_hole_group::*, kb_gaussian_splat_group::*, kb_line_group::*, kb_model_group::*,
+        kb_postprocess_group::*, kb_sprite_group::*, kb_sunbeam_group::*,
     },
     PERF_SCOPE,
 };
@@ -27,6 +27,10 @@ pub struct KbRenderer<'a> {
     model_with_holes_render_group: KbModelRenderGroup,
     line_render_group: KbLineRenderGroup,
     sunbeam_render_group: KbSunbeamRenderGroup,
+    // Built lazily on first load_gaussian_splat() call: its pipeline binds storage
+    // buffers in the vertex stage, which WebGL2 can't do, so we must not create it
+    // for the GL-backed 2D/3D demos.
+    gaussian_splat_render_group: Option<KbGaussianSplatRenderGroup>,
 
     bullet_hole_render_group: KbBulletHoleRenderGroup,
     bullet_hole_actor_index: Option<u32>,
@@ -117,6 +121,7 @@ impl<'a> KbRenderer<'a> {
             postprocess_render_group,
             line_render_group,
             sunbeam_render_group,
+            gaussian_splat_render_group: None,
             custom_world_render_groups,
             custom_foreground_render_groups,
 
@@ -407,6 +412,13 @@ impl<'a> KbRenderer<'a> {
             );
         }
 
+        if let Some(splat_group) = &mut self.gaussian_splat_render_group {
+            if splat_group.has_model() {
+                PERF_SCOPE!("Gaussian Splats");
+                splat_group.render(&mut self.device_resources, &self.game_camera, game_config);
+            }
+        }
+
         if !self.actor_map.is_empty() {
             PERF_SCOPE!("Foreground Opaque");
             self.model_render_group.render(
@@ -588,6 +600,24 @@ impl<'a> KbRenderer<'a> {
         self.asset_manager
             .load_model(file_path, &mut self.device_resources, use_holes)
             .await
+    }
+
+    pub async fn load_gaussian_splat(&mut self, file_path: &str, params: &KbSplatParams) {
+        if self.gaussian_splat_render_group.is_none() {
+            self.gaussian_splat_render_group = Some(
+                KbGaussianSplatRenderGroup::new(&self.device_resources, &mut self.asset_manager)
+                    .await,
+            );
+        }
+        let splat_group = self.gaussian_splat_render_group.as_mut().unwrap();
+        splat_group.set_params(params);
+        splat_group.load(file_path, &self.device_resources).await;
+    }
+
+    pub fn set_gaussian_splat_params(&mut self, params: &KbSplatParams) {
+        if let Some(splat_group) = &mut self.gaussian_splat_render_group {
+            splat_group.set_params(params);
+        }
     }
 
     pub fn set_camera(&mut self, camera: &KbCamera) {

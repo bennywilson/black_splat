@@ -8,5 +8,5 @@ wasm-bindgen --target web --out-dir target/wasm32-unknown-unknown/release target
 if errorlevel 1 ( echo wasm-bindgen failed & pause & exit /b 1 )
 
 powershell cp index.html target/wasm32-unknown-unknown/release
-python3 -m http.server -d target/wasm32-unknown-unknown/release
+python3 ..\serve.py target/wasm32-unknown-unknown/release
 pause

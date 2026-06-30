@@ -50,7 +50,14 @@ impl KbConfig {
         let graphics_backend = {
             #[cfg(target_arch = "wasm32")]
             {
-                wgpu::Backends::GL
+                // WebGL2 can't bind storage buffers in shaders, which the gaussian
+                // splat path requires.  Honor an explicit "webgpu" request so that
+                // example can run in the browser; otherwise default to GL like before.
+                let json_val = json_file["graphics_back_end"].as_str();
+                match json_val {
+                    Some("webgpu") => wgpu::Backends::BROWSER_WEBGPU,
+                    _ => wgpu::Backends::GL,
+                }
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -59,12 +66,14 @@ impl KbConfig {
                 match json_val {
                     Some(val) => match val {
                         "dx12" => wgpu::Backends::DX12,
-                        "webgpu" => wgpu::Backends::BROWSER_WEBGPU,
+                        // No native "WebGPU" backend exists; use whatever primary
+                        // backend the platform offers (dx12/vulkan/metal).
+                        "webgpu" => wgpu::Backends::PRIMARY,
                         "vulkan" => wgpu::Backends::VULKAN,
                         "gl" => wgpu::Backends::GL,
                         _ => wgpu::Backends::all(),
                     },
-                    None => wgpu::Backends::BROWSER_WEBGPU,
+                    None => wgpu::Backends::PRIMARY,
                 }
             }
         };

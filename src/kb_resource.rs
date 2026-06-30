@@ -445,31 +445,55 @@ impl<'a> KbDeviceResources<'a> {
             .await
             .unwrap();
 
+        log!(
+            "  Adapter: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+
         log!("  Requesting Device");
-        let (device, queue) = adapter
+        // WebGL2 can't do shader storage buffers, so it gets the most restrictive
+        // limit set.  For every other backend (native + browser WebGPU) we request
+        // exactly what the adapter reports -- that can never fail a limit check, and
+        // it still gives the gaussian splat path the storage buffers it needs.
+        let required_limits = if game_config.graphics_backend == wgpu::Backends::GL {
+            wgpu::Limits::downlevel_webgl2_defaults()
+        } else {
+            adapter.limits()
+        };
+        let (device, queue) = match adapter
             .request_device(
                 &DeviceDescriptor {
                     required_features: wgpu::Features::empty(),
-                    // WebGL doesn't support all of wgpu's features
-                    required_limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
-                    } else {
-                        wgpu::Limits::default()
-                    },
+                    required_limits,
                     label: Some("Device Descriptor"),
                 },
                 None, // Trace path
             )
             .await
-            .unwrap();
+        {
+            Ok(dq) => dq,
+            Err(e) => {
+                log!("  request_device() FAILED: {e:?}");
+                panic!("request_device() failed: {e:?}");
+            }
+        };
 
         let surface_caps = surface.get_capabilities(&adapter);
+        // Prefer an sRGB format, but some WebGPU surfaces (e.g. Chrome's canvas)
+        // only expose a non-sRGB format -- fall back to whatever is offered.
         let surface_format = surface_caps
             .formats
             .iter()
             .copied()
             .find(|f| f.is_srgb())
-            .unwrap();
+            .unwrap_or_else(|| {
+                log!(
+                    "  No sRGB surface format; using {:?}",
+                    surface_caps.formats.first()
+                );
+                surface_caps.formats[0]
+            });
 
         let mut surface_config = surface
             .get_default_config(
@@ -477,7 +501,10 @@ impl<'a> KbDeviceResources<'a> {
                 game_config.window_width,
                 game_config.window_height,
             )
-            .unwrap();
+            .unwrap_or_else(|| {
+                log!("  get_default_config() returned None (surface/adapter mismatch)");
+                panic!("surface.get_default_config() returned None");
+            });
         surface_config.format = surface_format;
         surface.configure(&device, &surface_config);
 

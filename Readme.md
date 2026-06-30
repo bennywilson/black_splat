@@ -33,6 +33,20 @@ Run the examples from a command prompt:
 | 2D demo #1 | this directory | `cargo run` |
 | 2D demo #2 | `kbEngine3/Examples/2D/` | `cargo run` |
 | 3D demo #3 | `kbEngine3/Examples/3D/` | `cargo run` |
+| Gaussian splats | `kbEngine3/Examples/splat/` | `cargo run --release` |
+
+### Gaussian splat demo
+
+Renders a 3D Gaussian Splat point cloud (`.ply`) as view-aligned billboards with
+spherical-harmonic color. Because it binds storage buffers in the vertex shader,
+it needs the **WebGPU** backend in the browser (WebGL2 can't do this) or any
+native dx12/vulkan/metal backend — the bundled `game_config.txt` already requests
+`"graphics_back_end": "webgpu"`, which resolves correctly on both.
+
+Drop a standard 3DGS `point_cloud.ply` into
+`Examples/splat/game_assets/splats/` (see the README there), then `cargo run
+--release`, or run `build_wasm.bat` for the browser build. Fly with **WASD** and
+look with the **arrow keys**.
 
 To run a browser build:
 

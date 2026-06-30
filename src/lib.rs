@@ -16,6 +16,7 @@ pub mod kb_resource;
 pub mod kb_utils;
 pub mod render_groups {
     pub mod kb_bullet_hole_group;
+    pub mod kb_gaussian_splat_group;
     pub mod kb_line_group;
     pub mod kb_model_group;
     pub mod kb_postprocess_group;
