@@ -48,6 +48,16 @@ fn quat_axes(q_in: vec4<f32>) -> array<vec3<f32>, 3> {
     return axes;
 }
 
+// sRGB -> linear.  The SH-evaluated splat color is in sRGB/gamma space, but the
+// scene render target is an sRGB-format texture, so the GPU applies a linear->sRGB
+// encode on store.  Converting to linear here cancels that encode (so colors
+// aren't double-encoded / too bright) and lets alpha blending run in linear space.
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lower = c / 12.92;
+    let higher = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(higher, lower, c <= vec3<f32>(0.04045));
+}
+
 fn get_vertex_corner(corner_id: u32) -> vec2<f32> {
     var offsets = array<vec2<f32>, 6>(
         vec2<f32>(-1.0, -1.0),
@@ -117,7 +127,9 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
     let splat = g_splats[splat_id];
 
     let splat_pos = splat.position.xyz * overall_scale;
-    let axes = quat_axes(splat.rotation);
+    // `var` (not `let`): naga/Vulkan only permit dynamic indexing (axes[long_axis_idx]
+    // below) into a function-local variable, not into a value expression.
+    var axes = quat_axes(splat.rotation);
     let splat_scale = splat.scale_opacity.xyz;
 
     // Major/minor/intermediate axis selection.
@@ -159,7 +171,11 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
     let clip_pos = u.view_proj * vec4<f32>(world_pos, 1.0);
 
     output.position = clip_pos;
-    output.color = vec4<f32>(evaluate_sh(-cam_forward, splat), clamp(splat.scale_opacity.w, 0.0, 1.0) * 0.24);
+    // Global opacity multiplier. A sharp falloff shrinks the visible footprint,
+    // so the cloud reads more transparent -- raise this toward 1.0 for a solider
+    // look, lower it for a more ethereal one.
+    let opacity_scale = 0.85;
+    output.color = vec4<f32>(evaluate_sh(-cam_forward, splat), clamp(splat.scale_opacity.w, 0.0, 1.0) * opacity_scale);
     output.uv_and_scale = vec4<f32>(offset_x, offset_y, billboard_width, long_scale);
     return output;
 }
@@ -172,6 +188,14 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
     let r = uv * uv / (scale * scale);
     let falloff = exp(-sharpness * (r.x + r.y));
     let output_alpha = clamp(input.color.a * falloff, 0.0, 1.0);
-    let out_color = (((input.color.rgb * output_alpha) - 0.5) * u.splat_params.z) + 0.5;
+    // Contrast pivots around mid-gray (0.5): (x - 0.5) * contrast + 0.5.  Clamp to
+    // [0,1] and return the straight (non-premultiplied) color: the ALPHA_BLENDING
+    // pipeline already multiplies by src.a, so premultiplying here too would scale
+    // color by alpha squared (too dark) and push RGB negative in the falloff skirt
+    // (the black fringe at large scales).
+    let contrasted = clamp(((input.color.rgb - 0.5) * u.splat_params.z) + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Contrast pivots in gamma space (0.5 = mid-gray); convert to linear last so
+    // the sRGB render target's encode-on-store gives back the correct color.
+    let out_color = srgb_to_linear(contrasted);
     return vec4<f32>(out_color, output_alpha);
 }

@@ -34,7 +34,9 @@ var s_diffuse: sampler;
 var t_scene_color: texture_2d<f32>;
 
 struct PostProcessUniform {
-    time_mode_unused_unused: vec4<f32>,
+    // x: time, y: postprocess mode, z: 1.0 when surface is non-sRGB, w: tonemap
+    // operator (0 none, 1 Reinhard, 2 ACES).
+    time_mode_srgb_tonemap: vec4<f32>,
 };
 @group(1) @binding(0)
 var<uniform> postprocess_buffer: PostProcessUniform;
@@ -60,13 +62,29 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(higher, lower, c < vec3<f32>(0.0031308));
 }
 
+// Narkowicz 2015 ACES filmic approximation, applied to linear color before the
+// sRGB encode.  The five constants are the curve fit -- tweak them here to taste:
+//   a (shoulder steepness), b (toe lift), d/e/f (denominator: contrast & black).
+fn tonemap_aces(in_c: vec3<f32>) -> vec3<f32> {
+    // Exposure: the master brightness knob. >1.0 brightens, <1.0 darkens.
+    let exposure = 0.2f;
+    let c = in_c * exposure;
+
+    let a = 2.51;
+    let b = 0.03;
+    let d = 2.43;
+    let e = 0.59;
+    let f = 0.14;
+    return clamp((c * (a * c + b)) / (c * (d * c + e) + f), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var uv : vec2<f32> = in.tex_coords;
     var outColor: vec4<f32> = textureSample(t_scene_color, s_diffuse, uv);
 
-    var postprocess_mode: i32 = get_postprocess_mode(postprocess_buffer.time_mode_unused_unused.y);
+    var postprocess_mode: i32 = get_postprocess_mode(postprocess_buffer.time_mode_srgb_tonemap.y);
 
     if (postprocess_mode == 1) {
         outColor = textureSample(t_scene_color, s_diffuse, uv);
@@ -74,15 +92,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         outColor.y = outColor.x;
         outColor.z = outColor.x;
     } else if (postprocess_mode == 2) {
-        var uv_offset: vec2<f32> = vec2<f32>(0.0, postprocess_buffer.time_mode_unused_unused.x * -0.02f);
+        var uv_offset: vec2<f32> = vec2<f32>(0.0, postprocess_buffer.time_mode_srgb_tonemap.x * -0.02f);
         var uv_scale: vec2<f32> = vec2<f32>(0.5, 0.5);
         var scanLine: f32 = textureSample(t_post_process_filter, s_diffuse, uv * uv_scale + uv_offset).x;
         outColor.r *= ((scanLine * 0.5) + 0.5);
         outColor.g *= ((scanLine * 0.5) + 0.5);
         outColor.b *= ((scanLine * 0.5) + 0.5);
     } else if (postprocess_mode == 3) {
-        var uv_offset_1 = vec2<f32>(1.0, 1.0) * postprocess_buffer.time_mode_unused_unused.x * 0.03;
-        var uv_offset_2 = vec2<f32>(-1.0, -.3) * postprocess_buffer.time_mode_unused_unused.x * 0.023;
+        var uv_offset_1 = vec2<f32>(1.0, 1.0) * postprocess_buffer.time_mode_srgb_tonemap.x * 0.03;
+        var uv_offset_2 = vec2<f32>(-1.0, -.3) * postprocess_buffer.time_mode_srgb_tonemap.x * 0.023;
         var uv_scale = vec2<f32>(1.0, 1.0);
         var uv_offset: vec2<f32> = textureSample(t_post_process_filter, s_diffuse, uv * uv_scale + uv_offset_1).gg;
         uv_offset.y = textureSample(t_post_process_filter, s_diffuse, uv * 0.5 * uv_scale + uv_offset_2).g;
@@ -93,8 +111,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         outColor = textureSample(t_scene_color, s_diffuse, uv_offset);
     }
 
+    // ACES tonemap in linear space before any sRGB encode (w > 0.5 enables it).
+    /*if (postprocess_buffer.time_mode_srgb_tonemap.w > 0.5) {
+        outColor = vec4<f32>(tonemap_aces(outColor.rgb), outColor.a);
+    }*/
+
     // .z flags a non-sRGB surface: encode here so colors aren't displayed dark.
-    if (postprocess_buffer.time_mode_unused_unused.z > 0.5) {
+    if (postprocess_buffer.time_mode_srgb_tonemap.z > 0.5) {
         outColor = vec4<f32>(linear_to_srgb(outColor.rgb), outColor.a);
     }
     return outColor;

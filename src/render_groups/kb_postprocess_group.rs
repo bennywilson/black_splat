@@ -11,6 +11,8 @@ pub struct KbPostprocessRenderGroup {
     pub uniform_bind_group: wgpu::BindGroup,
     pub bind_group: wgpu::BindGroup,
     pub postprocess_tex_handle: KbTextureHandle,
+    // When true, the postprocess pass applies the ACES tonemap.
+    pub tonemap_enabled: bool,
 }
 
 impl KbPostprocessRenderGroup {
@@ -186,6 +188,7 @@ impl KbPostprocessRenderGroup {
             vertex_buffer,
             index_buffer,
             postprocess_tex_handle,
+            tonemap_enabled: false,
         }
     }
 
@@ -227,9 +230,9 @@ impl KbPostprocessRenderGroup {
         render_pass.set_vertex_buffer(1, device_resources.instance_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
-        self.postprocess_uniform.time_mode_unused_unused[0] =
+        self.postprocess_uniform.time_mode_srgb_tonemap[0] =
             game_config.start_time.elapsed().as_secs_f32();
-        self.postprocess_uniform.time_mode_unused_unused[1] = {
+        self.postprocess_uniform.time_mode_srgb_tonemap[1] = {
             let postprocess_mode = match postprocess_override {
                 Some(p) => p.clone(),
                 None => game_config.postprocess_mode.clone(),
@@ -243,12 +246,15 @@ impl KbPostprocessRenderGroup {
         };
         // When the surface isn't sRGB (e.g. Chrome WebGPU), the hardware won't
         // gamma-encode on present, so the shader must do it or everything looks dark.
-        self.postprocess_uniform.time_mode_unused_unused[2] =
+        self.postprocess_uniform.time_mode_srgb_tonemap[2] =
             if device_resources.surface_config.format.is_srgb() {
                 0.0
             } else {
                 1.0
             };
+        // ACES tonemap toggle (applied in linear space before the sRGB encode).
+        self.postprocess_uniform.time_mode_srgb_tonemap[3] =
+            if self.tonemap_enabled { 1.0 } else { 0.0 };
 
         device_resources.queue.write_buffer(
             &self.uniform_buffer,

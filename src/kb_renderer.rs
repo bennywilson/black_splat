@@ -260,7 +260,7 @@ impl<'a> KbRenderer<'a> {
                     )
                 } else {
                     format!(
-                        "Press [H] or tap here for help.\n\nFPS: {:.0}\n\n {}",
+                        "Press [H] or tap here for help.  Press [Space] to cycle scenes\n\nFPS: {:.0}\n\n {}",
                         frame_rate, self.game_hud_msg
                     )
                 }
@@ -602,7 +602,10 @@ impl<'a> KbRenderer<'a> {
             .await
     }
 
-    pub async fn load_gaussian_splat(&mut self, file_path: &str, params: &KbSplatParams) {
+    /// Loads a splat .ply and appends it as a selectable cloud.  Returns true if
+    /// it loaded (a missing/unreadable file is skipped and returns false).  Call
+    /// repeatedly to preload several clouds, then cycle with `set_active_gaussian_splat`.
+    pub async fn load_gaussian_splat(&mut self, file_path: &str, params: &KbSplatParams) -> bool {
         if self.gaussian_splat_render_group.is_none() {
             self.gaussian_splat_render_group = Some(
                 KbGaussianSplatRenderGroup::new(&self.device_resources, &mut self.asset_manager)
@@ -611,7 +614,28 @@ impl<'a> KbRenderer<'a> {
         }
         let splat_group = self.gaussian_splat_render_group.as_mut().unwrap();
         splat_group.set_params(params);
-        splat_group.load(file_path, &self.device_resources).await;
+        splat_group.load(file_path, &self.device_resources).await
+    }
+
+    /// Number of splat clouds preloaded via `load_gaussian_splat`.
+    pub fn num_gaussian_splats(&self) -> usize {
+        self.gaussian_splat_render_group
+            .as_ref()
+            .map_or(0, |g| g.num_models())
+    }
+
+    /// Selects which preloaded splat cloud to render (out-of-range is ignored).
+    pub fn set_active_gaussian_splat(&mut self, index: usize) {
+        if let Some(splat_group) = &mut self.gaussian_splat_render_group {
+            splat_group.set_active_model(index);
+        }
+    }
+
+    /// Number of gaussian splats in the currently active cloud (0 if none).
+    pub fn active_gaussian_splat_count(&self) -> u32 {
+        self.gaussian_splat_render_group
+            .as_ref()
+            .map_or(0, |g| g.active_splat_count())
     }
 
     pub fn set_gaussian_splat_params(&mut self, params: &KbSplatParams) {
@@ -718,6 +742,11 @@ impl<'a> KbRenderer<'a> {
 
     pub fn num_active_particles(&self) -> usize {
         self.active_particles
+    }
+
+    /// Enables the ACES tonemap applied in the postprocess pass.
+    pub fn set_tonemap_enabled(&mut self, enabled: bool) {
+        self.postprocess_render_group.tonemap_enabled = enabled;
     }
 
     pub async fn add_sprite_render_group(

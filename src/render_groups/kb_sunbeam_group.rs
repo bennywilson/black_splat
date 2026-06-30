@@ -119,7 +119,7 @@ impl KbSunbeamRenderGroup {
                 module: mask_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -241,7 +241,7 @@ impl KbSunbeamRenderGroup {
                 module: draw_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend: Some(additive_blend_state),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

@@ -26,6 +26,9 @@ pub struct KbConfig {
     pub sun_color: CgVec4,
     pub sun_beam_pos_scale: CgVec4,
     pub bullet_holes: bool,
+
+    pub start_position: CgVec3,
+    pub start_rotation: CgVec3,
 }
 
 impl KbConfig {
@@ -107,6 +110,32 @@ impl KbConfig {
         let json_val = json_file["bullet_holes"].as_bool();
         let bullet_holes = json_val.unwrap_or_default();
 
+        let start_position = {
+            let arr = &json_file["start_position"];
+            if arr.is_array() {
+                CgVec3::new(
+                    arr[0].as_f32().unwrap_or(0.0),
+                    arr[1].as_f32().unwrap_or(0.0),
+                    arr[2].as_f32().unwrap_or(0.0),
+                )
+            } else {
+                CgVec3::new(0.0, 0.0, 0.0)
+            }
+        };
+
+        let start_rotation = {
+            let arr = &json_file["start_rotation"];
+            if arr.is_array() {
+                CgVec3::new(
+                    arr[0].as_f32().unwrap_or(0.0),
+                    arr[1].as_f32().unwrap_or(0.0),
+                    arr[2].as_f32().unwrap_or(0.0),
+                )
+            } else {
+                CgVec3::new(0.0, 0.0, 0.0)
+            }
+        };
+
         KbConfig {
             enemy_spawn_delay,
             enemy_move_speed,
@@ -128,6 +157,8 @@ impl KbConfig {
             sun_color: CgVec4::new(1.0, 1.0, 1.0, 1.0),
             sun_beam_pos_scale,
             bullet_holes,
+            start_position,
+            start_rotation,
         }
     }
 

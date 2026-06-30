@@ -137,7 +137,9 @@ pub struct SpriteUniform {
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PostProcessUniform {
-    pub time_mode_unused_unused: [f32; 4],
+    // x: time, y: postprocess mode, z: 1.0 when the surface is non-sRGB (encode
+    // in-shader), w: 1.0 to apply the ACES tonemap.
+    pub time_mode_srgb_tonemap: [f32; 4],
 }
 
 #[allow(dead_code)]
@@ -203,7 +205,14 @@ impl KbTexture {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: surface_config.format,
+            // Always render the offscreen scene into an sRGB target so alpha
+            // blending happens in linear space (the hardware decodes/encodes).
+            // On native the surface is already sRGB so this is a no-op; on web
+            // Chrome's canvas is non-sRGB `Bgra8Unorm`, and without this the
+            // scene would blend in gamma space -- making stacked transparent
+            // splats composite far too dark.  The postprocess pass converts back
+            // to the (possibly non-sRGB) surface on present.
+            format: surface_config.format.add_srgb_suffix(),
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });

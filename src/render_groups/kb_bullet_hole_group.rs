@@ -139,7 +139,7 @@ impl KbBulletHoleRenderGroup {
                 module: model_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

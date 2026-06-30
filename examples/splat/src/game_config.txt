@@ -11,5 +11,9 @@
     "graphics_power_pref": "high",
 
     "_comment3": "Valid values for 'vsync' are true and false",
-    "vsync": false
+    "vsync": false,
+
+    "_comment4": "Starting camera position [x, y, z] and rotation [yaw_deg, pitch_deg, 0]",
+    "start_position": [-2.78, 2.27, 1.81],
+    "start_rotation": [-243.4, 13.0, 0.0]
 }

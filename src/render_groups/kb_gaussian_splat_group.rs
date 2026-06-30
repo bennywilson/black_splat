@@ -137,11 +137,18 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// the blk reference: y is flipped, the quaternion is reordered, scale is taken
 /// out of log space, opacity through a sigmoid, and the SH "rest" coefficients
 /// are de-interleaved from [all R | all G | all B] into per-coefficient RGB.
-pub async fn load_splat_ply(path: &str) -> Vec<KbSplatInstance> {
+/// Loads a splat .ply into GPU instances.  Returns `None` (rather than panicking)
+/// when the file can't be read, so a demo cycling several optional .ply files
+/// keeps running with whatever is actually present.
+pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
     log!("Loading gaussian splat ply: {path}");
-    let bytes = load_binary(path)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to read splat ply {path}: {e}"));
+    let bytes = match load_binary(path).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log!("Skipping splat ply {path}: {e}");
+            return None;
+        }
+    };
 
     let header_pos =
         find_subsequence(&bytes, b"end_header").expect("ply is missing an end_header marker");
@@ -210,19 +217,21 @@ pub async fn load_splat_ply(path: &str) -> Vec<KbSplatInstance> {
     for i in 0..vertex_count {
         let base = data_start + i * stride;
 
-        // Position: flip Y to go from the 3DGS data frame into this engine's
-        // right-handed (look_at_rh) frame.
-        let position = [get(base, "x"), -get(base, "y"), get(base, "z"), 0.0];
+        // Position: rotate the 3DGS data frame 180 deg about Z (negate X and Y)
+        // into this engine's right-handed (look_at_rh) frame.  Negating a SINGLE
+        // axis is a reflection (det = -1) and mirrors the cloud; negating two is a
+        // proper rotation (det = +1), so the scene keeps its handedness.
+        let position = [-get(base, "x"), -get(base, "y"), get(base, "z"), 0.0];
 
         // Quaternion stored as rot_0=w, rot_1=x, rot_2=y, rot_3=z, so the
-        // standard form is xyzw = (rot_1, rot_2, rot_3, rot_0).  Flipping Y on the
-        // positions is a reflection M = diag(1,-1,1); to keep each splat's
-        // orientation consistent the rotation is conjugated by M, which for a
-        // quaternion (w,x,y,z) yields (w,-x,y,-z) -- i.e. negate x and z.
+        // standard form is xyzw = (rot_1, rot_2, rot_3, rot_0).  To keep each
+        // splat's orientation consistent with the 180-deg-about-Z position
+        // rotation, conjugate the quaternion by that rotation, which for
+        // (w,x,y,z) yields (w,-x,-y,z) -- i.e. negate x and y.
         let rotation = [
             -get(base, "rot_1"),
-            get(base, "rot_2"),
-            -get(base, "rot_3"),
+            -get(base, "rot_2"),
+            get(base, "rot_3"),
             get(base, "rot_0"),
         ];
 
@@ -260,7 +269,7 @@ pub async fn load_splat_ply(path: &str) -> Vec<KbSplatInstance> {
     }
 
     log!("Loaded {} splats from {path}", instances.len());
-    instances
+    Some(instances)
 }
 
 // Returns false when the sphere (world-space center + radius) is entirely outside
@@ -307,7 +316,10 @@ pub struct KbGaussianSplatRenderGroup {
     sort_globals_layout: wgpu::BindGroupLayout,
     sort_pass_layout: wgpu::BindGroupLayout,
 
-    model: Option<KbSplatModel>,
+    // All preloaded splat clouds; `active_model` indexes the one being rendered.
+    // Cycling between them just changes the index (no async reload).
+    models: Vec<KbSplatModel>,
+    active_model: usize,
     params: KbSplatParams,
 }
 
@@ -403,7 +415,7 @@ impl KbGaussianSplatRenderGroup {
                 module: shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -525,7 +537,8 @@ impl KbGaussianSplatRenderGroup {
             sort_pipeline_scatter,
             sort_globals_layout,
             sort_pass_layout,
-            model: None,
+            models: Vec::new(),
+            active_model: 0,
             params: KbSplatParams::default(),
         }
     }
@@ -534,8 +547,32 @@ impl KbGaussianSplatRenderGroup {
         self.params = *params;
     }
 
-    pub async fn load(&mut self, path: &str, device_resources: &KbDeviceResources<'_>) {
-        let instances = load_splat_ply(path).await;
+    /// Number of splat clouds currently loaded.
+    pub fn num_models(&self) -> usize {
+        self.models.len()
+    }
+
+    /// Select which preloaded splat cloud to render.  Out-of-range indices are
+    /// ignored.
+    pub fn set_active_model(&mut self, index: usize) {
+        if index < self.models.len() {
+            self.active_model = index;
+        }
+    }
+
+    /// Number of gaussian splats in the currently active cloud (0 if none).
+    pub fn active_splat_count(&self) -> u32 {
+        self.models.get(self.active_model).map_or(0, |m| m.num_splats)
+    }
+
+    /// Loads a splat .ply and appends it as a new model.  Missing/unreadable
+    /// files are skipped (no model appended), so callers can preload an optional
+    /// set and cycle over whatever loaded.  Returns true when a model was added.
+    pub async fn load(&mut self, path: &str, device_resources: &KbDeviceResources<'_>) -> bool {
+        let instances = match load_splat_ply(path).await {
+            Some(instances) => instances,
+            None => return false,
+        };
         let num_splats = instances.len() as u32;
         let device = &device_resources.device;
 
@@ -687,7 +724,7 @@ impl KbGaussianSplatRenderGroup {
             ([cx, cy, cz], r)
         };
 
-        self.model = Some(KbSplatModel {
+        self.models.push(KbSplatModel {
             splat_buffer,
             num_splats,
             keys_a,
@@ -710,10 +747,11 @@ impl KbGaussianSplatRenderGroup {
             bounding_center,
             bounding_radius,
         });
+        true
     }
 
     pub fn has_model(&self) -> bool {
-        self.model.is_some()
+        !self.models.is_empty()
     }
 
     pub fn render(
@@ -722,7 +760,7 @@ impl KbGaussianSplatRenderGroup {
         game_camera: &KbCamera,
         game_config: &KbConfig,
     ) {
-        let model = match self.model.as_mut() {
+        let model = match self.models.get_mut(self.active_model) {
             Some(m) => m,
             None => return,
         };

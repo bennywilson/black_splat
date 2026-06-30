@@ -160,7 +160,7 @@ impl KbSpriteRenderGroup {
                 module: shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -208,7 +208,7 @@ impl KbSpriteRenderGroup {
                 module: transparent_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
