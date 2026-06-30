@@ -52,6 +52,14 @@ fn get_postprocess_mode(in_val: f32) -> i32 {
     return 3;
 }
 
+// Linear -> sRGB. Used only when the surface format is NOT sRGB (e.g. Chrome's
+// WebGPU canvas), where the hardware won't do the encode for us.
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    let lower = c * 12.92;
+    let higher = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(higher, lower, c < vec3<f32>(0.0031308));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
@@ -83,6 +91,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             uv_offset.y = 0.9999f;
         }
         outColor = textureSample(t_scene_color, s_diffuse, uv_offset);
+    }
+
+    // .z flags a non-sRGB surface: encode here so colors aren't displayed dark.
+    if (postprocess_buffer.time_mode_unused_unused.z > 0.5) {
+        outColor = vec4<f32>(linear_to_srgb(outColor.rgb), outColor.a);
     }
     return outColor;
 }

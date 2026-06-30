@@ -3,10 +3,40 @@
 <meta name="author" content="Benny Wilson">
 <title>kbEngine3 - Gaussian Splats</title>
 
+<script>
+    // wgpu 0.20 still sends the limit "maxInterStageShaderComponents", which was
+    // removed from the WebGPU spec; current Chrome rejects requestDevice() for any
+    // unrecognized limit. Strip limits the adapter doesn't actually support before
+    // they reach the browser. Remove this once the engine is on a newer wgpu.
+    if (typeof GPUAdapter !== "undefined") {
+        const orig = GPUAdapter.prototype.requestDevice;
+        GPUAdapter.prototype.requestDevice = function (desc) {
+            if (desc && desc.requiredLimits) {
+                const supported = this.limits;
+                const cleaned = {};
+                for (const k in desc.requiredLimits) {
+                    if (k in supported) {
+                        cleaned[k] = desc.requiredLimits[k];
+                    }
+                }
+                desc = Object.assign({}, desc, { requiredLimits: cleaned });
+            }
+            return orig.call(this, desc);
+        };
+    }
+</script>
+
 <script type="module">
 	import init from "./kb_engine_splat_demo.js";
     window.addEventListener("load", () => {
-        init();
+        // Cache-bust the wasm URL so Chrome's compiled-wasm cache can't serve a
+        // stale build across rebuilds (a plain reload otherwise reuses it).
+        init({
+            module_or_path: new URL(
+                `./kb_engine_splat_demo_bg.wasm?v=${Date.now()}`,
+                import.meta.url
+            ),
+        });
     });
 </script>
 

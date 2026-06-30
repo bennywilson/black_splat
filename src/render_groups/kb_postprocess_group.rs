@@ -241,6 +241,14 @@ impl KbPostprocessRenderGroup {
                 _ => 0.0,
             }
         };
+        // When the surface isn't sRGB (e.g. Chrome WebGPU), the hardware won't
+        // gamma-encode on present, so the shader must do it or everything looks dark.
+        self.postprocess_uniform.time_mode_unused_unused[2] =
+            if device_resources.surface_config.format.is_srgb() {
+                0.0
+            } else {
+                1.0
+            };
 
         device_resources.queue.write_buffer(
             &self.uniform_buffer,
