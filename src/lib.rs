@@ -91,58 +91,32 @@ where
         let _ = event_loop.spawn(move |event, control_flow| {
             let _ = &mut game_renderer;
             let _ = &game_config;
+            let _ = &mut frame_timer;
             match event {
                 Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-                    hack_wait += 1;
-                    if hack_wait > 6 {
-                        game_engine.tick_frame(
-                            &mut game_renderer,
-                            &mut input_manager,
-                            &mut game_config,
-                        );
-                    }
-                    if hack_wait > 8 {
-                        let render_result = game_renderer
-                            .render_frame(&game_engine.get_game_objects(), &game_config);
-                        match render_result {
-                            Ok(_) => {}
-                            Err(wgpu::SurfaceError::Lost) => {
-                                let _ = async {
-                                    game_renderer.resize(&game_config);
-                                };
-                            }
-                            Err(wgpu::SurfaceError::OutOfMemory) => control_flow.exit(),
-                            Err(e) => {
-                                eprintln!("{:?}", e)
-                            }
-                        }
-                    }
-
-                    let elapsed_frame_time = frame_timer.elapsed().as_secs_f32();
-                    let delay = {
-                        if elapsed_frame_time <= 12000.0 {
-                            12000.0 - elapsed_frame_time
-                        } else {
-                            0.0
-                        }
-                    };
-                    frame_timer = instant::Instant::now();
-                    let delay = core::time::Duration::from_micros(delay as u64);
-                    let new_control_flow = ControlFlow::wait_duration(delay);
-                    control_flow.set_control_flow(new_control_flow);
+                    // The initial 1us timer just kicks us off; from here we render
+                    // via requestAnimationFrame (request_redraw + ControlFlow::Wait).
+                    // rAF paces to the real frame-production rate, giving the GPU the
+                    // back-pressure the browser otherwise lacks -- a timer just floods
+                    // it and input shows up frames (seconds) late.
+                    window.request_redraw();
+                    control_flow.set_control_flow(ControlFlow::Wait);
                 }
                 Event::WindowEvent {
                     ref event,
                     window_id,
                 } if window_id == game_renderer.window_id() => match event {
                     WindowEvent::RedrawRequested => {
-                        if game_config.vsync == false {
+                        // Driven by requestAnimationFrame (see ResumeTimeReached).
+                        hack_wait += 1;
+                        if hack_wait > 6 {
                             game_engine.tick_frame(
                                 &mut game_renderer,
                                 &mut input_manager,
                                 &mut game_config,
                             );
-
+                        }
+                        if hack_wait > 8 {
                             let render_result = game_renderer
                                 .render_frame(&game_engine.get_game_objects(), &game_config);
                             match render_result {
@@ -158,6 +132,8 @@ where
                                 }
                             }
                         }
+                        // Schedule the next animation frame.
+                        window.request_redraw();
                     }
 
                     WindowEvent::MouseWheel { delta, .. } => {

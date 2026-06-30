@@ -506,6 +506,10 @@ impl<'a> KbDeviceResources<'a> {
                 panic!("surface.get_default_config() returned None");
             });
         surface_config.format = surface_format;
+        // Keep at most one frame queued ahead of the GPU.  With heavy per-frame GPU
+        // work (e.g. the gaussian splat sort + overdraw) the default of 2+ lets the
+        // CPU race ahead, so input shows up seconds late even at a steady frame rate.
+        surface_config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &surface_config);
 
         let max_instances = game_config.max_render_instances;

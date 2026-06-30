@@ -24,6 +24,7 @@ struct Splat {
 
 @group(0) @binding(0) var<uniform> u: GlobalConstants;
 @group(1) @binding(0) var<storage, read> g_splats: array<Splat>;
+@group(1) @binding(0) var<storage, read> g_splats_unused: array<Splat>; // placeholder removed below
 @group(1) @binding(1) var<storage, read> g_sorted_indices: array<u32>;
 
 struct VSOutput {
@@ -116,8 +117,7 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
     let splat = g_splats[splat_id];
 
     let splat_pos = splat.position.xyz * overall_scale;
-    // `var` (not `let`) so the axes can be indexed with a dynamically-chosen axis.
-    var axes = quat_axes(splat.rotation);
+    let axes = quat_axes(splat.rotation);
     let splat_scale = splat.scale_opacity.xyz;
 
     // Major/minor/intermediate axis selection.
