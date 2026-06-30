@@ -307,6 +307,14 @@ impl KbSpriteRenderGroup {
                 continue;
             }
 
+            if frame_instances.len() >= game_config.max_render_instances as usize {
+                log::warn!(
+                    "KbSpriteRenderGroup: hit max_render_instances ({}); dropping remaining sprites this frame",
+                    game_config.max_render_instances
+                );
+                break;
+            }
+
             let game_object_position = game_object.position + extra_offset;
             let sprite_index = game_object.sprite_index + game_object.anim_frame;
             let mut u_offset = ((sprite_index % 8) as f32) * u_scale;
