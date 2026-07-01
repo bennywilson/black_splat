@@ -17,6 +17,17 @@ const CAMERA_MOVE_RATE: f32 = 1.0;
 const CAMERA_ROTATION_RATE: f32 = 30.0;
 const PARAM_RATE: f32 = 1.5;
 
+// Touch (mobile / iOS): the screen splits into a left "move" stick and a right
+// "look" stick.  A drag of this fraction of the screen's smaller axis counts as
+// full deflection; smaller drags scale proportionally.  Using a fraction (not
+// fixed pixels) keeps the feel consistent across canvas resolutions.
+const TOUCH_STICK_SPAN: f64 = 0.18;
+const TOUCH_DEAD_ZONE: f32 = 0.12;
+const TOUCH_LOOK_RATE: f32 = 70.0; // degrees/sec at full deflection
+// Top strip of the screen acts as on-screen buttons rather than sticks: tap the
+// top-left to toggle help, the top-right to cycle to the next splat cloud.
+const TOUCH_UI_BAND: f64 = 0.14;
+
 pub struct SplatGame {
     game_objects: Vec<GameObject>,
     game_camera: KbCamera,
@@ -89,35 +100,79 @@ impl KbGameEngine for SplatGame {
         let (_view, view_dir, right_dir) = self.game_camera.calculate_view_matrix();
         let forward_dir = CgVec3::new(view_dir.x, view_dir.y, view_dir.z).normalize();
 
-        // Movement
+        // Movement (keyboard)
         let mut move_vec = CG_VEC3_ZERO;
         if input_manager.get_key_state("w").is_down() { move_vec += forward_dir; }
         if input_manager.get_key_state("s").is_down() { move_vec += -forward_dir; }
         if input_manager.get_key_state("d").is_down() { move_vec += right_dir; }
         if input_manager.get_key_state("a").is_down() { move_vec += -right_dir; }
-        if move_vec.magnitude2() > 0.001 {
-            let speed = if input_manager.get_key_state("left_shift").is_down() {
-                CAMERA_MOVE_RATE * 3.0
-            } else {
-                CAMERA_MOVE_RATE
-            };
-            let new_pos = self.game_camera.get_position()
-                + move_vec.normalize() * delta_time * speed;
-            self.game_camera.set_position(&new_pos);
-        }
+        let sprint = input_manager.get_key_state("left_shift").is_down();
 
-        // Look
+        // Look (keyboard)
         let mut camera_rot = self.game_camera.get_rotation();
         let rot_amount = delta_time * CAMERA_ROTATION_RATE;
         if input_manager.get_key_state("left_arrow").is_down() { camera_rot.x += rot_amount; }
         if input_manager.get_key_state("right_arrow").is_down() { camera_rot.x -= rot_amount; }
         if input_manager.get_key_state("up_arrow").is_down() { camera_rot.y -= rot_amount; }
         if input_manager.get_key_state("down_arrow").is_down() { camera_rot.y += rot_amount; }
+
+        // Touch (mobile / iOS): left half of the screen is a move stick, right
+        // half is a look stick.  Each reads the finger's offset from where it
+        // first landed as an analog deflection, so a finger held still doesn't
+        // drift and a drag-and-hold keeps moving/turning.  Spans are screen
+        // fractions, so this behaves the same at any canvas resolution.
+        let screen_w = game_config.window_width.max(1) as f64;
+        let screen_h = game_config.window_height.max(1) as f64;
+        let span = screen_w.min(screen_h) * TOUCH_STICK_SPAN;
+        let ui_band = screen_h * TOUCH_UI_BAND;
+        let mut cycle_splat = false;
+        for (_id, touch) in input_manager.get_touch_map().iter() {
+            if !(touch.touch_state.is_down() || touch.touch_state.just_pressed()) {
+                continue;
+            }
+
+            // Top strip = on-screen buttons (tap only), kept out of the sticks.
+            if touch.start_pos.1 < ui_band {
+                if touch.touch_state.just_pressed() {
+                    if touch.start_pos.0 < screen_w * 0.5 {
+                        renderer.enable_help_text();
+                    } else {
+                        cycle_splat = true;
+                    }
+                }
+                continue;
+            }
+
+            let dx = ((touch.current_pos.0 - touch.start_pos.0) / span).clamp(-1.0, 1.0) as f32;
+            let dy = ((touch.current_pos.1 - touch.start_pos.1) / span).clamp(-1.0, 1.0) as f32;
+            if dx * dx + dy * dy < TOUCH_DEAD_ZONE * TOUCH_DEAD_ZONE {
+                continue;
+            }
+            if touch.start_pos.0 < screen_w * 0.5 {
+                // Left stick: drag right = strafe right, drag up = move forward.
+                move_vec += right_dir * dx;
+                move_vec -= forward_dir * dy;
+            } else {
+                // Right stick: drag right = look right, drag up = look up.
+                camera_rot.x -= dx * TOUCH_LOOK_RATE * delta_time;
+                camera_rot.y += dy * TOUCH_LOOK_RATE * delta_time;
+            }
+        }
+
+        if move_vec.magnitude2() > 0.001 {
+            let speed = if sprint { CAMERA_MOVE_RATE * 3.0 } else { CAMERA_MOVE_RATE };
+            let new_pos = self.game_camera.get_position()
+                + move_vec.normalize() * delta_time * speed;
+            self.game_camera.set_position(&new_pos);
+        }
+
         camera_rot.y = camera_rot.y.clamp(-89.0, 89.0);
         self.game_camera.set_rotation(&camera_rot);
 
-        // Cycle to the next preloaded splat cloud.
-        if input_manager.get_key_state("space").just_pressed() && !self.splat_names.is_empty() {
+        // Cycle to the next preloaded splat cloud ([Space] or a top-right tap).
+        if (cycle_splat || input_manager.get_key_state("space").just_pressed())
+            && !self.splat_names.is_empty()
+        {
             self.active_splat = (self.active_splat + 1) % self.splat_names.len();
             renderer.set_active_gaussian_splat(self.active_splat);
         }
@@ -158,17 +213,12 @@ impl KbGameEngine for SplatGame {
         let splat_count = renderer.active_gaussian_splat_count();
         renderer.set_debug_game_msg(&format!(
             "Move: [W][A][S][D]   [Shift] sprint   Look: [Arrow Keys]\n\
+             Touch: left half = move,  right half = look\n\
+             Touch top-left = help,  top-right = next splat\n\
              Camera  pos ({:.2}, {:.2}, {:.2})   rot ({:.1}, {:.1})\n\n\
-             [Space]     Cycle Splat  {} ({}/{})   {} splats\n\n\
-             Splat Params (hold to adjust):\n\
-             [1] / [2]   Falloff      {:.2}\n\
-             [3] / [4]   Scale        {:.2}\n\
-             [5] / [6]   Contrast     {:.2}\n\
-             [7] / [8]   Size         {:.2}\n\
-             [9]         SH Degree    {}",
+             [Space]     Cycle Splat  {} ({}/{})   {} splats",
             pos.x, pos.y, pos.z, rot.x, rot.y,
             active_name, self.active_splat + 1, self.splat_names.len().max(1), splat_count,
-            p.falloff, p.scale, p.contrast, p.overall_scale, p.max_sh_degree as u32,
         ));
 
         renderer.set_camera(&self.game_camera);
