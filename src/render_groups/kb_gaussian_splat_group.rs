@@ -5,8 +5,18 @@ use wgpu::util::DeviceExt;
 
 use crate::{kb_assets::*, kb_config::*, kb_game_object::*, kb_resource::*, log};
 
-/// 700k splats * 160 bytes = 112 MB, comfortably under wgpu's default 128 MiB
-/// storage-buffer binding limit.  Larger point clouds are clamped to this.
+/// Per-platform cap on splats per cloud.  The GPU-side ceiling is computed at
+/// load time from the device's actual limits (see `load`); this constant bounds
+/// how much CPU memory a parse may commit before that ceiling is known.
+///
+/// Native: effectively "whatever the GPU can bind" -- also kept safely under the
+/// radix sort's hard dispatch ceiling of 65535 workgroups * 256 = ~16.7M splats.
+/// Wasm: browsers commonly cap a storage binding near the spec's 128 MiB
+/// default, and the 32-bit address space must hold the raw .ply AND the parsed
+/// instances, so stay conservative: 700k * 160 bytes = 112 MB.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_SPLATS: usize = 16_000_000;
+#[cfg(target_arch = "wasm32")]
 pub const MAX_SPLATS: usize = 700_000;
 
 const SORT_WORKGROUP_SIZE: u32 = 256;
@@ -14,7 +24,7 @@ const SORT_WORKGROUP_SIZE: u32 = 256;
 /// GPU-side gaussian splat record.  Layout mirrors the WGSL `Splat` struct in
 /// gaussian_splat.wgsl (160 bytes, 16-byte aligned).
 #[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct KbSplatInstance {
     pub position: [f32; 4],      // xyz position, w unused
     pub scale_opacity: [f32; 4], // linear scale xyz, normalized opacity w
@@ -42,6 +52,15 @@ struct KbSortGlobals {
     num_tiles: u32,       // ceil(num_elements / SORT_WORKGROUP_SIZE)
     _pad0: u32,
     _pad1: u32,
+}
+
+/// Outcome of a successful runtime splat load: how many splats made it onto the
+/// GPU, and the file's original count when the cloud had to be clamped to the
+/// platform/device budget (`None` = loaded in full).
+#[derive(Clone, Copy)]
+pub struct KbSplatLoadInfo {
+    pub num_splats: u32,
+    pub clamped_from: Option<usize>,
 }
 
 /// Tunable rendering parameters (see the original blk GaussianSplatComponent).
@@ -131,16 +150,19 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Parses a binary-little-endian 3D gaussian splat .ply into GPU instances.
-///
-/// Mirrors kbModel::load_ply + Renderer_Dx12::initialize_gaussian_splatting from
-/// the blk reference: y is flipped, the quaternion is reordered, scale is taken
-/// out of log space, opacity through a sigmoid, and the SH "rest" coefficients
-/// are de-interleaved from [all R | all G | all B] into per-coefficient RGB.
-/// Loads a splat .ply into GPU instances.  Returns `None` (rather than panicking)
-/// when the file can't be read, so a demo cycling several optional .ply files
-/// keeps running with whatever is actually present.
-pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
+/// What `parse_splat_ply` produced: the GPU instances plus, when the file held
+/// more splats than the platform/device budget allowed, the original count (so
+/// callers can warn the user that the cloud was truncated).
+#[derive(Debug)]
+pub struct KbSplatParse {
+    pub instances: Vec<KbSplatInstance>,
+    pub clamped_from: Option<usize>,
+}
+
+/// Loads a splat .ply from a path and parses it (see `parse_splat_ply`).
+/// Returns `None` when the file can't be read or parsed, so a demo cycling
+/// several optional .ply files keeps running with whatever is actually present.
+pub async fn load_splat_ply(path: &str, max_splats: usize) -> Option<Vec<KbSplatInstance>> {
     log!("Loading gaussian splat ply: {path}");
     let bytes = match load_binary(path).await {
         Ok(bytes) => bytes,
@@ -149,18 +171,53 @@ pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
             return None;
         }
     };
+    match parse_splat_ply(&bytes, path, max_splats) {
+        Ok(parse) => Some(parse.instances),
+        Err(e) => {
+            log!("Skipping splat ply {path}: {e}");
+            None
+        }
+    }
+}
 
-    let header_pos =
-        find_subsequence(&bytes, b"end_header").expect("ply is missing an end_header marker");
-    let header = std::str::from_utf8(&bytes[0..header_pos]).expect("ply header is not valid utf8");
+/// Parses a binary-little-endian 3D gaussian splat .ply into GPU instances,
+/// clamped to `max_splats` (callers derive it from the device's storage-binding
+/// limits).  `source` appears only in log messages.
+///
+/// Mirrors kbModel::load_ply + Renderer_Dx12::initialize_gaussian_splatting from
+/// the blk reference: y is flipped, the quaternion is reordered, scale is taken
+/// out of log space, opacity through a sigmoid, and the SH "rest" coefficients
+/// are de-interleaved from [all R | all G | all B] into per-coefficient RGB.
+/// Returns `Err` with a short human-readable reason (never panics) on malformed
+/// input: the bytes may be a user-picked file, and the message is shown to them.
+pub fn parse_splat_ply(
+    bytes: &[u8],
+    source: &str,
+    max_splats: usize,
+) -> Result<KbSplatParse, String> {
+    let header_pos = find_subsequence(bytes, b"end_header")
+        .ok_or_else(|| "not a .ply file (no end_header)".to_string())?;
+    let header = std::str::from_utf8(&bytes[0..header_pos])
+        .map_err(|_| "header is not valid utf-8".to_string())?;
 
     let mut vertex_count = 0usize;
     let mut stride = 0usize;
     let mut offsets: HashMap<String, usize> = HashMap::new();
+    let mut format_ok = false;
 
     for line in header.lines() {
         let mut it = line.split_whitespace();
         match it.next() {
+            Some("format") => {
+                let format = it.next().unwrap_or("");
+                if format == "binary_little_endian" {
+                    format_ok = true;
+                } else {
+                    return Err(format!(
+                        "'{format}' .ply is unsupported (need binary_little_endian)"
+                    ));
+                }
+            }
             Some("element") => {
                 if it.next() == Some("vertex") {
                     vertex_count = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -177,6 +234,22 @@ pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
         }
     }
 
+    if !format_ok {
+        return Err("no 'format' line -- not a valid .ply".to_string());
+    }
+
+    // A 3DGS training export always carries these.  Compressed .plys (e.g.
+    // SuperSplat's, which packs everything into chunk/packed_* properties) and
+    // plain point clouds don't, and would otherwise "load" as garbage since
+    // missing properties read as 0.
+    for required in ["x", "y", "z", "scale_0", "rot_0", "opacity", "f_dc_0"] {
+        if !offsets.contains_key(required) {
+            return Err(format!(
+                "no '{required}' property -- compressed or non-3DGS .ply? (unsupported)"
+            ));
+        }
+    }
+
     // Binary data begins right after the newline following "end_header".
     let mut data_start = header_pos + "end_header".len();
     while data_start < bytes.len() && bytes[data_start] != b'\n' {
@@ -185,26 +258,33 @@ pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
     data_start += 1;
 
     if vertex_count == 0 || stride == 0 {
-        panic!("ply {path} has no vertices or zero stride");
+        return Err("header lists no vertices".to_string());
     }
 
-    let available = (bytes.len() - data_start) / stride;
+    let available = bytes.len().saturating_sub(data_start) / stride;
     if available < vertex_count {
         log!(
-            "Warning: ply {path} header claims {vertex_count} verts but only {available} present"
+            "Warning: ply {source} header claims {vertex_count} verts but only {available} present"
         );
         vertex_count = available;
     }
-
-    if vertex_count > MAX_SPLATS {
-        log!(
-            "Warning: ply {path} has {vertex_count} splats; clamping to MAX_SPLATS ({MAX_SPLATS})"
-        );
-        vertex_count = MAX_SPLATS;
+    if vertex_count == 0 {
+        return Err("vertex data is missing or truncated".to_string());
     }
 
-    let get = |base: usize, name: &str| -> f32 {
-        match offsets.get(name) {
+    let mut clamped_from = None;
+    if vertex_count > max_splats {
+        log!("Warning: ply {source} has {vertex_count} splats; clamping to {max_splats}");
+        clamped_from = Some(vertex_count);
+        vertex_count = max_splats;
+    }
+
+    // Resolve every property offset up front: at multi-million splat counts,
+    // per-splat HashMap lookups (and format!-built f_rest keys) dominate load
+    // time.  Missing properties read as 0.0, same as before.
+    let off = |name: &str| offsets.get(name).copied();
+    let read = |base: usize, off: Option<usize>| -> f32 {
+        match off {
             Some(off) => {
                 let o = base + off;
                 f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
@@ -212,6 +292,26 @@ pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
             None => 0.0,
         }
     };
+
+    let xyz_off = [off("x"), off("y"), off("z")];
+    let rot_off = [off("rot_0"), off("rot_1"), off("rot_2"), off("rot_3")];
+    let scale_off = [off("scale_0"), off("scale_1"), off("scale_2")];
+    let opacity_off = off("opacity");
+    let dc_off = [off("f_dc_0"), off("f_dc_1"), off("f_dc_2")];
+
+    // f_rest is packed channel-major: [R0..Rk-1 | G0..Gk-1 | B0..Bk-1] where k is
+    // the per-channel coefficient count -- 15 for the standard degree-3 export,
+    // 8 for a degree-2 one.  Derive k from the header so either layout
+    // de-interleaves correctly, and take the first 8 coefficients (degrees 1+2)
+    // of each channel, which is all the GPU struct carries.
+    let num_rest = offsets.keys().filter(|k| k.starts_with("f_rest_")).count();
+    let rest_per_channel = num_rest / 3;
+    let mut rest_off = [[None; 3]; 8];
+    for (n, coeff) in rest_off.iter_mut().enumerate() {
+        for (c, chan) in coeff.iter_mut().enumerate() {
+            *chan = off(&format!("f_rest_{}", n + c * rest_per_channel));
+        }
+    }
 
     let mut instances = Vec::<KbSplatInstance>::with_capacity(vertex_count);
     for i in 0..vertex_count {
@@ -221,7 +321,12 @@ pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
         // into this engine's right-handed (look_at_rh) frame.  Negating a SINGLE
         // axis is a reflection (det = -1) and mirrors the cloud; negating two is a
         // proper rotation (det = +1), so the scene keeps its handedness.
-        let position = [-get(base, "x"), -get(base, "y"), get(base, "z"), 0.0];
+        let position = [
+            -read(base, xyz_off[0]),
+            -read(base, xyz_off[1]),
+            read(base, xyz_off[2]),
+            0.0,
+        ];
 
         // Quaternion stored as rot_0=w, rot_1=x, rot_2=y, rot_3=z, so the
         // standard form is xyzw = (rot_1, rot_2, rot_3, rot_0).  To keep each
@@ -229,34 +334,34 @@ pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
         // rotation, conjugate the quaternion by that rotation, which for
         // (w,x,y,z) yields (w,-x,-y,z) -- i.e. negate x and y.
         let rotation = [
-            -get(base, "rot_1"),
-            -get(base, "rot_2"),
-            get(base, "rot_3"),
-            get(base, "rot_0"),
+            -read(base, rot_off[1]),
+            -read(base, rot_off[2]),
+            read(base, rot_off[3]),
+            read(base, rot_off[0]),
         ];
 
         // Scale out of log space, opacity through a sigmoid.
         let scale_opacity = [
-            get(base, "scale_0").exp(),
-            get(base, "scale_1").exp(),
-            get(base, "scale_2").exp(),
-            1.0 / (1.0 + (-get(base, "opacity")).exp()),
+            read(base, scale_off[0]).exp(),
+            read(base, scale_off[1]).exp(),
+            read(base, scale_off[2]).exp(),
+            1.0 / (1.0 + (-read(base, opacity_off)).exp()),
         ];
 
         let sh0 = [
-            get(base, "f_dc_0"),
-            get(base, "f_dc_1"),
-            get(base, "f_dc_2"),
+            read(base, dc_off[0]),
+            read(base, dc_off[1]),
+            read(base, dc_off[2]),
             0.0,
         ];
 
-        // De-interleave f_rest: ply packs it as [R0..14, G15..29, B30..44].
-        // We assemble per-coefficient RGB triples for the first 8 coefficients.
+        // Assemble per-coefficient RGB triples from the channel-major offsets
+        // resolved above.
         let mut sh_rest = [0.0f32; 24];
-        for n in 0..8 {
-            sh_rest[n * 3] = get(base, &format!("f_rest_{n}"));
-            sh_rest[n * 3 + 1] = get(base, &format!("f_rest_{}", n + 15));
-            sh_rest[n * 3 + 2] = get(base, &format!("f_rest_{}", n + 30));
+        for (n, coeff) in rest_off.iter().enumerate() {
+            sh_rest[n * 3] = read(base, coeff[0]);
+            sh_rest[n * 3 + 1] = read(base, coeff[1]);
+            sh_rest[n * 3 + 2] = read(base, coeff[2]);
         }
 
         instances.push(KbSplatInstance {
@@ -268,8 +373,11 @@ pub async fn load_splat_ply(path: &str) -> Option<Vec<KbSplatInstance>> {
         });
     }
 
-    log!("Loaded {} splats from {path}", instances.len());
-    Some(instances)
+    log!("Loaded {} splats from {source}", instances.len());
+    Ok(KbSplatParse {
+        instances,
+        clamped_from,
+    })
 }
 
 // Returns false when the sphere (world-space center + radius) is entirely outside
@@ -569,12 +677,55 @@ impl KbGaussianSplatRenderGroup {
     /// files are skipped (no model appended), so callers can preload an optional
     /// set and cycle over whatever loaded.  Returns true when a model was added.
     pub async fn load(&mut self, path: &str, device_resources: &KbDeviceResources<'_>) -> bool {
-        let instances = match load_splat_ply(path).await {
+        let max_splats = self.device_max_splats(device_resources);
+        let instances = match load_splat_ply(path, max_splats).await {
             Some(instances) => instances,
             None => return false,
         };
-        let num_splats = instances.len() as u32;
+        self.add_model(instances, device_resources);
+        true
+    }
+
+    /// Parses an in-memory .ply (e.g. one the user picked at runtime) and appends
+    /// it as a new model.  Synchronous -- no file I/O -- so it is callable from a
+    /// per-frame tick.  On success reports the loaded count and whether the cloud
+    /// was clamped to the GPU budget; on failure returns a short user-displayable
+    /// reason.  Never panics on malformed bytes.
+    pub fn load_from_bytes(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        device_resources: &KbDeviceResources<'_>,
+    ) -> Result<KbSplatLoadInfo, String> {
+        let max_splats = self.device_max_splats(device_resources);
+        let parse = parse_splat_ply(bytes, name, max_splats)?;
+        let info = KbSplatLoadInfo {
+            num_splats: parse.instances.len() as u32,
+            clamped_from: parse.clamped_from,
+        };
+        self.add_model(parse.instances, device_resources);
+        Ok(info)
+    }
+
+    /// Clamps the platform splat budget to what this device can actually put in
+    /// one storage-buffer binding, so oversized clouds degrade to a warning +
+    /// clamp instead of a buffer-creation panic.
+    fn device_max_splats(&self, device_resources: &KbDeviceResources<'_>) -> usize {
+        let limits = device_resources.device.limits();
+        let device_cap = (limits.max_storage_buffer_binding_size as u64)
+            .min(limits.max_buffer_size)
+            / size_of::<KbSplatInstance>() as u64;
+        MAX_SPLATS.min(device_cap as usize)
+    }
+
+    /// Uploads parsed instances as GPU buffers + sort state and appends the model.
+    fn add_model(
+        &mut self,
+        instances: Vec<KbSplatInstance>,
+        device_resources: &KbDeviceResources<'_>,
+    ) {
         let device = &device_resources.device;
+        let num_splats = instances.len() as u32;
 
         let splat_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("KbSplat_splat_buffer"),
@@ -747,7 +898,6 @@ impl KbGaussianSplatRenderGroup {
             bounding_center,
             bounding_radius,
         });
-        true
     }
 
     pub fn has_model(&self) -> bool {
@@ -924,3 +1074,102 @@ impl KbGaussianSplatRenderGroup {
 
 // Keep the GPU struct size in lockstep with the WGSL layout.
 const _: () = assert!(size_of::<KbSplatInstance>() == 160);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Builds a minimal binary-little-endian 3DGS .ply with `n` splats, each with
+    // position (1,2,3), identity-ish rotation, log-scale 0, and opacity logit 0.
+    fn make_ply(n: usize) -> Vec<u8> {
+        let mut header = String::from("ply\nformat binary_little_endian 1.0\n");
+        header.push_str(&format!("element vertex {n}\n"));
+        for p in [
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1",
+            "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ] {
+            header.push_str(&format!("property float {p}\n"));
+        }
+        header.push_str("end_header\n");
+        let mut bytes = header.into_bytes();
+        for _ in 0..n {
+            for v in [
+                1.0f32, 2.0, 3.0, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            ] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn parses_a_minimal_ply() {
+        let parse = parse_splat_ply(&make_ply(3), "test", MAX_SPLATS).unwrap();
+        assert_eq!(parse.instances.len(), 3);
+        assert!(parse.clamped_from.is_none());
+        // Position: X and Y are negated into the engine frame.
+        assert_eq!(parse.instances[0].position[0..3], [-1.0, -2.0, 3.0]);
+        // Log-scale 0 -> 1.0; opacity logit 0 -> sigmoid 0.5.
+        assert_eq!(parse.instances[0].scale_opacity, [1.0, 1.0, 1.0, 0.5]);
+    }
+
+    #[test]
+    fn clamps_to_max_splats_and_reports_it() {
+        let parse = parse_splat_ply(&make_ply(10), "test", 4).unwrap();
+        assert_eq!(parse.instances.len(), 4);
+        assert_eq!(parse.clamped_from, Some(10));
+    }
+
+    #[test]
+    fn tolerates_truncated_data() {
+        let mut ply = make_ply(5);
+        ply.truncate(ply.len() - 2 * 14 * 4 - 1); // cut off the last two splats
+        let parse = parse_splat_ply(&ply, "test", MAX_SPLATS).unwrap();
+        assert_eq!(parse.instances.len(), 2);
+        // Truncation is not the same as hitting the splat budget.
+        assert!(parse.clamped_from.is_none());
+    }
+
+    #[test]
+    fn rejects_garbage_without_panicking() {
+        assert!(parse_splat_ply(b"not a ply at all", "test", MAX_SPLATS).is_err());
+        assert!(parse_splat_ply(b"", "test", MAX_SPLATS).is_err());
+        // Valid header but zero vertices.
+        assert!(parse_splat_ply(
+            b"ply\nformat binary_little_endian 1.0\nelement vertex 0\nproperty float x\nend_header\n",
+            "test",
+            MAX_SPLATS
+        )
+        .is_err());
+        // Header claims vertices but the data section is missing entirely.
+        let no_data = String::from_utf8(make_ply(0)).unwrap().replace("vertex 0", "vertex 9");
+        assert!(parse_splat_ply(no_data.as_bytes(), "test", MAX_SPLATS).is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_formats_with_a_reason() {
+        // ASCII .ply: would otherwise parse the text section as binary garbage.
+        // (The format check fires before the vertex-count check, so an empty
+        // data section is fine here.)
+        let ascii = String::from_utf8(make_ply(0))
+            .unwrap()
+            .replace("binary_little_endian", "ascii");
+        let err = parse_splat_ply(ascii.as_bytes(), "test", MAX_SPLATS).unwrap_err();
+        assert!(err.contains("ascii"), "unexpected error: {err}");
+
+        // Missing 3DGS properties (e.g. a compressed or plain point-cloud .ply).
+        let plain = b"ply\nformat binary_little_endian 1.0\nelement vertex 1\n\
+            property float x\nproperty float y\nproperty float z\nend_header\n\
+            \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let err = parse_splat_ply(plain, "test", MAX_SPLATS).unwrap_err();
+        assert!(err.contains("scale_0"), "unexpected error: {err}");
+
+        // No format line at all.
+        assert!(parse_splat_ply(
+            b"ply\nelement vertex 1\nproperty float x\nend_header\n\x00\x00\x00\x00",
+            "test",
+            MAX_SPLATS
+        )
+        .is_err());
+    }
+}

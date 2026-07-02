@@ -30,7 +30,11 @@ impl KbGameEngine for EmptyGame {
         }
     }
 
-    async fn initialize_world(&mut self, _game_renderer: &mut KbRenderer<'_>) {
+    async fn initialize_world(
+        &mut self,
+        _game_renderer: &mut KbRenderer<'_>,
+        _game_config: &mut KbConfig,
+    ) {
         log!("EmptyGame::initialize_world() caled...");
 
         let right_vec: Vector3<f32> = Vector3::new(1.0, 0.0, 0.0);

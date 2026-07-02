@@ -8,6 +8,9 @@ cgmath = "0.18"
 getrandom = { version = "0.2", features = ["js"] }
 instant = { version = "0.1.12", features = ["wasm-bindgen"] }
 pollster = "0.3"
+# Native + browser file-open dialog for the "load your own .ply" button.  On
+# wasm it wraps an HTML file input, so the picked file never leaves the device.
+rfd = "0.14"
 
 kb_engine3 = { path = "../../" }
 

@@ -1,6 +1,6 @@
 use instant::Instant;
 use std::{collections::HashMap, sync::Arc};
-use wgpu_text::glyph_brush::{Section as TextSection, Text};
+use wgpu_text::glyph_brush::{HorizontalAlign, Layout, Section as TextSection, Text, VerticalAlign};
 
 use crate::{
     kb_assets::*,
@@ -11,7 +11,7 @@ use crate::{
     log,
     render_groups::{
         kb_bullet_hole_group::*, kb_gaussian_splat_group::*, kb_line_group::*, kb_model_group::*,
-        kb_postprocess_group::*, kb_sprite_group::*, kb_sunbeam_group::*,
+        kb_postprocess_group::*, kb_sprite_group::*, kb_sunbeam_group::*, kb_ui_group::*,
     },
     PERF_SCOPE,
 };
@@ -31,6 +31,14 @@ pub struct KbRenderer<'a> {
     // buffers in the vertex stage, which WebGL2 can't do, so we must not create it
     // for the GL-backed 2D/3D demos.
     gaussian_splat_render_group: Option<KbGaussianSplatRenderGroup>,
+    ui_render_group: KbUiRenderGroup,
+    // Screen-space buttons the game wants drawn this frame (set_ui_buttons).
+    // Purely visual: hit-testing stays in the game, which knows the rects.
+    ui_buttons: Vec<KbUiButton>,
+    // Status line drawn bottom-center in its own color (e.g. red load errors),
+    // independent of the help text.  Empty = hidden.
+    status_msg: String,
+    status_msg_color: CgVec4,
 
     bullet_hole_render_group: KbBulletHoleRenderGroup,
     bullet_hole_actor_index: Option<u32>,
@@ -58,6 +66,8 @@ pub struct KbRenderer<'a> {
     display_debug_msg: bool,
     game_debug_msg: String,
     game_hud_msg: String,
+    // Shown right-aligned in the top-right corner while help is up (e.g. camera pos).
+    game_topright_msg: String,
     debug_msg_color: CgVec4,
 }
 
@@ -110,6 +120,8 @@ impl<'a> KbRenderer<'a> {
         )
         .await;
 
+        let ui_render_group = KbUiRenderGroup::new(&device_resources, &mut asset_manager).await;
+
         let debug_lines = Vec::<KbLine>::new();
 
         KbRenderer {
@@ -122,6 +134,10 @@ impl<'a> KbRenderer<'a> {
             line_render_group,
             sunbeam_render_group,
             gaussian_splat_render_group: None,
+            ui_render_group,
+            ui_buttons: Vec::new(),
+            status_msg: "".to_string(),
+            status_msg_color: CgVec4::new(1.0, 0.25, 0.2, 1.0),
             custom_world_render_groups,
             custom_foreground_render_groups,
 
@@ -146,6 +162,7 @@ impl<'a> KbRenderer<'a> {
 
             game_debug_msg: "".to_string(),
             game_hud_msg: "".to_string(),
+            game_topright_msg: "".to_string(),
 
             allow_debug_text: true,
             display_debug_msg: false,
@@ -216,9 +233,21 @@ impl<'a> KbRenderer<'a> {
         _num_game_objects: u32,
         game_config: &KbConfig,
     ) {
+        // Button background quads draw first so all text (labels included) lands
+        // on top of them.
+        self.ui_render_group.render(
+            command_encoder,
+            view,
+            &self.device_resources,
+            &self.ui_buttons,
+            game_config,
+        );
+
         let device_resources = &mut self.device_resources;
 
-        if self.allow_debug_text {
+        // Text pass: debug/help text (when enabled) plus button labels and the
+        // status line (always).
+        if self.allow_debug_text || !self.ui_buttons.is_empty() || !self.status_msg.is_empty() {
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Text"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -266,18 +295,90 @@ impl<'a> KbRenderer<'a> {
                 }
             };
 
+            let msg_color = [
+                self.debug_msg_color.x,
+                self.debug_msg_color.y,
+                self.debug_msg_color.z,
+                self.debug_msg_color.w,
+            ];
             let section = TextSection::default()
                 .add_text(
                     Text::new(&frame_time_string)
-                        .with_color([
-                            self.debug_msg_color.x,
-                            self.debug_msg_color.y,
-                            self.debug_msg_color.z,
-                            self.debug_msg_color.w,
-                        ])
+                        .with_color(msg_color)
                         .with_scale(24.0 * 1.0),
                 )
                 .with_screen_position((10.0, 10.0));
+
+            // Right-aligned corner text (camera pos, etc.), anchored to the top-right.
+            let topright_section = TextSection::default()
+                .add_text(
+                    Text::new(&self.game_topright_msg)
+                        .with_color(msg_color)
+                        .with_scale(24.0 * 1.0),
+                )
+                .with_screen_position((game_config.window_width as f32 - 10.0, 10.0))
+                .with_layout(Layout::default().h_align(HorizontalAlign::Right));
+
+            // Centered button labels; sized off the button so they stay
+            // readable on high-DPI touch screens.
+            let button_sections: Vec<TextSection> = self
+                .ui_buttons
+                .iter()
+                .map(|button| {
+                    let (x, y, w, h) = button.rect;
+                    TextSection::default()
+                        .add_text(
+                            Text::new(&button.label)
+                                .with_color(button.text_color)
+                                .with_scale(h * 0.42),
+                        )
+                        .with_screen_position((x + w * 0.5, y + h * 0.5))
+                        .with_layout(
+                            Layout::default_single_line()
+                                .h_align(HorizontalAlign::Center)
+                                .v_align(VerticalAlign::Center),
+                        )
+                })
+                .collect();
+
+            // Bottom-center status line, sized like the buttons so it reads on
+            // high-DPI touch screens.
+            let status_scale = ((game_config.window_width.min(game_config.window_height) as f32)
+                * 0.035)
+                .clamp(22.0, 44.0);
+            let status_section = TextSection::default()
+                .add_text(
+                    Text::new(&self.status_msg)
+                        .with_color([
+                            self.status_msg_color.x,
+                            self.status_msg_color.y,
+                            self.status_msg_color.z,
+                            self.status_msg_color.w,
+                        ])
+                        .with_scale(status_scale),
+                )
+                .with_screen_position((
+                    game_config.window_width as f32 * 0.5,
+                    game_config.window_height as f32 - status_scale * 2.5,
+                ))
+                .with_layout(
+                    Layout::default_single_line()
+                        .h_align(HorizontalAlign::Center)
+                        .v_align(VerticalAlign::Center),
+                );
+
+            let mut sections = Vec::new();
+            if self.allow_debug_text {
+                sections.push(&section);
+                if self.display_debug_msg && !self.game_topright_msg.is_empty() {
+                    sections.push(&topright_section);
+                }
+            }
+            sections.extend(button_sections.iter());
+            if !self.status_msg.is_empty() {
+                sections.push(&status_section);
+            }
+
             device_resources.brush.resize_view(
                 game_config.window_width as f32,
                 game_config.window_height as f32,
@@ -288,7 +389,7 @@ impl<'a> KbRenderer<'a> {
                 .queue(
                     &device_resources.device,
                     &device_resources.queue,
-                    vec![&section],
+                    sections,
                 )
                 .unwrap();
             device_resources.brush.draw(&mut render_pass);
@@ -617,6 +718,26 @@ impl<'a> KbRenderer<'a> {
         splat_group.load(file_path, &self.device_resources).await
     }
 
+    /// Parses an in-memory splat .ply (e.g. one the user picked at runtime) and
+    /// appends it as a selectable cloud.  Synchronous, so it can be called from
+    /// tick_frame -- but the splat pipeline must already exist, i.e. at least one
+    /// prior `load_gaussian_splat` call (pipeline creation needs async shader
+    /// loads).  On success reports the count and whether the cloud was clamped
+    /// to the GPU budget; on failure returns a short user-displayable reason.
+    pub fn load_gaussian_splat_from_bytes(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        params: &KbSplatParams,
+    ) -> Result<KbSplatLoadInfo, String> {
+        let Some(splat_group) = &mut self.gaussian_splat_render_group else {
+            log!("load_gaussian_splat_from_bytes called before the splat pipeline exists");
+            return Err("splat renderer not initialized".to_string());
+        };
+        splat_group.set_params(params);
+        splat_group.load_from_bytes(bytes, name, &self.device_resources)
+    }
+
     /// Number of splat clouds preloaded via `load_gaussian_splat`.
     pub fn num_gaussian_splats(&self) -> usize {
         self.gaussian_splat_render_group
@@ -720,8 +841,28 @@ impl<'a> KbRenderer<'a> {
         self.allow_debug_text = allow;
     }
 
+    /// Sets the screen-space buttons to draw this frame (background quads plus
+    /// centered labels).  Purely visual: the game hit-tests the same rects
+    /// against mouse/touch input itself.
+    pub fn set_ui_buttons(&mut self, buttons: Vec<KbUiButton>) {
+        self.ui_buttons = buttons;
+    }
+
+    /// Sets the bottom-center status line (empty string hides it).  Unlike the
+    /// help text this is always visible, so games use it for things the user
+    /// must see -- load errors, clamp warnings, progress.
+    pub fn set_status_msg(&mut self, msg: &str, color: &CgVec4) {
+        self.status_msg = msg.to_string();
+        self.status_msg_color = *color;
+    }
+
     pub fn set_debug_game_msg(&mut self, msg: &str) {
         self.game_debug_msg = msg.to_string();
+    }
+
+    /// Right-aligned text drawn in the top-right corner while help is shown.
+    pub fn set_debug_topright_msg(&mut self, msg: &str) {
+        self.game_topright_msg = msg.to_string();
     }
 
     pub fn set_hud_msg(&mut self, msg: &str) {

@@ -134,6 +134,7 @@ impl KbInputManager {
             PhysicalKey::Code(KeyCode::KeyD) => "d",
             PhysicalKey::Code(KeyCode::Space) => "space",
             PhysicalKey::Code(KeyCode::KeyH) => "h",
+            PhysicalKey::Code(KeyCode::KeyL) => "l",
             PhysicalKey::Code(KeyCode::KeyM) => "m",
             PhysicalKey::Code(KeyCode::KeyY) => "y",
             PhysicalKey::Code(KeyCode::KeyV) => "v",
