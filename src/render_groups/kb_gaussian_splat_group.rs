@@ -506,8 +506,8 @@ impl KbGaussianSplatRenderGroup {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("KbSplat_pipeline_layout"),
-            bind_group_layouts: &[&uniform_bind_group_layout, &storage_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_bind_group_layout), Some(&storage_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -515,13 +515,13 @@ impl KbGaussianSplatRenderGroup {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -545,7 +545,8 @@ impl KbGaussianSplatRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         // --- GPU radix sort pipelines ----------------------------------------
@@ -611,8 +612,8 @@ impl KbGaussianSplatRenderGroup {
         let sort_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("KbSplat_sort_pipeline_layout"),
-                bind_group_layouts: &[&sort_globals_layout, &sort_pass_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&sort_globals_layout), Some(&sort_pass_layout)],
+                immediate_size: 0,
             });
 
         let make_pipeline = |label: &str, entry_point: &'static str| {
@@ -620,8 +621,9 @@ impl KbGaussianSplatRenderGroup {
                 label: Some(label),
                 layout: Some(&sort_pipeline_layout),
                 module: sort_shader,
-                entry_point,
+                entry_point: Some(entry_point),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
             })
         };
         let sort_pipeline_compute_keys = make_pipeline("KbSplat_sort_compute_keys", "cs_compute_keys");
@@ -1049,6 +1051,7 @@ impl KbGaussianSplatRenderGroup {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &device_resources.render_textures[0].view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -1056,6 +1059,7 @@ impl KbGaussianSplatRenderGroup {
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
                 timestamp_writes: None,
             });
 

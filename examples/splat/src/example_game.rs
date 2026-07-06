@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use cgmath::InnerSpace;
 
 use kb_engine3::{
-    kb_config::*, kb_engine::*, kb_game_object::*, kb_input::*, kb_renderer::*, kb_utils::*, log,
-    render_groups::{kb_gaussian_splat_group::KbSplatParams, kb_ui_group::KbUiButton},
+    egui, kb_config::*, kb_engine::*, kb_game_object::*, kb_input::*, kb_renderer::*, kb_utils::*,
+    log, render_groups::kb_gaussian_splat_group::KbSplatParams,
 };
 
 // Splat clouds the demo preloads and cycles between with [Space].  Missing files
@@ -19,19 +19,44 @@ const CAMERA_MOVE_RATE: f32 = 1.0;
 const CAMERA_ROTATION_RATE: f32 = 30.0;
 const PARAM_RATE: f32 = 1.5;
 
-// Touch (mobile / iOS): the screen splits into a left "move" stick and a right
-// "look" stick.  A drag of this fraction of the screen's smaller axis counts as
-// full deflection; smaller drags scale proportionally.  Using a fraction (not
-// fixed pixels) keeps the feel consistent across canvas resolutions.
-const TOUCH_STICK_SPAN: f64 = 0.18;
-const TOUCH_DEAD_ZONE: f32 = 0.12;
-const TOUCH_LOOK_RATE: f32 = 70.0; // degrees/sec at full deflection
-// Top strip of the screen toggles the help text when tapped, and is kept out of
-// the sticks.  (Load/cycle live on real GUI buttons in the bottom-right.)
-const TOUCH_UI_BAND: f64 = 0.14;
+// On-screen touch pads (drawn with egui, fed by raw touches so both work at
+// once): left pad = move, right pad = look.  Sizes are fractions of the
+// shorter screen axis, in egui points, so they scale with any resolution.
+const PAD_RADIUS_FRAC: f32 = 0.16;
+const PAD_MARGIN_FRAC: f32 = 0.05;
+// Fraction of the pad radius that counts as full deflection.
+const PAD_SPAN_FRAC: f32 = 0.75;
+const PAD_DEAD_ZONE: f32 = 0.12;
+const PAD_LOOK_RATE: f32 = 70.0; // degrees/sec at full deflection
 
-fn point_in_rect(rect: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
-    x >= rect.0 && x <= rect.0 + rect.2 && y >= rect.1 && y <= rect.1 + rect.3
+// Right-click + drag look: camera degrees turned per pixel of mouse movement.
+const MOUSE_LOOK_SENS: f32 = 0.18;
+
+
+/// Deflection of one touch pad: finger offset from the pad center, saturating
+/// at `span` and zeroed inside the dead zone.
+fn pad_deflection(finger: egui::Pos2, center: egui::Pos2, span: f32) -> egui::Vec2 {
+    let mut defl = (finger - center) / span;
+    let len = defl.length();
+    if len < PAD_DEAD_ZONE {
+        return egui::Vec2::ZERO;
+    }
+    if len > 1.0 {
+        defl /= len;
+    }
+    defl
+}
+
+/// Draws the "Editor | Game" mode switch and applies clicks to `editor_mode`.
+/// Always shown (in both modes) so it's the way back from game mode -- important
+/// on touch, where there's no keyboard shortcut.
+fn draw_mode_switch(ui: &mut egui::Ui, editor_mode: &mut bool) {
+    if ui.selectable_label(*editor_mode, "Editor").clicked() {
+        *editor_mode = true;
+    }
+    if ui.selectable_label(!*editor_mode, "Game").clicked() {
+        *editor_mode = false;
+    }
 }
 
 // "6185394" -> "6,185,394" for status messages.
@@ -78,6 +103,15 @@ pub struct SplatGame {
     // Transient bottom-center message (load errors, clamp warnings) and its
     // remaining time on screen.
     status: Option<(String, CgVec4, f32)>,
+    // The move/look pads draw once the first touch proves this is a touch
+    // device (there's no reliable "has touchscreen" query through winit).
+    touch_pads_visible: bool,
+    // True while the right button is held for mouse look.  Drives grabbing +
+    // hiding the cursor on the first frame and restoring it once on release.
+    looking: bool,
+    // Editor vs game mode.  Editor: the full menu bar + debug overlay are always
+    // shown.  Game: only the small mode switch remains, for an unobstructed view.
+    editor_mode: bool,
 }
 
 impl SplatGame {
@@ -141,6 +175,9 @@ impl KbGameEngine for SplatGame {
             picked_ply: Arc::new(Mutex::new(None)),
             picker_state: Arc::new(Mutex::new(PickerState::Idle)),
             status: None,
+            touch_pads_visible: false,
+            looking: false,
+            editor_mode: true,
         }
     }
 
@@ -168,6 +205,10 @@ impl KbGameEngine for SplatGame {
         renderer.set_active_gaussian_splat(0);
         renderer.set_tonemap_enabled(true);
 
+        // Help is reachable from the menu bar's Help button, so drop the
+        // engine's "Press [H]..." hint line.
+        renderer.set_show_help_hint(false);
+
         renderer.set_camera(&self.game_camera);
     }
 
@@ -187,99 +228,263 @@ impl KbGameEngine for SplatGame {
 
         // Movement (keyboard)
         let mut move_vec = CG_VEC3_ZERO;
-        if input_manager.get_key_state("w").is_down() { move_vec += forward_dir; }
-        if input_manager.get_key_state("s").is_down() { move_vec += -forward_dir; }
-        if input_manager.get_key_state("d").is_down() { move_vec += right_dir; }
-        if input_manager.get_key_state("a").is_down() { move_vec += -right_dir; }
+        if input_manager.get_key_state("w").is_down() {
+            move_vec += forward_dir;
+        }
+        if input_manager.get_key_state("s").is_down() {
+            move_vec += -forward_dir;
+        }
+        if input_manager.get_key_state("d").is_down() {
+            move_vec += right_dir;
+        }
+        if input_manager.get_key_state("a").is_down() {
+            move_vec += -right_dir;
+        }
         let sprint = input_manager.get_key_state("left_shift").is_down();
 
         // Look (keyboard)
         let mut camera_rot = self.game_camera.get_rotation();
         let rot_amount = delta_time * CAMERA_ROTATION_RATE;
-        if input_manager.get_key_state("left_arrow").is_down() { camera_rot.x += rot_amount; }
-        if input_manager.get_key_state("right_arrow").is_down() { camera_rot.x -= rot_amount; }
-        if input_manager.get_key_state("up_arrow").is_down() { camera_rot.y -= rot_amount; }
-        if input_manager.get_key_state("down_arrow").is_down() { camera_rot.y += rot_amount; }
+        if input_manager.get_key_state("left_arrow").is_down() {
+            camera_rot.x += rot_amount;
+        }
+        if input_manager.get_key_state("right_arrow").is_down() {
+            camera_rot.x -= rot_amount;
+        }
+        if input_manager.get_key_state("up_arrow").is_down() {
+            camera_rot.y -= rot_amount;
+        }
+        if input_manager.get_key_state("down_arrow").is_down() {
+            camera_rot.y += rot_amount;
+        }
 
-        // Touch (mobile / iOS): left half of the screen is a move stick, right
-        // half is a look stick.  Each reads the finger's offset from where it
-        // first landed as an analog deflection, so a finger held still doesn't
-        // drift and a drag-and-hold keeps moving/turning.  Spans are screen
-        // fractions, so this behaves the same at any canvas resolution.
-        let screen_w = game_config.window_width.max(1) as f64;
-        let screen_h = game_config.window_height.max(1) as f64;
-        let span = screen_w.min(screen_h) * TOUCH_STICK_SPAN;
-        let ui_band = screen_h * TOUCH_UI_BAND;
-
-        // GUI buttons, bottom-right: [Load .ply] above [Next splat].  Sized off
-        // the smaller screen axis (clamped to finger-friendly bounds) so they
-        // stay tappable on phones without dominating a desktop window.
-        let btn_h = ((screen_w.min(screen_h) as f32) * 0.08).clamp(40.0, 96.0);
-        let btn_w = btn_h * 3.6;
-        let margin = btn_h * 0.3;
-        let btn_x = screen_w as f32 - btn_w - margin;
-        let cycle_rect = (btn_x, screen_h as f32 - btn_h - margin, btn_w, btn_h);
-        let load_rect = (btn_x, cycle_rect.1 - btn_h - margin * 0.5, btn_w, btn_h);
-
-        // Mouse: hover highlights, left-click triggers.
-        let (mx, my) = {
-            let pos = input_manager.get_mouse_position();
-            (pos.0 as f32, pos.1 as f32)
-        };
-        let mut load_hot = point_in_rect(load_rect, mx, my);
-        let mut cycle_hot = point_in_rect(cycle_rect, mx, my);
-        let clicked = input_manager.get_key_state("mouse_left").just_pressed();
-        let mut do_load = clicked && load_hot;
-        let mut do_cycle = clicked && cycle_hot;
-
-        for (_id, touch) in input_manager.get_touch_map().iter() {
-            if !(touch.touch_state.is_down() || touch.touch_state.just_pressed()) {
-                continue;
+        // Look (mouse): hold the right button to look.  While held the cursor
+        // is hidden and grabbed to the window so it can't slide off-screen, and
+        // the camera turns from RAW mouse motion -- position-independent, so you
+        // can sweep as far as you like without the pointer hitting an edge.
+        // Matches the touch look pad: move right = look right, move up = look up.
+        let rmb = input_manager.get_key_state("mouse_right");
+        if rmb.is_down() || rmb.just_pressed() {
+            if !self.looking {
+                self.looking = true;
+                renderer.set_cursor_visible(false);
+                renderer.set_cursor_grabbed(true);
             }
+            let (dx, dy) = input_manager.get_mouse_raw_delta();
+            camera_rot.x -= dx as f32 * MOUSE_LOOK_SENS;
+            camera_rot.y += dy as f32 * MOUSE_LOOK_SENS;
+        } else if self.looking {
+            self.looking = false;
+            renderer.set_cursor_grabbed(false);
+            renderer.set_cursor_visible(true);
+        }
 
-            // Touches that started on a GUI button belong to it (highlight while
-            // held, trigger on press) and never feed the movement/look sticks --
-            // start_pos anchors them even if the finger drifts.
-            let (tx, ty) = (touch.start_pos.0 as f32, touch.start_pos.1 as f32);
-            if point_in_rect(load_rect, tx, ty) {
-                load_hot = true;
-                do_load |= touch.touch_state.just_pressed();
-                continue;
-            }
-            if point_in_rect(cycle_rect, tx, ty) {
-                cycle_hot = true;
-                do_cycle |= touch.touch_state.just_pressed();
-                continue;
-            }
+        // --- GUI (egui, same on native + web) ---
+        let ctx = renderer.egui_ctx().clone();
 
-            // Top strip toggles help (tap only), kept out of the sticks.
-            if touch.start_pos.1 < ui_band {
-                if touch.touch_state.just_pressed() {
-                    renderer.enable_help_text();
+        // On web, egui's pixels-per-point follows the browser devicePixelRatio,
+        // which on a high-DPR display left the fixed 1280x720 canvas with very
+        // few layout "points" -- the panels ballooned.  Pin ppp to the surface
+        // instead.  A 480-point-tall design space gives ppp ~1.5, matching the
+        // native desktop look (which was fine) so the GUI reads at a comfortable
+        // size instead of tiny.  Native is left alone (honors OS scaling).
+        #[cfg(target_arch = "wasm32")]
+        {
+            ctx.set_pixels_per_point((game_config.window_height as f32 / 480.0).max(0.5));
+            // Finger-friendly tap targets (iOS especially): enlarge egui's
+            // interactive sizing so menu items, dropdown entries and sliders are
+            // easy to tap.  Set on the global style so dropdown popups -- which
+            // don't inherit a per-`ui` spacing tweak -- get it too.  Desktop web
+            // gets slightly larger controls as well, which is fine.
+            ctx.all_styles_mut(|s| {
+                s.spacing.button_padding = egui::vec2(16.0, 12.0);
+                s.spacing.interact_size.y = 38.0;
+                s.spacing.item_spacing = egui::vec2(14.0, 10.0);
+            });
+        }
+
+        let screen = ctx.content_rect();
+
+        // Scene status shown on the right of the menu bar.
+        let active_scene = self
+            .splat_names
+            .get(self.active_splat)
+            .cloned()
+            .unwrap_or_else(|| "none".to_string());
+        let scene_total = self.splat_names.len().max(1);
+        let splat_count = renderer.active_gaussian_splat_count();
+
+        let mut do_load = false;
+        let mut do_cycle = false;
+        let mut params_changed = false;
+
+        // Editor vs game mode.  In editor mode the full bar is always shown --
+        // the mode switch, File (open), Debug (scene cycle + future toggles),
+        // Splat (parameter sliders), Help, and a right-aligned scene status.  In
+        // game mode only the small mode switch remains, so the view is
+        // unobstructed; that switch is the way back too (no keyboard needed, so
+        // it works on touch).
+        let editor = self.editor_mode;
+        let menu_bar = egui::Area::new(egui::Id::new("menu_bar"))
+            .fixed_pos(screen.left_top())
+            .constrain(true)
+            .show(&ctx, |ui| {
+                egui::Frame::side_top_panel(ui.style()).show(ui, |ui| {
+                    if !editor {
+                        // Game mode: just the mode switch, kept small.  (MenuBar
+                        // always claims full width, so it's only used in editor.)
+                        ui.horizontal(|ui| draw_mode_switch(ui, &mut self.editor_mode));
+                        return;
+                    }
+                    ui.set_width(screen.width());
+                    egui::MenuBar::new().ui(ui, |ui| {
+                        draw_mode_switch(ui, &mut self.editor_mode);
+                        ui.separator();
+                        ui.menu_button("File", |ui| {
+                            // Buttons auto-close the menu on click.
+                            do_load |= ui.button("Load .ply…").clicked();
+                        });
+                        ui.menu_button("Debug", |ui| {
+                            do_cycle |= ui.button("Next scene").clicked();
+                        });
+                        ui.menu_button("Splat", |ui| {
+                            // Sliders keep the menu open while dragged.
+                            ui.set_min_width(240.0);
+                            ui.spacing_mut().slider_width = 150.0;
+                            let p = &mut self.splat_params;
+                            params_changed |= ui
+                                .add(egui::Slider::new(&mut p.falloff, 0.01..=20.0).text("falloff"))
+                                .changed();
+                            params_changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut p.scale, 0.1..=20.0).text("splat scale"),
+                                )
+                                .changed();
+                            params_changed |= ui
+                                .add(egui::Slider::new(&mut p.contrast, 0.1..=5.0).text("contrast"))
+                                .changed();
+                            params_changed |= ui
+                                .add(
+                                    egui::Slider::new(&mut p.overall_scale, 0.1..=10.0)
+                                        .text("overall scale"),
+                                )
+                                .changed();
+                            // The splat record carries 8 "rest" coefficients (degrees
+                            // 1+2), so 2 is the highest degree that changes anything.
+                            let mut sh = p.max_sh_degree as u32;
+                            if ui
+                                .add(egui::Slider::new(&mut sh, 0..=2).text("SH degree"))
+                                .changed()
+                            {
+                                p.max_sh_degree = sh as f32;
+                                params_changed = true;
+                            }
+                        });
+                        // Top-level toggle (not a dropdown) for the help text.
+                        if ui.button("Help").clicked() {
+                            renderer.enable_help_text();
+                        }
+                        // Right-aligned scene status.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(format!(
+                                "{active_scene}  ({}/{scene_total})   {splat_count} splats",
+                                self.active_splat + 1
+                            ));
+                        });
+                    });
+                });
+            });
+
+        // Game mode hides the engine's debug/camera overlay too, for a clean
+        // view.  In editor mode it's shown, pushed below the bar so the bar
+        // doesn't cover it (bar rect is in points; the text is placed in physical
+        // pixels, hence the pixels_per_point scale).
+        renderer.set_allow_debug_text(editor);
+        let bar_bottom_px = menu_bar.response.rect.bottom() * ctx.pixels_per_point();
+        renderer.set_debug_text_top_offset(bar_bottom_px + 6.0);
+
+        // Touch pads.  egui's pointer only tracks one touch, so the pads read
+        // the engine's raw touch map -- move and look then work simultaneously
+        // -- and use egui purely as the painter.
+        let touch_map = input_manager.get_touch_map();
+        if !touch_map.is_empty() {
+            self.touch_pads_visible = true;
+        }
+        if self.touch_pads_visible {
+            let ppp = ctx.pixels_per_point();
+            let min_axis = screen.width().min(screen.height());
+            let radius = min_axis * PAD_RADIUS_FRAC;
+            let margin = min_axis * PAD_MARGIN_FRAC;
+            let span = radius * PAD_SPAN_FRAC;
+            let move_center = egui::pos2(
+                screen.left() + margin + radius,
+                screen.bottom() - margin - radius,
+            );
+            let look_center = egui::pos2(
+                screen.right() - margin - radius,
+                screen.bottom() - margin - radius,
+            );
+
+            // A touch belongs to the pad it STARTED on, so a held drag can
+            // wander outside the circle without hopping pads.
+            let mut move_defl = egui::Vec2::ZERO;
+            let mut look_defl = egui::Vec2::ZERO;
+            for (_id, touch) in touch_map.iter() {
+                if !(touch.touch_state.is_down() || touch.touch_state.just_pressed()) {
+                    continue;
                 }
-                continue;
+                let start = egui::pos2(
+                    touch.start_pos.0 as f32 / ppp,
+                    touch.start_pos.1 as f32 / ppp,
+                );
+                let finger = egui::pos2(
+                    touch.current_pos.0 as f32 / ppp,
+                    touch.current_pos.1 as f32 / ppp,
+                );
+                if start.distance(move_center) <= radius {
+                    move_defl = pad_deflection(finger, move_center, span);
+                } else if start.distance(look_center) <= radius {
+                    look_defl = pad_deflection(finger, look_center, span);
+                }
             }
 
-            let dx = ((touch.current_pos.0 - touch.start_pos.0) / span).clamp(-1.0, 1.0) as f32;
-            let dy = ((touch.current_pos.1 - touch.start_pos.1) / span).clamp(-1.0, 1.0) as f32;
-            if dx * dx + dy * dy < TOUCH_DEAD_ZONE * TOUCH_DEAD_ZONE {
-                continue;
-            }
-            if touch.start_pos.0 < screen_w * 0.5 {
-                // Left stick: drag right = strafe right, drag up = move forward.
-                move_vec += right_dir * dx;
-                move_vec -= forward_dir * dy;
-            } else {
-                // Right stick: drag right = look right, drag up = look up.
-                camera_rot.x -= dx * TOUCH_LOOK_RATE * delta_time;
-                camera_rot.y += dy * TOUCH_LOOK_RATE * delta_time;
+            // Left pad: drag right = strafe right, drag up = move forward.
+            // Right pad: drag right = look right, drag up = look up.
+            move_vec += right_dir * move_defl.x - forward_dir * move_defl.y;
+            camera_rot.x -= look_defl.x * PAD_LOOK_RATE * delta_time;
+            camera_rot.y += look_defl.y * PAD_LOOK_RATE * delta_time;
+
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("touch_pads"),
+            ));
+            for (center, defl) in [(move_center, move_defl), (look_center, look_defl)] {
+                painter.circle(
+                    center,
+                    radius,
+                    egui::Color32::from_rgba_unmultiplied(10, 23, 15, 110),
+                    egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(64, 160, 90, 150)),
+                );
+                painter.circle(
+                    center + defl * span,
+                    radius * 0.35,
+                    egui::Color32::from_rgba_unmultiplied(38, 115, 57, 200),
+                    egui::Stroke::new(
+                        2.0,
+                        egui::Color32::from_rgba_unmultiplied(120, 255, 145, 220),
+                    ),
+                );
             }
         }
 
         if move_vec.magnitude2() > 0.001 {
-            let speed = if sprint { CAMERA_MOVE_RATE * 3.0 } else { CAMERA_MOVE_RATE };
-            let new_pos = self.game_camera.get_position()
-                + move_vec.normalize() * delta_time * speed;
+            let speed = if sprint {
+                CAMERA_MOVE_RATE * 3.0
+            } else {
+                CAMERA_MOVE_RATE
+            };
+            let new_pos =
+                self.game_camera.get_position() + move_vec.normalize() * delta_time * speed;
             self.game_camera.set_position(&new_pos);
         }
 
@@ -320,8 +525,11 @@ impl KbGameEngine for SplatGame {
                     });
                 }
                 Err(reason) => {
-                    self.status =
-                        Some((format!("Couldn't load {file_name}: {reason}"), STATUS_RED, 10.0));
+                    self.status = Some((
+                        format!("Couldn't load {file_name}: {reason}"),
+                        STATUS_RED,
+                        10.0,
+                    ));
                 }
             }
         }
@@ -345,19 +553,43 @@ impl KbGameEngine for SplatGame {
             },
         }
 
-        // Splat param adjustments
+        // Splat param adjustments (keyboard mirrors of the sliders)
         let adj = delta_time * PARAM_RATE;
         let p = &mut self.splat_params;
-        let mut changed = false;
+        let mut changed = params_changed;
 
-        if input_manager.get_key_state("1").is_down() { p.falloff = (p.falloff - adj).max(0.01); changed = true; }
-        if input_manager.get_key_state("2").is_down() { p.falloff = (p.falloff + adj).min(20.0); changed = true; }
-        if input_manager.get_key_state("3").is_down() { p.scale = (p.scale - adj).max(0.1); changed = true; }
-        if input_manager.get_key_state("4").is_down() { p.scale = (p.scale + adj).min(20.0); changed = true; }
-        if input_manager.get_key_state("5").is_down() { p.contrast = (p.contrast - adj).max(0.1); changed = true; }
-        if input_manager.get_key_state("6").is_down() { p.contrast = (p.contrast + adj).min(5.0); changed = true; }
-        if input_manager.get_key_state("7").is_down() { p.overall_scale = (p.overall_scale - adj).max(0.1); changed = true; }
-        if input_manager.get_key_state("8").is_down() { p.overall_scale = (p.overall_scale + adj).min(10.0); changed = true; }
+        if input_manager.get_key_state("1").is_down() {
+            p.falloff = (p.falloff - adj).max(0.01);
+            changed = true;
+        }
+        if input_manager.get_key_state("2").is_down() {
+            p.falloff = (p.falloff + adj).min(20.0);
+            changed = true;
+        }
+        if input_manager.get_key_state("3").is_down() {
+            p.scale = (p.scale - adj).max(0.1);
+            changed = true;
+        }
+        if input_manager.get_key_state("4").is_down() {
+            p.scale = (p.scale + adj).min(20.0);
+            changed = true;
+        }
+        if input_manager.get_key_state("5").is_down() {
+            p.contrast = (p.contrast - adj).max(0.1);
+            changed = true;
+        }
+        if input_manager.get_key_state("6").is_down() {
+            p.contrast = (p.contrast + adj).min(5.0);
+            changed = true;
+        }
+        if input_manager.get_key_state("7").is_down() {
+            p.overall_scale = (p.overall_scale - adj).max(0.1);
+            changed = true;
+        }
+        if input_manager.get_key_state("8").is_down() {
+            p.overall_scale = (p.overall_scale + adj).min(10.0);
+            changed = true;
+        }
         if input_manager.get_key_state("9").just_pressed() {
             // The splat record carries 8 "rest" coefficients (degrees 1+2), so 2
             // is the highest degree that changes anything.
@@ -380,34 +612,15 @@ impl KbGameEngine for SplatGame {
             .get(self.active_splat)
             .map_or("none", |s| s.as_str());
         let splat_count = renderer.active_gaussian_splat_count();
-        // Button styling: dark translucent fill, green accents to match the
-        // debug text; brightened while hovered or held.
-        let button = |label: &str, rect: (f32, f32, f32, f32), hot: bool| KbUiButton {
-            label: label.to_string(),
-            rect,
-            background: if hot {
-                [0.10, 0.35, 0.16, 0.92]
-            } else {
-                [0.04, 0.09, 0.06, 0.78]
-            },
-            border: if hot {
-                [0.45, 1.0, 0.55, 0.95]
-            } else {
-                [0.20, 0.55, 0.30, 0.65]
-            },
-            text_color: [0.0, 1.0, 0.0, 1.0],
-        };
-        renderer.set_ui_buttons(vec![
-            button("Load .ply", load_rect, load_hot),
-            button("Next scene", cycle_rect, cycle_hot),
-        ]);
-
         renderer.set_debug_game_msg(&format!(
             "Move: [W][A][S][D]   [Shift] sprint   Look: [Arrow Keys]\n\
-             Touch: left half = move,  right half = look,  top strip = help\n\n\
+             Touch: left pad = move,  right pad = look\n\n\
              [Space]     Next scene  {} ({}/{})   {} splats\n\
              [L]         Load your own .ply",
-            active_name, self.active_splat + 1, self.splat_names.len().max(1), splat_count,
+            active_name,
+            self.active_splat + 1,
+            self.splat_names.len().max(1),
+            splat_count,
         ));
         renderer.set_debug_topright_msg(&format!(
             "Camera\npos ({:.2}, {:.2}, {:.2})\nrot ({:.1}, {:.1})",

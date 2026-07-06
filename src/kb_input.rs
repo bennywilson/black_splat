@@ -38,6 +38,11 @@ pub struct KbInputManager {
     touch_id_to_info: HashMap<u64, KbTouchInfo>,
     mouse_scroll_delta: f32,
     cursor_position: (i32, i32),
+    // Raw mouse motion (winit DeviceEvent::MouseMotion) accumulated this frame.
+    // Independent of the cursor position, so it keeps reporting movement even
+    // when the cursor is grabbed/hidden at a window edge -- the basis for
+    // FPS-style mouse look.  Reset each frame in update_key_states.
+    mouse_raw_delta: (f64, f64),
     key_map: HashMap<&'static str, KbButtonState>,
 }
 
@@ -53,6 +58,17 @@ impl KbInputManager {
 
     pub fn update_mouse_scroll(&mut self, y_delta: f32) {
         self.mouse_scroll_delta += y_delta;
+    }
+
+    pub fn add_mouse_raw_delta(&mut self, dx: f64, dy: f64) {
+        self.mouse_raw_delta.0 += dx;
+        self.mouse_raw_delta.1 += dy;
+    }
+
+    /// Raw mouse movement accumulated since the last frame, in device units
+    /// (~pixels).  Use this for mouse look while the cursor is grabbed.
+    pub fn get_mouse_raw_delta(&self) -> (f64, f64) {
+        self.mouse_raw_delta
     }
 
     pub fn update_touch(
@@ -74,11 +90,14 @@ impl KbInputManager {
         {
             self.touch_id_to_info.remove(&id);
         } else if phase == winit::event::TouchPhase::Moved {
-            let touch_info = &mut self.touch_id_to_info.get_mut(&id).unwrap();
-            touch_info.frame_delta.0 = touch_info.current_pos.0 - location.x;
-            touch_info.frame_delta.1 = touch_info.current_pos.1 - location.y;
-            touch_info.current_pos.0 = location.x;
-            touch_info.current_pos.1 = location.y;
+            // A Moved for a touch we never saw start (its Started was dropped or
+            // already Ended) must not panic -- just ignore it.
+            if let Some(touch_info) = self.touch_id_to_info.get_mut(&id) {
+                touch_info.frame_delta.0 = touch_info.current_pos.0 - location.x;
+                touch_info.frame_delta.1 = touch_info.current_pos.1 - location.y;
+                touch_info.current_pos.0 = location.x;
+                touch_info.current_pos.1 = location.y;
+            }
         }
     }
 
@@ -103,7 +122,10 @@ impl KbInputManager {
             } else {
                 *key_pair = KbButtonState::None;
             };
-        } else {
+        } else if *state == ElementState::Pressed {
+            // Only a press creates a new entry.  A release for a button we
+            // never recorded (e.g. its press was swallowed elsewhere) must not
+            // fabricate a JustPressed.
             self.key_map.insert(button_name, KbButtonState::JustPressed);
         }
 
@@ -179,6 +201,7 @@ impl KbInputManager {
         }
 
         self.mouse_scroll_delta = 0.0;
+        self.mouse_raw_delta = (0.0, 0.0);
     }
 
     pub fn get_key_state(&self, key: &str) -> KbButtonState {

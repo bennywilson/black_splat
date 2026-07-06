@@ -143,8 +143,8 @@ impl KbSpriteRenderGroup {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&texture_bind_group_layout, &uniform_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&texture_bind_group_layout), Some(&uniform_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let opaque_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -152,13 +152,13 @@ impl KbSpriteRenderGroup {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc(), KbSpriteDrawInstance::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -177,8 +177,8 @@ impl KbSpriteRenderGroup {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -187,7 +187,8 @@ impl KbSpriteRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         let transparent_shader_handle = asset_manager
@@ -200,13 +201,13 @@ impl KbSpriteRenderGroup {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: transparent_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc(), KbSpriteDrawInstance::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: transparent_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -225,8 +226,8 @@ impl KbSpriteRenderGroup {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -235,7 +236,8 @@ impl KbSpriteRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         log!("  Creating vertex/index buffers");
@@ -359,6 +361,7 @@ impl KbSpriteRenderGroup {
         let color_attachment = Some(wgpu::RenderPassColorAttachment {
             view: &device_resources.render_textures[0].view,
             resolve_target: None,
+            depth_slice: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Load,
                 store: wgpu::StoreOp::Store,
@@ -378,6 +381,7 @@ impl KbSpriteRenderGroup {
                 stencil_ops: None,
             }),
             occlusion_query_set: None,
+            multiview_mask: None,
             timestamp_writes: None,
         });
         device_resources.queue.write_buffer(

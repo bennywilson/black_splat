@@ -9,6 +9,10 @@ anyhow = "1.0"
 bytemuck = { version = "1.12", features = [ "derive" ] }
 cfg-if = "1.0.0"
 cgmath = "0.18"
+# In-engine GUI (game HUDs and the editor).  egui-wgpu/egui-winit are the
+# official adapters and must version-match egui, wgpu, and winit.
+egui = "0.35"
+egui-wgpu = "0.35"
 env_logger = "0.10"
 getrandom = { version = "0.2", features = ["js"] }
 gltf="1.4.0"
@@ -17,8 +21,8 @@ json = "0.12.4"
 load_file = "1.0.1"
 log = "0.4"
 pollster = "0.3"
-winit = "0.29.15"
-wgpu_text = "0.8.7"
+winit = "0.30.13"
+wgpu_text = "29"
 wasm-bindgen = "0.2.92"
 wasm-bindgen-futures = "0.4.42"
 
@@ -28,7 +32,8 @@ default-features = false
 features = ["png", "jpeg"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-wgpu = "0.20.0"
+wgpu = "29"
+egui-winit = "0.35"
 tracy_full = {version = "1.7.1", features = ["enable"]}
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -36,7 +41,10 @@ console_log = { version = "0.2.0", features = [] }
 reqwest = { version = "0.11" }
 wasm-bindgen = "0.2.92"
 wasm-bindgen-futures = "0.4.42"
-wgpu = { version = "0.20.0", features = ["webgl"] }
+# The default "clipboard" feature pulls arboard, which doesn't build for
+# wasm32-unknown-unknown; egui still handles copy/paste through web events.
+egui-winit = { version = "0.35", default-features = false, features = ["links"] }
+wgpu = { version = "29", features = ["webgl"] }
 web-sys = { version = "0.3.69", features = [
     "Document",
     "Window",
@@ -49,10 +57,3 @@ web-sys = { version = "0.3.69", features = [
 wasm_include_2d = [] # feature has no explicit dependencies
 wasm_include_3d = [] # feature has no explicit dependencies
 wasm_include_key = [] # feature has no explicit dependencies
-
-# Local fork of wgpu 0.20.1 that drops the `maxInterStageShaderComponents` limit
-# from requestDevice -- Chrome 129+ removed it from the WebGPU spec and rejects it,
-# which otherwise panics the web build at device creation.  See
-# third_party/wgpu-0.20.1/src/backend/webgpu.rs.
-[patch.crates-io]
-wgpu = { path = "third_party/wgpu-0.20.1" }

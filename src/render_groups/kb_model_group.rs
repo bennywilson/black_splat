@@ -594,8 +594,8 @@ impl KbModelRenderGroup {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("KbModelRenderGroup_render_pipeline_layout"),
-                bind_group_layouts: &[&texture_bind_group_layout, &uniform_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&texture_bind_group_layout), Some(&uniform_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let shader_handle = asset_manager
@@ -637,13 +637,13 @@ impl KbModelRenderGroup {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: model_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: model_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format.add_srgb_suffix(),
                     blend,
@@ -662,8 +662,8 @@ impl KbModelRenderGroup {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(depth_write_enabled),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -672,7 +672,8 @@ impl KbModelRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         let particle_shader_handle = asset_manager
@@ -684,13 +685,13 @@ impl KbModelRenderGroup {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: particle_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc(), KbModelDrawInstance::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: particle_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -709,8 +710,8 @@ impl KbModelRenderGroup {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -719,7 +720,8 @@ impl KbModelRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         let additive_blend_state = wgpu::BlendState {
@@ -736,13 +738,13 @@ impl KbModelRenderGroup {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: particle_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc(), KbModelDrawInstance::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: particle_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format.add_srgb_suffix(),
                     blend: Some(additive_blend_state),
@@ -761,8 +763,8 @@ impl KbModelRenderGroup {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -771,7 +773,8 @@ impl KbModelRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         KbModelRenderGroup {
@@ -851,6 +854,7 @@ impl KbModelRenderGroup {
                 wgpu::RenderPassColorAttachment {
                     view: &device_resources.render_textures[0].view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: color_ops,
                 },
                 wgpu::RenderPassDepthStencilAttachment {
@@ -867,6 +871,7 @@ impl KbModelRenderGroup {
             color_attachments: &[Some(color_attachment)],
             depth_stencil_attachment: Some(depth_attachment),
             occlusion_query_set: None,
+            multiview_mask: None,
             timestamp_writes: None,
         });
 
@@ -977,7 +982,7 @@ impl KbModelRenderGroup {
             render_pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
             for i in 0..model.get_uniform_info_count() {
-                let uniform_bind_group = &model.get_uniform_bind_group(i);
+                let uniform_bind_group = model.get_uniform_bind_group(i);
                 render_pass.set_bind_group(1, uniform_bind_group, &[]);
                 render_pass.set_bind_group(0, &model.tex_bind_group, &[]);
                 render_pass.draw_indexed(0..model.num_indices, 0, 0..1);
@@ -1017,6 +1022,7 @@ impl KbModelRenderGroup {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &device_resources.render_textures[0].view,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
@@ -1031,6 +1037,7 @@ impl KbModelRenderGroup {
                 stencil_ops: None,
             }),
             occlusion_query_set: None,
+            multiview_mask: None,
             timestamp_writes: None,
         });
 
@@ -1125,7 +1132,7 @@ impl KbModelRenderGroup {
             render_pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
             render_pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.set_vertex_buffer(1, model.instance_buffer.slice(..));
-            let uniform_bind_group = &model.get_uniform_bind_group(0);
+            let uniform_bind_group = model.get_uniform_bind_group(0);
             render_pass.set_bind_group(1, uniform_bind_group, &[]);
             render_pass.set_bind_group(0, &model.tex_bind_group, &[]);
             render_pass.draw_indexed(0..model.num_indices, 0, 0..particle_instances.len() as u32);

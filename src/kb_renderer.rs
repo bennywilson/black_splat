@@ -11,7 +11,7 @@ use crate::{
     log,
     render_groups::{
         kb_bullet_hole_group::*, kb_gaussian_splat_group::*, kb_line_group::*, kb_model_group::*,
-        kb_postprocess_group::*, kb_sprite_group::*, kb_sunbeam_group::*, kb_ui_group::*,
+        kb_postprocess_group::*, kb_sprite_group::*, kb_sunbeam_group::*,
     },
     PERF_SCOPE,
 };
@@ -31,10 +31,18 @@ pub struct KbRenderer<'a> {
     // buffers in the vertex stage, which WebGL2 can't do, so we must not create it
     // for the GL-backed 2D/3D demos.
     gaussian_splat_render_group: Option<KbGaussianSplatRenderGroup>,
-    ui_render_group: KbUiRenderGroup,
-    // Screen-space buttons the game wants drawn this frame (set_ui_buttons).
-    // Purely visual: hit-testing stays in the game, which knows the rects.
-    ui_buttons: Vec<KbUiButton>,
+    // In-engine GUI (egui).  The context is shared with the host loop's
+    // egui-winit State (which feeds it window input); games build widgets
+    // against it during tick_frame, and render_frame paints the tessellated
+    // output onto the swapchain as the final pass.
+    egui_ctx: egui::Context,
+    egui_renderer: egui_wgpu::Renderer,
+    // True between begin_egui_pass() and the end_pass in render_frame; used
+    // to keep the begin/end pairing balanced when frames are skipped.
+    egui_pass_active: bool,
+    // Clipboard/cursor/link requests from the last rendered pass, picked up
+    // by the host loop and handed to egui-winit.
+    egui_platform_output: Option<egui::PlatformOutput>,
     // Status line drawn bottom-center in its own color (e.g. red load errors),
     // independent of the help text.  Empty = hidden.
     status_msg: String,
@@ -61,9 +69,17 @@ pub struct KbRenderer<'a> {
     frame_timer: Instant,
     frame_count: u32,
     window_id: winit::window::WindowId,
+    // Kept so games can control the cursor (grab/hide) for mouse look.
+    window: Arc<winit::window::Window>,
 
     allow_debug_text: bool,
     display_debug_msg: bool,
+    // Y (physical px) where the top-left/top-right debug text begins.  A game
+    // with a top menu bar pushes this down so the bar doesn't cover the text.
+    debug_text_top_offset: f32,
+    // Whether the auto-generated "Press [H] for help" hint is drawn.  Games
+    // that expose help another way (e.g. a menu button) turn it off.
+    show_help_hint: bool,
     game_debug_msg: String,
     game_hud_msg: String,
     // Shown right-aligned in the top-right corner while help is up (e.g. camera pos).
@@ -120,9 +136,14 @@ impl<'a> KbRenderer<'a> {
         )
         .await;
 
-        let ui_render_group = KbUiRenderGroup::new(&device_resources, &mut asset_manager).await;
-
         let debug_lines = Vec::<KbLine>::new();
+
+        let egui_ctx = egui::Context::default();
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device_resources.device,
+            device_resources.surface_config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
 
         KbRenderer {
             device_resources,
@@ -134,8 +155,10 @@ impl<'a> KbRenderer<'a> {
             line_render_group,
             sunbeam_render_group,
             gaussian_splat_render_group: None,
-            ui_render_group,
-            ui_buttons: Vec::new(),
+            egui_ctx,
+            egui_renderer,
+            egui_pass_active: false,
+            egui_platform_output: None,
             status_msg: "".to_string(),
             status_msg_color: CgVec4::new(1.0, 0.25, 0.2, 1.0),
             custom_world_render_groups,
@@ -159,6 +182,7 @@ impl<'a> KbRenderer<'a> {
             frame_timer: Instant::now(),
             frame_count: 0,
             window_id: window.id(),
+            window,
 
             game_debug_msg: "".to_string(),
             game_hud_msg: "".to_string(),
@@ -166,25 +190,147 @@ impl<'a> KbRenderer<'a> {
 
             allow_debug_text: true,
             display_debug_msg: false,
+            debug_text_top_offset: 10.0,
+            show_help_hint: true,
             debug_msg_color: CgVec4::new(0.0, 1.0, 0.0, 1.0),
         }
     }
 
-    pub fn begin_frame(&mut self) -> (wgpu::SurfaceTexture, wgpu::TextureView) {
+    /// Acquires the next swapchain image.  Returns `None` when there is no
+    /// frame to render this tick (occluded/timeout, or the surface needed a
+    /// reconfigure) -- the caller should just skip the frame and try again.
+    pub fn begin_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
         PERF_SCOPE!("begin_frame())");
 
-        let final_texture = self.device_resources.surface.get_current_texture().unwrap();
+        use wgpu::CurrentSurfaceTexture::*;
+        let final_texture = match self.device_resources.surface.get_current_texture() {
+            Success(texture) | Suboptimal(texture) => texture,
+            Timeout | Occluded => return None,
+            Outdated | Lost => {
+                self.device_resources.surface.configure(
+                    &self.device_resources.device,
+                    &self.device_resources.surface_config,
+                );
+                return None;
+            }
+            Validation => {
+                log!("Validation error acquiring the surface texture; skipping frame");
+                return None;
+            }
+        };
         let final_view = final_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        (final_texture, final_view)
+        Some((final_texture, final_view))
     }
 
     pub fn end_frame(&self, final_tex: wgpu::SurfaceTexture) {
         PERF_SCOPE!("end_frame())");
 
         final_tex.present();
+    }
+
+    /// The egui context.  Games and editors build their UI against it any
+    /// time between the engine's begin_egui_pass() and render_frame -- in
+    /// practice, from inside tick_frame.
+    pub fn egui_ctx(&self) -> &egui::Context {
+        &self.egui_ctx
+    }
+
+    /// Starts this frame's egui pass with the input egui-winit collected.
+    /// Called by the engine loop right before ticking the game.
+    pub fn begin_egui_pass(&mut self, raw_input: egui::RawInput) {
+        // If the previous pass never reached render_frame (frame skipped),
+        // retire it first so begin/end stay balanced.
+        self.discard_egui_pass();
+        self.egui_ctx.begin_pass(raw_input);
+        self.egui_pass_active = true;
+    }
+
+    /// Ends an unrendered egui pass.  Texture deltas are still applied --
+    /// egui only sends them once (fonts especially), so dropping them would
+    /// corrupt every later frame.
+    fn discard_egui_pass(&mut self) {
+        if !self.egui_pass_active {
+            return;
+        }
+        self.egui_pass_active = false;
+        let full_output = self.egui_ctx.end_pass();
+        for (id, delta) in &full_output.textures_delta.set {
+            self.egui_renderer.update_texture(
+                &self.device_resources.device,
+                &self.device_resources.queue,
+                *id,
+                delta,
+            );
+        }
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+    }
+
+    /// Clipboard/cursor/link requests from the last rendered egui pass; the
+    /// host loop forwards them to egui-winit.
+    pub fn take_egui_platform_output(&mut self) -> Option<egui::PlatformOutput> {
+        self.egui_platform_output.take()
+    }
+
+    /// Ends the frame's egui pass and paints it onto `final_view` (the
+    /// swapchain).  Runs after every other pass so the GUI is always on top.
+    fn render_egui(&mut self, final_view: &wgpu::TextureView, game_config: &KbConfig) {
+        if !self.egui_pass_active {
+            return;
+        }
+        self.egui_pass_active = false;
+        let full_output = self.egui_ctx.end_pass();
+
+        let device = &self.device_resources.device;
+        let queue = &self.device_resources.queue;
+        for (id, delta) in &full_output.textures_delta.set {
+            self.egui_renderer.update_texture(device, queue, *id, delta);
+        }
+
+        let clipped = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [game_config.window_width, game_config.window_height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("egui"),
+        });
+        self.egui_renderer
+            .update_buffers(device, queue, &mut encoder, &clipped, &screen);
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: final_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+                timestamp_writes: None,
+            });
+            // egui-wgpu wants a pass with no encoder borrow.
+            let mut render_pass = render_pass.forget_lifetime();
+            self.egui_renderer.render(&mut render_pass, &clipped, &screen);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+        self.egui_platform_output = Some(full_output.platform_output);
     }
 
     pub fn get_encoder(&mut self, label: &str) -> wgpu::CommandEncoder {
@@ -233,26 +379,16 @@ impl<'a> KbRenderer<'a> {
         _num_game_objects: u32,
         game_config: &KbConfig,
     ) {
-        // Button background quads draw first so all text (labels included) lands
-        // on top of them.
-        self.ui_render_group.render(
-            command_encoder,
-            view,
-            &self.device_resources,
-            &self.ui_buttons,
-            game_config,
-        );
-
         let device_resources = &mut self.device_resources;
 
-        // Text pass: debug/help text (when enabled) plus button labels and the
-        // status line (always).
-        if self.allow_debug_text || !self.ui_buttons.is_empty() || !self.status_msg.is_empty() {
+        // Text pass: debug/help text (when enabled) plus the status line (always).
+        if self.allow_debug_text || !self.status_msg.is_empty() {
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Text"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -260,6 +396,7 @@ impl<'a> KbRenderer<'a> {
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
                 timestamp_writes: None,
             });
 
@@ -270,11 +407,21 @@ impl<'a> KbRenderer<'a> {
             let avg_frame_time = total_frame_times / (self.frame_times.len() as f32);
             let frame_rate = 1.0 / avg_frame_time;
 
+            // Optional "Press [H]..." hint prefix (suppressed when a game drives
+            // help another way, e.g. a menu button).
+            let hint = if self.show_help_hint {
+                if self.display_debug_msg {
+                    "Press [H] to hide help\n"
+                } else {
+                    "Press [H] for help.  Press [Space] to cycle scenes\n\n"
+                }
+            } else {
+                ""
+            };
             let frame_time_string = {
                 if self.display_debug_msg {
                     format!(
-                        "Press [H] or tap here to hide help\n\
-                        {}\n\\n
+                        "{hint}{}\n\
                         FPS: {:.0} \n\
                         Frame time: {:.2} ms\n\
                         Back End: {:?}\n\
@@ -288,10 +435,7 @@ impl<'a> KbRenderer<'a> {
                         self.game_hud_msg
                     )
                 } else {
-                    format!(
-                        "Press [H] or tap here for help.  Press [Space] to cycle scenes\n\nFPS: {:.0}\n\n {}",
-                        frame_rate, self.game_hud_msg
-                    )
+                    format!("{hint}FPS: {:.0}\n\n {}", frame_rate, self.game_hud_msg)
                 }
             };
 
@@ -307,7 +451,7 @@ impl<'a> KbRenderer<'a> {
                         .with_color(msg_color)
                         .with_scale(24.0 * 1.0),
                 )
-                .with_screen_position((10.0, 10.0));
+                .with_screen_position((10.0, self.debug_text_top_offset));
 
             // Right-aligned corner text (camera pos, etc.), anchored to the top-right.
             let topright_section = TextSection::default()
@@ -316,32 +460,13 @@ impl<'a> KbRenderer<'a> {
                         .with_color(msg_color)
                         .with_scale(24.0 * 1.0),
                 )
-                .with_screen_position((game_config.window_width as f32 - 10.0, 10.0))
+                .with_screen_position((
+                    game_config.window_width as f32 - 10.0,
+                    self.debug_text_top_offset,
+                ))
                 .with_layout(Layout::default().h_align(HorizontalAlign::Right));
 
-            // Centered button labels; sized off the button so they stay
-            // readable on high-DPI touch screens.
-            let button_sections: Vec<TextSection> = self
-                .ui_buttons
-                .iter()
-                .map(|button| {
-                    let (x, y, w, h) = button.rect;
-                    TextSection::default()
-                        .add_text(
-                            Text::new(&button.label)
-                                .with_color(button.text_color)
-                                .with_scale(h * 0.42),
-                        )
-                        .with_screen_position((x + w * 0.5, y + h * 0.5))
-                        .with_layout(
-                            Layout::default_single_line()
-                                .h_align(HorizontalAlign::Center)
-                                .v_align(VerticalAlign::Center),
-                        )
-                })
-                .collect();
-
-            // Bottom-center status line, sized like the buttons so it reads on
+            // Bottom-center status line, sized generously so it reads on
             // high-DPI touch screens.
             let status_scale = ((game_config.window_width.min(game_config.window_height) as f32)
                 * 0.035)
@@ -374,7 +499,6 @@ impl<'a> KbRenderer<'a> {
                     sections.push(&topright_section);
                 }
             }
-            sections.extend(button_sections.iter());
             if !self.status_msg.is_empty() {
                 sections.push(&status_section);
             }
@@ -410,15 +534,16 @@ impl<'a> KbRenderer<'a> {
         }
     }
 
-    pub fn render_frame(
-        &mut self,
-        game_objects: &Vec<GameObject>,
-        game_config: &KbConfig,
-    ) -> Result<(), wgpu::SurfaceError> {
+    pub fn render_frame(&mut self, game_objects: &Vec<GameObject>, game_config: &KbConfig) {
         self.update_particles(game_config);
         PERF_SCOPE!("render_frame()");
 
-        let (final_tex, final_view) = self.begin_frame();
+        // No frame available (occluded window / surface reconfigure): skip,
+        // retiring the frame's egui pass so the next begin stays balanced.
+        let Some((final_tex, final_view)) = self.begin_frame() else {
+            self.discard_egui_pass();
+            return;
+        };
 
         if self.bullet_hole_actor_index.is_some() {
             PERF_SCOPE!("Bullet Holes");
@@ -618,12 +743,15 @@ impl<'a> KbRenderer<'a> {
             self.submit_encoder(command_encoder);
         }
 
+        {
+            PERF_SCOPE!("egui pass");
+            self.render_egui(&final_view, game_config);
+        }
+
         self.end_frame(final_tex);
 
         let cur_time = game_config.start_time.elapsed().as_secs_f32();
         self.debug_lines.retain_mut(|l| cur_time < l.end_time);
-
-        Ok(())
     }
 
     pub fn resize(&mut self, game_config: &KbConfig) {
@@ -841,13 +969,6 @@ impl<'a> KbRenderer<'a> {
         self.allow_debug_text = allow;
     }
 
-    /// Sets the screen-space buttons to draw this frame (background quads plus
-    /// centered labels).  Purely visual: the game hit-tests the same rects
-    /// against mouse/touch input itself.
-    pub fn set_ui_buttons(&mut self, buttons: Vec<KbUiButton>) {
-        self.ui_buttons = buttons;
-    }
-
     /// Sets the bottom-center status line (empty string hides it).  Unlike the
     /// help text this is always visible, so games use it for things the user
     /// must see -- load errors, clamp warnings, progress.
@@ -875,6 +996,40 @@ impl<'a> KbRenderer<'a> {
 
     pub fn enable_help_text(&mut self) {
         self.display_debug_msg = !self.display_debug_msg;
+    }
+
+    /// Sets the Y (physical px) where the top-left debug text and top-right
+    /// corner text begin, so a game with a top menu bar can push them clear
+    /// of the bar.  Defaults to 10.
+    pub fn set_debug_text_top_offset(&mut self, y: f32) {
+        self.debug_text_top_offset = y;
+    }
+
+    /// Toggles the auto-generated "Press [H] for help" hint line (on by
+    /// default).  Turn off when help is reachable another way (e.g. a menu).
+    pub fn set_show_help_hint(&mut self, show: bool) {
+        self.show_help_hint = show;
+    }
+
+    /// Shows/hides the mouse cursor.  Pair with `set_cursor_grabbed` and raw
+    /// mouse motion (`KbInputManager::get_mouse_raw_delta`) for mouse look.
+    pub fn set_cursor_visible(&self, visible: bool) {
+        self.window.set_cursor_visible(visible);
+    }
+
+    /// Grabs the cursor so it can't leave the window/screen while looking
+    /// around.  Best effort across platforms: tries hardware Lock (macOS,
+    /// Wayland, browser pointer-lock) and falls back to Confine (Windows,
+    /// X11).  Errors (e.g. unsupported mode) are ignored.
+    pub fn set_cursor_grabbed(&self, grabbed: bool) {
+        use winit::window::CursorGrabMode;
+        if grabbed {
+            if self.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                let _ = self.window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+        } else {
+            let _ = self.window.set_cursor_grab(CursorGrabMode::None);
+        }
     }
 
     pub fn set_postprocess_mode(&mut self, new_mode: &KbPostProcessMode) {
