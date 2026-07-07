@@ -1,14 +1,12 @@
 // gaussian_splat_radix.wgsl
 //
 // GPU least-significant-digit radix sort of the splat index buffer, keyed by
-// view-space depth so the draw can composite back-to-front.  Replaces the older
-// bitonic sort (O(n log^2 n), ~98 passes at 2^20) with a Reduce-Scan-Scan-Scatter
+// view-space depth so the draw can composite back-to-front. Reduce-Scan-Scan-Scatter
 // radix: 32-bit keys, four 8-bit digit passes, each O(n).
 //
-// Deliberately NOT a One-Sweep / decoupled-look-back radix: that needs
-// cross-workgroup forward-progress guarantees the WebGPU spec does not provide
-// and would risk deadlock on the web backend.  Instead every phase is its own
-// dispatch (its own pass boundary), and all scans run in workgroup shared memory
+// Note: One-Sweep / decoupled-look-back radix requires cross-workgroup forward-progress 
+// guarantees the WebGPU spec does not provide and would risk deadlock on the web backend.  
+// Instead every phase is its own dispatch (its own pass boundary), and all scans run in workgroup shared memory
 // with no subgroup intrinsics (also not guaranteed on the web).
 //
 // Phases per sort (the host drives the dispatch order; see kb_gaussian_splat_group.rs):

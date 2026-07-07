@@ -1,8 +1,6 @@
-# kbEngine3
+# Black Splat
 
-A simple sprite renderer built with **Rust** and **wgpu 0.19.3** (latest at the time of this project).
-
-All sprites are drawn with a single `draw_indexed` call using instancing.
+A 3d renderer built with **Rust** and **wgpu**
 
 ## Setup
 
@@ -35,19 +33,6 @@ Run the examples from a command prompt:
 | 3D demo #3 | `kbEngine3/Examples/3D/` | `cargo run` |
 | Gaussian splats | `kbEngine3/Examples/splat/` | `cargo run --release` |
 
-### Gaussian splat demo
-
-Renders a 3D Gaussian Splat point cloud (`.ply`) as view-aligned billboards with
-spherical-harmonic color. Because it binds storage buffers in the vertex shader,
-it needs the **WebGPU** backend in the browser (WebGL2 can't do this) or any
-native dx12/vulkan/metal backend — the bundled `game_config.txt` already requests
-`"graphics_back_end": "webgpu"`, which resolves correctly on both.
-
-Drop a standard 3DGS `point_cloud.ply` into
-`Examples/splat/game_assets/splats/` (see the README there), then `cargo run
---release`, or run `build_wasm.bat` for the browser build. Fly with **WASD** and
-look with the **arrow keys**.
-
 To run a browser build:
 
 1. Run `kbEngine3/Examples/3D/build_wasm.bat` or `kbEngine3/Examples/2D/build_wasm.bat`.
@@ -77,6 +62,9 @@ Each example uses a config file that controls several parameters. There is an ex
 
     "_comment3": "Valid values for 'vsync' are true and false",
     "vsync": true
+
+   "start_position": [-2.78, 2.27, 1.81],
+    "start_rotation": [-243.4, 13.0, 0.0]
 }
 ```
 

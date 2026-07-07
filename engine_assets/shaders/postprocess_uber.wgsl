@@ -63,10 +63,8 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 // Narkowicz 2015 ACES filmic approximation, applied to linear color before the
-// sRGB encode.  The five constants are the curve fit -- tweak them here to taste:
-//   a (shoulder steepness), b (toe lift), d/e/f (denominator: contrast & black).
+// sRGB encode.
 fn tonemap_aces(in_c: vec3<f32>) -> vec3<f32> {
-    // Exposure: the master brightness knob. >1.0 brightens, <1.0 darkens.
     let exposure = 0.2f;
     let c = in_c * exposure;
 

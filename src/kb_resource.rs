@@ -468,10 +468,6 @@ impl<'a> KbDeviceResources<'a> {
         );
 
         log!("  Requesting Device");
-        // WebGL2 can't do shader storage buffers, so it gets the most restrictive
-        // limit set.  For every other backend (native + browser WebGPU) we request
-        // exactly what the adapter reports -- that can never fail a limit check, and
-        // it still gives the gaussian splat path the storage buffers it needs.
         let required_limits = if game_config.graphics_backend == wgpu::Backends::GL {
             wgpu::Limits::downlevel_webgl2_defaults()
         } else {

@@ -632,7 +632,7 @@ impl GameObject {
             return false;
         }
 
-        self.next_attack_time = cur_time + 0.1;
+        self.next_attack_time = cur_time + 0.04;
         true
     }
 }

@@ -7,16 +7,12 @@
     "_comment_render_scale": "Offscreen scene renders at this fraction of the window, then upscales. 0.6667 of 1080p ~= 720p. Use 1.0 for full native res.",
     "render_scale": 0.6667,
 
-    "_comment": "Gaussian splatting needs shader storage buffers, so it requires the WebGPU backend (in the browser) or a native dx12/vulkan/metal backend.  'webgpu' selects the right thing on both.",
     "graphics_back_end": "webgpu",
 
-    "_comment2": "Valid values for 'graphics_power_pref' are default, low, and high",
     "graphics_power_pref": "high",
 
-    "_comment3": "Valid values for 'vsync' are true and false",
     "vsync": false,
 
-    "_comment4": "Starting camera position [x, y, z] and rotation [yaw_deg, pitch_deg, 0]",
     "start_position": [-2.78, 2.27, 1.81],
     "start_rotation": [-243.4, 13.0, 0.0]
 }

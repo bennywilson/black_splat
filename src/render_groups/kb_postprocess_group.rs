@@ -11,10 +11,7 @@ pub struct KbPostprocessRenderGroup {
     pub uniform_bind_group: wgpu::BindGroup,
     pub bind_group: wgpu::BindGroup,
     pub postprocess_tex_handle: KbTextureHandle,
-    // Linear sampler used to read the scene color, so a sub-native render_scale
-    // upscales smoothly instead of point-sampling (blocky) onto the surface.
     pub scene_sampler: wgpu::Sampler,
-    // When true, the postprocess pass applies the ACES tonemap.
     pub tonemap_enabled: bool,
 }
 
