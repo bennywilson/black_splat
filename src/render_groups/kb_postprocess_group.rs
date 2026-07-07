@@ -11,6 +11,8 @@ pub struct KbPostprocessRenderGroup {
     pub uniform_bind_group: wgpu::BindGroup,
     pub bind_group: wgpu::BindGroup,
     pub postprocess_tex_handle: KbTextureHandle,
+    pub scene_sampler: wgpu::Sampler,
+    pub tonemap_enabled: bool,
 }
 
 impl KbPostprocessRenderGroup {
@@ -99,8 +101,8 @@ impl KbPostprocessRenderGroup {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout, &uniform_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&uniform_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -108,13 +110,13 @@ impl KbPostprocessRenderGroup {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: postprocess_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc(), KbSpriteDrawInstance::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: postprocess_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -137,7 +139,8 @@ impl KbPostprocessRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         let postprocess_tex_handle = asset_manager
@@ -146,6 +149,19 @@ impl KbPostprocessRenderGroup {
                 device_resources,
             )
             .await;
+        // Linear filtering so a sub-native render_scale upscales smoothly onto the
+        // surface.  Repeat address mode matches the filter texture's sampler so the
+        // scanline/warp effects keep wrapping as before.
+        let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
         let postprocess_tex = asset_manager.get_texture(&postprocess_tex_handle);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &bind_group_layout,
@@ -156,7 +172,7 @@ impl KbPostprocessRenderGroup {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&postprocess_tex.sampler),
+                    resource: wgpu::BindingResource::Sampler(&scene_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -186,6 +202,8 @@ impl KbPostprocessRenderGroup {
             vertex_buffer,
             index_buffer,
             postprocess_tex_handle,
+            scene_sampler,
+            tonemap_enabled: false,
         }
     }
 
@@ -206,6 +224,7 @@ impl KbPostprocessRenderGroup {
         let color_attachment = Some(wgpu::RenderPassColorAttachment {
             view: target_view,
             resolve_target: None,
+            depth_slice: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Load,
                 store: wgpu::StoreOp::Store,
@@ -217,6 +236,7 @@ impl KbPostprocessRenderGroup {
             color_attachments: &[color_attachment],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
+            multiview_mask: None,
             timestamp_writes: None,
         });
 
@@ -227,9 +247,9 @@ impl KbPostprocessRenderGroup {
         render_pass.set_vertex_buffer(1, device_resources.instance_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
-        self.postprocess_uniform.time_mode_unused_unused[0] =
+        self.postprocess_uniform.time_mode_srgb_tonemap[0] =
             game_config.start_time.elapsed().as_secs_f32();
-        self.postprocess_uniform.time_mode_unused_unused[1] = {
+        self.postprocess_uniform.time_mode_srgb_tonemap[1] = {
             let postprocess_mode = match postprocess_override {
                 Some(p) => p.clone(),
                 None => game_config.postprocess_mode.clone(),
@@ -241,6 +261,17 @@ impl KbPostprocessRenderGroup {
                 _ => 0.0,
             }
         };
+        // When the surface isn't sRGB (e.g. Chrome WebGPU), the hardware won't
+        // gamma-encode on present, so the shader must do it or everything looks dark.
+        self.postprocess_uniform.time_mode_srgb_tonemap[2] =
+            if device_resources.surface_config.format.is_srgb() {
+                0.0
+            } else {
+                1.0
+            };
+        // ACES tonemap toggle (applied in linear space before the sRGB encode).
+        self.postprocess_uniform.time_mode_srgb_tonemap[3] =
+            if self.tonemap_enabled { 1.0 } else { 0.0 };
 
         device_resources.queue.write_buffer(
             &self.uniform_buffer,
@@ -307,7 +338,7 @@ impl KbPostprocessRenderGroup {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&postprocess_tex.sampler),
+                        resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,

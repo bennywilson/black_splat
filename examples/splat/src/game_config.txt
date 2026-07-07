@@ -1,0 +1,18 @@
+{
+    "max_instances": 2000,
+
+    "window_width": 1920,
+    "window_height": 1080,
+
+    "_comment_render_scale": "Offscreen scene renders at this fraction of the window, then upscales. 0.6667 of 1080p ~= 720p. Use 1.0 for full native res.",
+    "render_scale": 0.6667,
+
+    "graphics_back_end": "webgpu",
+
+    "graphics_power_pref": "high",
+
+    "vsync": false,
+
+    "start_position": [-2.78, 2.27, 1.81],
+    "start_rotation": [-243.4, 13.0, 0.0]
+}

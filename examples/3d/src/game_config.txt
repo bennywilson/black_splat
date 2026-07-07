@@ -1,7 +1,7 @@
 {
     "enemy_spawn_delay": 0.3,
     "enemy_move_speed": 1.0,
-    "max_instances": 2000,
+    "max_instances": 4000,
 
     "window_width": 1366,
     "window_height": 768,

@@ -100,8 +100,8 @@ impl KbBulletHoleRenderGroup {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("KbModelRenderGroup_render_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let shader_handle = asset_manager
@@ -131,15 +131,15 @@ impl KbBulletHoleRenderGroup {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: model_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: model_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -160,7 +160,8 @@ impl KbBulletHoleRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
         let mut surface_config = device_resources.surface_config.clone();
         surface_config.width = 1024;
@@ -197,6 +198,7 @@ impl KbBulletHoleRenderGroup {
         let color_attachment = wgpu::RenderPassColorAttachment {
             view: &model.hole_texture.as_ref().unwrap().view,
             resolve_target: None,
+            depth_slice: None,
             ops: wgpu::Operations {
                 load: if !self.first_run {
                     wgpu::LoadOp::Load
@@ -218,6 +220,7 @@ impl KbBulletHoleRenderGroup {
             color_attachments: &[Some(color_attachment)],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
+            multiview_mask: None,
             timestamp_writes: None,
         });
 

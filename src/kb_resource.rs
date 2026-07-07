@@ -137,7 +137,9 @@ pub struct SpriteUniform {
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PostProcessUniform {
-    pub time_mode_unused_unused: [f32; 4],
+    // x: time, y: postprocess mode, z: 1.0 when the surface is non-sRGB (encode
+    // in-shader), w: 1.0 to apply the ACES tonemap.
+    pub time_mode_srgb_tonemap: [f32; 4],
 }
 
 #[allow(dead_code)]
@@ -150,11 +152,13 @@ pub struct KbTexture {
 impl KbTexture {
     pub fn new_depth_texture(
         device: &Device,
-        surface_config: &SurfaceConfiguration,
+        _surface_config: &SurfaceConfiguration,
+        width: u32,
+        height: u32,
     ) -> Result<Self> {
         let size = wgpu::Extent3d {
-            width: surface_config.width,
-            height: surface_config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         };
         let desc = wgpu::TextureDescriptor {
@@ -176,7 +180,7 @@ impl KbTexture {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             compare: Some(wgpu::CompareFunction::LessEqual),
             lod_min_clamp: 0.0,
             lod_max_clamp: 100.0,
@@ -192,18 +196,27 @@ impl KbTexture {
     pub fn new_render_texture(
         device: &Device,
         surface_config: &wgpu::SurfaceConfiguration,
+        width: u32,
+        height: u32,
     ) -> Result<Self> {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Target"),
             size: wgpu::Extent3d {
-                width: surface_config.width,
-                height: surface_config.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: surface_config.format,
+            // Always render the offscreen scene into an sRGB target so alpha
+            // blending happens in linear space (the hardware decodes/encodes).
+            // On native the surface is already sRGB so this is a no-op; on web
+            // Chrome's canvas is non-sRGB `Bgra8Unorm`, and without this the
+            // scene would blend in gamma space -- making stacked transparent
+            // splats composite far too dark.  The postprocess pass converts back
+            // to the (possibly non-sRGB) surface on present.
+            format: surface_config.format.add_srgb_suffix(),
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -215,7 +228,7 @@ impl KbTexture {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -287,14 +300,14 @@ impl KbTexture {
         });
 
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 aspect: wgpu::TextureAspect::All,
                 texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
             },
             &new_rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * width),
                 rows_per_image: Some(height),
@@ -309,7 +322,7 @@ impl KbTexture {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -346,14 +359,14 @@ impl KbTexture {
         let rgba = img.to_rgba8();
 
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 aspect: wgpu::TextureAspect::All,
                 texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
             },
             &rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * dimensions.0),
                 rows_per_image: Some(dimensions.1),
@@ -368,7 +381,7 @@ impl KbTexture {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -417,12 +430,15 @@ impl<'a> KbDeviceResources<'a> {
         self.surface_config.height = game_config.window_height;
         self.surface.configure(&self.device, &self.surface_config);
 
+        // Offscreen scene targets render at render_scale; the postprocess pass
+        // upscales them onto the full-size surface.
+        let (rw, rh) = game_config.render_resolution();
         self.render_textures[0] =
-            KbTexture::new_render_texture(&self.device, &self.surface_config).unwrap();
+            KbTexture::new_render_texture(&self.device, &self.surface_config, rw, rh).unwrap();
         self.render_textures[1] =
-            KbTexture::new_depth_texture(&self.device, &self.surface_config).unwrap();
+            KbTexture::new_depth_texture(&self.device, &self.surface_config, rw, rh).unwrap();
         self.render_textures[2] =
-            KbTexture::new_render_texture(&self.device, &self.surface_config).unwrap();
+            KbTexture::new_render_texture(&self.device, &self.surface_config, rw, rh).unwrap();
     }
 
     pub async fn new(window: Arc<winit::window::Window>, game_config: &KbConfig) -> Self {
@@ -431,7 +447,7 @@ impl<'a> KbDeviceResources<'a> {
         log!("  Creating instance");
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: game_config.graphics_backend,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         log!("  Creating surface + adapter");
@@ -445,31 +461,51 @@ impl<'a> KbDeviceResources<'a> {
             .await
             .unwrap();
 
+        log!(
+            "  Adapter: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+
         log!("  Requesting Device");
-        let (device, queue) = adapter
-            .request_device(
-                &DeviceDescriptor {
-                    required_features: wgpu::Features::empty(),
-                    // WebGL doesn't support all of wgpu's features
-                    required_limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
-                    } else {
-                        wgpu::Limits::default()
-                    },
-                    label: Some("Device Descriptor"),
-                },
-                None, // Trace path
-            )
+        let required_limits = if game_config.graphics_backend == wgpu::Backends::GL {
+            wgpu::Limits::downlevel_webgl2_defaults()
+        } else {
+            adapter.limits()
+        };
+        let (device, queue) = match adapter
+            .request_device(&DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+                required_limits,
+                label: Some("Device Descriptor"),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
-            .unwrap();
+        {
+            Ok(dq) => dq,
+            Err(e) => {
+                log!("  request_device() FAILED: {e:?}");
+                panic!("request_device() failed: {e:?}");
+            }
+        };
 
         let surface_caps = surface.get_capabilities(&adapter);
+        // Prefer an sRGB format, but some WebGPU surfaces (e.g. Chrome's canvas)
+        // only expose a non-sRGB format -- fall back to whatever is offered.
         let surface_format = surface_caps
             .formats
             .iter()
             .copied()
             .find(|f| f.is_srgb())
-            .unwrap();
+            .unwrap_or_else(|| {
+                log!(
+                    "  No sRGB surface format; using {:?}",
+                    surface_caps.formats.first()
+                );
+                surface_caps.formats[0]
+            });
 
         let mut surface_config = surface
             .get_default_config(
@@ -477,8 +513,15 @@ impl<'a> KbDeviceResources<'a> {
                 game_config.window_width,
                 game_config.window_height,
             )
-            .unwrap();
+            .unwrap_or_else(|| {
+                log!("  get_default_config() returned None (surface/adapter mismatch)");
+                panic!("surface.get_default_config() returned None");
+            });
         surface_config.format = surface_format;
+        // Keep at most one frame queued ahead of the GPU.  With heavy per-frame GPU
+        // work (e.g. the gaussian splat sort + overdraw) the default of 2+ lets the
+        // CPU race ahead, so input shows up seconds late even at a steady frame rate.
+        surface_config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &surface_config);
 
         let max_instances = game_config.max_render_instances;
@@ -489,14 +532,19 @@ impl<'a> KbDeviceResources<'a> {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Offscreen scene targets render at render_scale; the postprocess pass
+        // upscales them onto the full-size surface.
+        let (rw, rh) = game_config.render_resolution();
         let mut render_textures = Vec::<KbTexture>::new();
-        let render_texture = KbTexture::new_render_texture(&device, &surface_config).unwrap();
+        let render_texture =
+            KbTexture::new_render_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(render_texture);
 
-        let depth_texture = KbTexture::new_depth_texture(&device, &surface_config).unwrap();
+        let depth_texture = KbTexture::new_depth_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(depth_texture);
 
-        let render_texture = KbTexture::new_render_texture(&device, &surface_config).unwrap();
+        let render_texture =
+            KbTexture::new_render_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(render_texture);
 
         log!("  Creating Font");

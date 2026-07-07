@@ -90,8 +90,8 @@ impl KbLineRenderGroup {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("KbLineRenderGroup_render_pipeline_layout"),
-                bind_group_layouts: &[&uniform_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&uniform_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let shader_handle = asset_manager
@@ -103,15 +103,15 @@ impl KbLineRenderGroup {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: model_shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[KbVertex::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: model_shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
+                    format: surface_config.format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -128,8 +128,8 @@ impl KbLineRenderGroup {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -138,7 +138,8 @@ impl KbLineRenderGroup {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         KbLineRenderGroup {
@@ -168,6 +169,7 @@ impl KbLineRenderGroup {
         let color_attachment = wgpu::RenderPassColorAttachment {
             view: &device_resources.render_textures[0].view,
             resolve_target: None,
+            depth_slice: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Load,
                 store: wgpu::StoreOp::Store,
@@ -187,6 +189,7 @@ impl KbLineRenderGroup {
             color_attachments: &[Some(color_attachment)],
             depth_stencil_attachment: Some(depth_attachment),
             occlusion_query_set: None,
+            multiview_mask: None,
             timestamp_writes: None,
         });
 
