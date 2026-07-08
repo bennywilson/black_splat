@@ -159,7 +159,7 @@ impl LinePass {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("LineGroup::render()"),
+                    label: Some("LinePass::render()"),
                 });
 
         let color_attachment = wgpu::RenderPassColorAttachment {

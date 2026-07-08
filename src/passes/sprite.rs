@@ -64,7 +64,7 @@ impl SpritePass {
                         count: None,
                     },
                 ],
-                label: Some("kbSpritePipeline: texture_bind_group_layout"),
+                label: Some("SpritePass: texture_bind_group_layout"),
             });
         let sprite_tex_handle = asset_manager
             .load_texture(&texture_file, device_resources)
@@ -95,7 +95,7 @@ impl SpritePass {
                     resource: wgpu::BindingResource::TextureView(&postprocess_tex.view),
                 },
             ],
-            label: Some("kbSpritePipeline: tex_bind_group"),
+            label: Some("SpritePass: tex_bind_group"),
         });
 
         let shader_handle = asset_manager
@@ -280,7 +280,7 @@ impl SpritePass {
     pub fn render(
         &mut self,
         ctx: &mut RenderContext,
-        render_pass_type: RenderPassType,
+        blend: SpriteBlend,
         game_objects: &Vec<GameObject>,
     ) {
         if game_objects.is_empty() {
@@ -369,7 +369,7 @@ impl SpritePass {
             },
         });
 
-        let label = format!("Sprite {:?}", render_pass_type);
+        let label = format!("Sprite {:?}", blend);
         let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(&label),
             color_attachments: &[color_attachment],
@@ -391,7 +391,7 @@ impl SpritePass {
             bytemuck::cast_slice(&[self.uniform]),
         );
 
-        if matches!(render_pass_type, RenderPassType::Opaque) {
+        if matches!(blend, SpriteBlend::Opaque) {
             render_pass.set_pipeline(&self.opaque_pipeline);
         } else {
             render_pass.set_pipeline(&self.alpha_blend_pipeline);

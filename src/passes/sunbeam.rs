@@ -181,7 +181,7 @@ impl SunbeamPass {
                         count: None,
                     },
                 ],
-                label: Some("Model_texture_bind_group_layout"),
+                label: Some("SunbeamPass_texture_bind_group_layout"),
             });
 
         let flare_tex_handle = asset_manager
@@ -530,7 +530,7 @@ impl SunbeamPass {
                         count: None,
                     },
                 ],
-                label: Some("Model_texture_bind_group_layout"),
+                label: Some("SunbeamPass_texture_bind_group_layout"),
             });
 
         self.tex_bind_group = device_resources.device.create_bind_group(&wgpu::BindGroupDescriptor {

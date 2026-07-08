@@ -67,7 +67,7 @@ macro_rules! PERF_SCOPE {
 }
 
 #[macro_export]
-macro_rules! make_kb_handle {
+macro_rules! make_handle {
     ($asset_type:ident, $handle_type:ident, $mapping_type:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $handle_type {

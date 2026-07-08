@@ -89,7 +89,7 @@ pub struct Renderer<'a> {
 
 impl<'a> Renderer<'a> {
     pub async fn new(window: Arc<winit::window::Window>, game_config: &Config) -> Self {
-        log!("GameRenderer::new() called...");
+        log!("Renderer::new() called...");
 
         let mut asset_manager = AssetManager::new();
         let device_resources = DeviceResources::new(window.clone(), game_config).await;
@@ -574,13 +574,13 @@ impl<'a> Renderer<'a> {
         {
             PERF_SCOPE!("World Opaque");
             self.model_pass
-                .render(&mut ctx, &RenderGroupType::World, None, &self.actor_map);
+                .render(&mut ctx, &SceneLayer::World, None, &self.actor_map);
         }
         {
             PERF_SCOPE!("World With Holes");
             self.model_with_holes_pass.render(
                 &mut ctx,
-                &RenderGroupType::WorldHole,
+                &SceneLayer::WorldHole,
                 None,
                 &self.actor_map,
             );
@@ -591,7 +591,7 @@ impl<'a> Renderer<'a> {
                 let pass = &mut self.custom_world_passes[i];
                 pass.render(
                     &mut ctx,
-                    &RenderGroupType::WorldCustom,
+                    &SceneLayer::WorldCustom,
                     Some(i),
                     &self.actor_map,
                 );
@@ -621,24 +621,24 @@ impl<'a> Renderer<'a> {
             self.sunbeam_pass.render(&mut ctx);
         }
 
-        if let Some(splat_group) = &mut self.gaussian_splat_pass {
-            if splat_group.has_model() {
+        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+            if splat_pass.has_model() {
                 PERF_SCOPE!("Gaussian Splats");
-                splat_group.render(&mut ctx);
+                splat_pass.render(&mut ctx);
             }
         }
 
         if !self.actor_map.is_empty() {
             PERF_SCOPE!("Foreground Opaque");
             self.model_pass
-                .render(&mut ctx, &RenderGroupType::Foreground, None, &self.actor_map);
+                .render(&mut ctx, &SceneLayer::Foreground, None, &self.actor_map);
             {
                 PERF_SCOPE!("Foreground Custom");
                 for i in 0..self.custom_foreground_passes.len() {
                     let pass = &mut self.custom_foreground_passes[i];
                     pass.render(
                         &mut ctx,
-                        &RenderGroupType::ForegroundCustom,
+                        &SceneLayer::ForegroundCustom,
                         Some(i),
                         &self.actor_map,
                     );
@@ -651,7 +651,7 @@ impl<'a> Renderer<'a> {
 
             self.default_sprite_pass.render(
                 &mut ctx,
-                RenderPassType::Opaque,
+                SpriteBlend::Opaque,
                 &skybox_render_objs,
             );
         }
@@ -661,7 +661,7 @@ impl<'a> Renderer<'a> {
 
             self.default_sprite_pass.render(
                 &mut ctx,
-                RenderPassType::Transparent,
+                SpriteBlend::Transparent,
                 &cloud_render_objs,
             );
         }
@@ -671,7 +671,7 @@ impl<'a> Renderer<'a> {
 
             self.default_sprite_pass.render(
                 &mut ctx,
-                RenderPassType::Opaque,
+                SpriteBlend::Opaque,
                 &game_render_objs,
             );
         }
@@ -679,7 +679,7 @@ impl<'a> Renderer<'a> {
         {
             PERF_SCOPE!("Custom Passes");
             for pass in &mut self.custom_sprite_passes {
-                pass.render(&mut ctx, RenderPassType::Opaque, &game_render_objs);
+                pass.render(&mut ctx, SpriteBlend::Opaque, &game_render_objs);
             }
         }
 
@@ -802,9 +802,9 @@ impl<'a> Renderer<'a> {
                     .await,
             );
         }
-        let splat_group = self.gaussian_splat_pass.as_mut().unwrap();
-        splat_group.set_params(params);
-        splat_group.load(file_path, &self.device_resources).await
+        let splat_pass = self.gaussian_splat_pass.as_mut().unwrap();
+        splat_pass.set_params(params);
+        splat_pass.load(file_path, &self.device_resources).await
     }
 
     /// Parses an in-memory splat .ply (e.g. one the user picked at runtime) and
@@ -819,12 +819,12 @@ impl<'a> Renderer<'a> {
         name: &str,
         params: &SplatParams,
     ) -> Result<SplatLoadInfo, String> {
-        let Some(splat_group) = &mut self.gaussian_splat_pass else {
+        let Some(splat_pass) = &mut self.gaussian_splat_pass else {
             log!("load_gaussian_splat_from_bytes called before the splat pipeline exists");
             return Err("splat renderer not initialized".to_string());
         };
-        splat_group.set_params(params);
-        splat_group.load_from_bytes(bytes, name, &self.device_resources)
+        splat_pass.set_params(params);
+        splat_pass.load_from_bytes(bytes, name, &self.device_resources)
     }
 
     /// Number of splat clouds preloaded via `load_gaussian_splat`.
@@ -836,8 +836,8 @@ impl<'a> Renderer<'a> {
 
     /// Selects which preloaded splat cloud to render (out-of-range is ignored).
     pub fn set_active_gaussian_splat(&mut self, index: usize) {
-        if let Some(splat_group) = &mut self.gaussian_splat_pass {
-            splat_group.set_active_model(index);
+        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+            splat_pass.set_active_model(index);
         }
     }
 
@@ -849,8 +849,8 @@ impl<'a> Renderer<'a> {
     }
 
     pub fn set_gaussian_splat_params(&mut self, params: &SplatParams) {
-        if let Some(splat_group) = &mut self.gaussian_splat_pass {
-            splat_group.set_params(params);
+        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+            splat_pass.set_params(params);
         }
     }
 
@@ -871,7 +871,7 @@ impl<'a> Renderer<'a> {
 
     pub async fn add_custom_pass(
         &mut self,
-        render_group_type: &RenderGroupType,
+        layer: &SceneLayer,
         blend_mode: &BlendMode,
         shader_path: &str,
     ) -> usize {
@@ -883,21 +883,21 @@ impl<'a> Renderer<'a> {
         )
         .await;
 
-        (match *render_group_type {
-            RenderGroupType::ForegroundCustom => {
+        (match *layer {
+            SceneLayer::ForegroundCustom => {
                 self.custom_foreground_passes.push(new_pass);
                 self.custom_foreground_passes.len()
             }
 
-            RenderGroupType::WorldCustom => {
+            SceneLayer::WorldCustom => {
                 self.custom_world_passes.push(new_pass);
                 self.custom_world_passes.len()
             }
 
             _ => {
                 panic!(
-                    "Renderer::add_custom_pass() - Render type {:?} not supported",
-                    render_group_type
+                    "Renderer::add_custom_pass() - Render layer {:?} not supported",
+                    layer
                 );
             }
         }) - 1

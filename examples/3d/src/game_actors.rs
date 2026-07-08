@@ -43,7 +43,7 @@ impl GamePlayer {
         hands_actor.set_position(&CgVec3::new(5.0, 1.0, 3.0));
         hands_actor.set_scale(&GLOBAL_SCALE);
         hands_actor.set_model(hands_model);
-        hands_actor.set_pass(&RenderGroupType::Foreground, &None);
+        hands_actor.set_layer(&SceneLayer::Foreground, &None);
 
         let mut outline_actors = Vec::<Actor>::new();
         let mut push = 0.0035;
@@ -58,7 +58,7 @@ impl GamePlayer {
             outline_actor.set_color(CgVec4::new(0.1, 0.1, 0.1, alpha));
             outline_actor.set_custom_data_1(CgVec4::new(push, 0.75, 0.75, 0.75));
             outline_actor.set_model(hands_model);
-            outline_actor.set_pass(&RenderGroupType::Foreground, &None);
+            outline_actor.set_layer(&SceneLayer::Foreground, &None);
 
             outline_actors.push(outline_actor);
             push += 0.0035;
@@ -309,7 +309,7 @@ impl GameMob {
     ) -> Self {
         let mut monster_actor = Actor::new();
         monster_actor.set_position(position);
-        monster_actor.set_pass(&RenderGroupType::WorldCustom, &Some(pass));
+        monster_actor.set_layer(&SceneLayer::WorldCustom, &Some(pass));
         monster_actor.set_scale(&(CgVec3::new(3.0, 3.0, 3.0) * GLOBAL_SCALE.x));
         monster_actor.set_model(model_handle);
 
@@ -326,7 +326,7 @@ impl GameMob {
         let mut monster_outline = Actor::new();
         monster_outline.set_position(position);
         monster_outline
-            .set_pass(&RenderGroupType::WorldCustom, &Some(outline_pass));
+            .set_layer(&SceneLayer::WorldCustom, &Some(outline_pass));
         monster_outline.set_scale(&(CgVec3::new(3.0, 3.0, 3.0) * GLOBAL_SCALE.x));
         monster_outline.set_model(model_handle);
 
@@ -471,7 +471,7 @@ impl GameProp {
         actor.set_position(position);
         actor.set_model(model_handle);
         actor.set_scale(&GLOBAL_SCALE);
-        actor.set_pass(&RenderGroupType::WorldCustom, &Some(outline_pass));
+        actor.set_layer(&SceneLayer::WorldCustom, &Some(outline_pass));
 
         let push = {
             match prop_type {

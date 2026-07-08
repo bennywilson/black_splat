@@ -190,8 +190,8 @@ impl GameVfxManager {
             decal_actor.set_rotation(&rotation);
 
             decal_actor.set_model(self.decal_model.as_ref().unwrap());
-            decal_actor.set_pass(
-                &RenderGroupType::WorldCustom,
+            decal_actor.set_layer(
+                &SceneLayer::WorldCustom,
                 &Some(self.decal_pass),
             );
             renderer.add_or_update_actor(&decal_actor);
@@ -260,8 +260,8 @@ impl GameVfxManager {
                 decal_actor.set_rotation(&rotation);
 
                 decal_actor.set_model(self.decal_model.as_ref().unwrap());
-                decal_actor.set_pass(
-                    &RenderGroupType::WorldCustom,
+                decal_actor.set_layer(
+                    &SceneLayer::WorldCustom,
                     &Some(self.decal_pass),
                 );
                 renderer.add_or_update_actor(&decal_actor);
@@ -284,7 +284,7 @@ impl GameVfxManager {
         );
         self.decal_pass = renderer
             .add_custom_pass(
-                &RenderGroupType::WorldCustom,
+                &SceneLayer::WorldCustom,
                 &BlendMode::Additive,
                 "engine_assets/shaders/decal.wgsl",
             )

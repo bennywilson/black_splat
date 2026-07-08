@@ -15,8 +15,14 @@ pub enum BlendMode {
     Additive,
 }
 
+/// Which slice of the scene an actor belongs to.  Passes draw layers in a
+/// fixed order and set the framebuffer load/clear behavior per layer: `World`
+/// clears color+depth (it's drawn first), `Foreground` clears only depth so it
+/// overlays the world (e.g. first-person hands), and the `*Custom` variants are
+/// game-supplied passes keyed by a handle (see `Renderer::add_custom_pass`).
+/// `WorldHole` is the world geometry that accepts bullet-hole decals.
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub enum RenderGroupType {
+pub enum SceneLayer {
     World,
     WorldHole,
     WorldCustom,
@@ -393,12 +399,10 @@ impl Texture {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
-pub enum RenderPassType {
+pub enum SpriteBlend {
     Opaque,
     Transparent,
-    PostProcess,
 }
 
 #[derive(Clone)]

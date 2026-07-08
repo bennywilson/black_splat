@@ -303,7 +303,7 @@ pub struct Actor {
     color: CgVec4,
     custom_data_1: CgVec4,
 
-    pass: RenderGroupType,
+    layer: SceneLayer,
     custom_pass_handle: Option<usize>,
 
     model_handle: ModelHandle,
@@ -326,7 +326,7 @@ impl Actor {
                 scale: CG_VEC3_ONE,
                 color: CG_VEC4_ONE,
                 custom_data_1: CG_VEC4_ZERO,
-                pass: RenderGroupType::World,
+                layer: SceneLayer::World,
                 custom_pass_handle: None,
                 model_handle: ModelHandle::make_invalid(),
             }
@@ -365,18 +365,18 @@ impl Actor {
         self.model_handle
     }
 
-    pub fn set_pass(
+    pub fn set_layer(
         &mut self,
-        new_pass: &RenderGroupType,
+        new_layer: &SceneLayer,
         custom_pass_handle: &Option<usize>,
     ) {
-        self.pass = new_pass.clone();
+        self.layer = new_layer.clone();
         self.custom_pass_handle
             .clone_from(custom_pass_handle);
     }
 
-    pub fn get_pass(&self) -> (RenderGroupType, Option<usize>) {
-        (self.pass.clone(), self.custom_pass_handle)
+    pub fn get_layer(&self) -> (SceneLayer, Option<usize>) {
+        (self.layer.clone(), self.custom_pass_handle)
     }
 
     pub fn set_color(&mut self, color: CgVec4) {

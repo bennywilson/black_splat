@@ -124,8 +124,8 @@ impl Example3DGame {
             [INVALID_PARTICLE_HANDLE, INVALID_PARTICLE_HANDLE],
         );
         let shotgun_actors = shotgun.get_actors();
-        shotgun_actors[1].set_pass(
-            &RenderGroupType::WorldCustom,
+        shotgun_actors[1].set_layer(
+            &SceneLayer::WorldCustom,
             &Some(self.outline_pass),
         );
 
@@ -148,12 +148,12 @@ impl Example3DGame {
                 [INVALID_PARTICLE_HANDLE, INVALID_PARTICLE_HANDLE],
             );
             let sign_actors = sign.get_actors();
-            sign_actors[0].set_pass(
-                &RenderGroupType::WorldHole,
+            sign_actors[0].set_layer(
+                &SceneLayer::WorldHole,
                 &Some(self.outline_pass),
             );
-            sign_actors[1].set_pass(
-                &RenderGroupType::WorldCustom,
+            sign_actors[1].set_layer(
+                &SceneLayer::WorldCustom,
                 &Some(self.outline_pass),
             );
 
@@ -343,7 +343,7 @@ impl GameEngine for Example3DGame {
 
         self.decal_pass = renderer
             .add_custom_pass(
-                &RenderGroupType::WorldCustom,
+                &SceneLayer::WorldCustom,
                 &BlendMode::Additive,
                 "engine_assets/shaders/decal.wgsl",
             )
@@ -353,7 +353,7 @@ impl GameEngine for Example3DGame {
         let fp_pass = Some(
             renderer
                 .add_custom_pass(
-                    &RenderGroupType::ForegroundCustom,
+                    &SceneLayer::ForegroundCustom,
                     &BlendMode::None,
                     "game_assets/shaders/first_person.wgsl",
                 )
@@ -362,7 +362,7 @@ impl GameEngine for Example3DGame {
         let fp_outline_pass = Some(
             renderer
                 .add_custom_pass(
-                    &RenderGroupType::ForegroundCustom,
+                    &SceneLayer::ForegroundCustom,
                     &BlendMode::Alpha,
                     "game_assets/shaders/first_person_outline.wgsl",
                 )
@@ -374,12 +374,12 @@ impl GameEngine for Example3DGame {
         let mut player = GamePlayer::new(&hands_model).await;
 
         let (hands, hands_outlines) = player.get_actors();
-        hands.set_pass(&RenderGroupType::ForegroundCustom, &fp_pass);
+        hands.set_layer(&SceneLayer::ForegroundCustom, &fp_pass);
         renderer.add_or_update_actor(hands);
 
         for outline in hands_outlines {
-            outline.set_pass(
-                &RenderGroupType::ForegroundCustom,
+            outline.set_layer(
+                &SceneLayer::ForegroundCustom,
                 &fp_outline_pass,
             );
             renderer.add_or_update_actor(outline);
@@ -392,7 +392,7 @@ impl GameEngine for Example3DGame {
             .await;
         let monster_pass = renderer
             .add_custom_pass(
-                &RenderGroupType::WorldCustom,
+                &SceneLayer::WorldCustom,
                 &BlendMode::Additive,
                 "game_assets/shaders/monster.wgsl",
             )
@@ -418,7 +418,7 @@ impl GameEngine for Example3DGame {
             let sky_pass = Some(
                 renderer
                     .add_custom_pass(
-                        &RenderGroupType::WorldCustom,
+                        &SceneLayer::WorldCustom,
                         &BlendMode::Alpha,
                         "engine_assets/shaders/sky_dome_occlude.wgsl",
                     )
@@ -428,7 +428,7 @@ impl GameEngine for Example3DGame {
             actor.set_position(&[0.0, 0.0, 0.0].into());
             actor.set_scale(&[30.0, 30.0, 30.0].into());
             actor.set_model(&sky_model);
-            actor.set_pass(&RenderGroupType::WorldCustom, &sky_pass);
+            actor.set_layer(&SceneLayer::WorldCustom, &sky_pass);
             renderer.add_or_update_actor(&actor);
             self.world_actors.push(actor);
         }
@@ -436,7 +436,7 @@ impl GameEngine for Example3DGame {
             let sky_pass = Some(
                 renderer
                     .add_custom_pass(
-                        &RenderGroupType::WorldCustom,
+                        &SceneLayer::WorldCustom,
                         &BlendMode::Alpha,
                         "engine_assets/shaders/sky_dome_draw.wgsl",
                     )
@@ -446,14 +446,14 @@ impl GameEngine for Example3DGame {
             actor.set_position(&[0.0, 0.0, 0.0].into());
             actor.set_scale(&[30.0, 30.0, 30.0].into());
             actor.set_model(&sky_model);
-            actor.set_pass(&RenderGroupType::WorldCustom, &sky_pass);
+            actor.set_layer(&SceneLayer::WorldCustom, &sky_pass);
             renderer.add_or_update_actor(&actor);
             self.world_actors.push(actor);
         }
 
         self.outline_pass = renderer
             .add_custom_pass(
-                &RenderGroupType::WorldCustom,
+                &SceneLayer::WorldCustom,
                 &BlendMode::Alpha,
                 "game_assets/shaders/first_person_outline.wgsl",
             )
@@ -483,8 +483,8 @@ impl GameEngine for Example3DGame {
         //  #[cfg(target_arch = "wasm32")]
         actor.set_custom_data_1(CgVec4::new(0.25, 0.08, 0.08, 0.08));
 
-        actor.set_pass(
-            &RenderGroupType::WorldCustom,
+        actor.set_layer(
+            &SceneLayer::WorldCustom,
             &Some(self.outline_pass),
         );
         renderer.add_or_update_actor(&actor);

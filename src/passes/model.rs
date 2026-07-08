@@ -792,8 +792,8 @@ impl ModelPass {
     pub fn render(
         &mut self,
         ctx: &mut RenderContext,
-        pass: &RenderGroupType,
-        custom_group_handle: Option<usize>,
+        layer: &SceneLayer,
+        custom_pass_handle: Option<usize>,
         actors: &HashMap<u32, Actor>,
     ) {
         let device_resources = &mut *ctx.device;
@@ -807,11 +807,11 @@ impl ModelPass {
                     label: Some("ModelPass::render()"),
                 });
 
-        let pass = (*pass).clone();
+        let layer = (*layer).clone();
         let (color_attachment, depth_attachment) = {
             let (color_ops, depth_ops) = {
                 let clear_color = game_config.clear_color;
-                if pass == RenderGroupType::World {
+                if layer == SceneLayer::World {
                     (
                         wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -827,7 +827,7 @@ impl ModelPass {
                             store: wgpu::StoreOp::Store,
                         },
                     )
-                } else if pass == RenderGroupType::Foreground {
+                } else if layer == SceneLayer::Foreground {
                     (
                         wgpu::Operations {
                             load: wgpu::LoadOp::Load,
@@ -866,7 +866,7 @@ impl ModelPass {
             )
         };
 
-        let render_pass_label = format!("{:?} {:?}", pass, self.blend_mode);
+        let render_pass_label = format!("{:?} {:?}", layer, self.blend_mode);
         let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(&render_pass_label),
             color_attachments: &[Some(color_attachment)],
@@ -881,8 +881,8 @@ impl ModelPass {
         let (view_matrix, view_dir, _) = game_camera.calculate_view_matrix();
         let view_pos = game_camera.get_position();
         let view_pos = [view_pos.x, view_pos.y, view_pos.z, 1.0];
-        let fov = if pass == RenderGroupType::Foreground
-            || pass == RenderGroupType::ForegroundCustom
+        let fov = if layer == SceneLayer::Foreground
+            || layer == SceneLayer::ForegroundCustom
         {
             game_config.foreground_fov
         } else {
@@ -899,19 +899,19 @@ impl ModelPass {
         let mut models_to_render = Vec::<ModelHandle>::new();
         let actor_iter = actors.iter();
         for actor_key_value in actor_iter {
-            let (actor_pass, group_handle) = actor_key_value.1.get_pass();
-            if actor_pass != pass {
+            let (actor_layer, pass_handle) = actor_key_value.1.get_layer();
+            if actor_layer != layer {
                 continue;
             }
-            if actor_pass == RenderGroupType::ForegroundCustom
-                || actor_pass == RenderGroupType::WorldCustom
+            if actor_layer == SceneLayer::ForegroundCustom
+                || actor_layer == SceneLayer::WorldCustom
             {
-                match custom_group_handle {
+                match custom_pass_handle {
                     None => {
                         continue;
                     }
                     Some(h) => {
-                        if h != group_handle.unwrap() {
+                        if h != pass_handle.unwrap() {
                             continue;
                         }
                     }

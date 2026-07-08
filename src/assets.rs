@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path, result::Result::Ok};
 use wgpu::ShaderModule;
 
-use crate::{resource::*, log, make_kb_handle, passes::model::*};
+use crate::{resource::*, log, make_handle, passes::model::*};
 
 #[cfg(target_arch = "wasm32")]
 fn format_url(file_name: &str) -> reqwest::Url {
@@ -50,11 +50,11 @@ pub async fn load_string(file_name: &str) -> anyhow::Result<String> {
     Ok(txt)
 }
 
-make_kb_handle!(Texture, TextureHandle, TextureAssetMappings);
-make_kb_handle!(ShaderModule, ShaderHandle, ShaderAssetMappings);
+make_handle!(Texture, TextureHandle, TextureAssetMappings);
+make_handle!(ShaderModule, ShaderHandle, ShaderAssetMappings);
 type ByteVec = Vec<u8>;
-make_kb_handle!(ByteVec, ByteFileHandle, ByteMappings);
-make_kb_handle!(Model, ModelHandle, ModelMappings);
+make_handle!(ByteVec, ByteFileHandle, ByteMappings);
+make_handle!(Model, ModelHandle, ModelMappings);
 
 #[allow(dead_code)]
 pub struct AssetManager {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::{config::*, renderer::*, utils::*, log, make_kb_handle};
+use crate::{config::*, renderer::*, utils::*, log, make_handle};
 
-make_kb_handle!(CollisionShape, CollisionHandle, CollisionMappings);
+make_handle!(CollisionShape, CollisionHandle, CollisionMappings);
 
 #[derive(Clone, Copy)]
 pub struct CollisionSphere {
