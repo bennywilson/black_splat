@@ -26,7 +26,7 @@ pub struct GameVfxManager {
     decals: Vec<GameDecal>,
     num_active_decals: usize,
     decal_model: Option<ModelHandle>,
-    decal_render_group: usize,
+    decal_pass: usize,
 }
 
 impl GameVfxManager {
@@ -50,7 +50,7 @@ impl GameVfxManager {
             decals: Vec::<GameDecal>::new(),
             num_active_decals: 0,
             decal_model: None,
-            decal_render_group: usize::MAX,
+            decal_pass: usize::MAX,
         }
     }
 
@@ -190,9 +190,9 @@ impl GameVfxManager {
             decal_actor.set_rotation(&rotation);
 
             decal_actor.set_model(self.decal_model.as_ref().unwrap());
-            decal_actor.set_render_group(
+            decal_actor.set_pass(
                 &RenderGroupType::WorldCustom,
-                &Some(self.decal_render_group),
+                &Some(self.decal_pass),
             );
             renderer.add_or_update_actor(&decal_actor);
             let decal = GameDecal {
@@ -260,9 +260,9 @@ impl GameVfxManager {
                 decal_actor.set_rotation(&rotation);
 
                 decal_actor.set_model(self.decal_model.as_ref().unwrap());
-                decal_actor.set_render_group(
+                decal_actor.set_pass(
                     &RenderGroupType::WorldCustom,
-                    &Some(self.decal_render_group),
+                    &Some(self.decal_pass),
                 );
                 renderer.add_or_update_actor(&decal_actor);
 
@@ -282,8 +282,8 @@ impl GameVfxManager {
                 .load_model("game_assets/models/decal.glb", false)
                 .await,
         );
-        self.decal_render_group = renderer
-            .add_custom_render_group(
+        self.decal_pass = renderer
+            .add_custom_pass(
                 &RenderGroupType::WorldCustom,
                 &BlendMode::Additive,
                 "engine_assets/shaders/decal.wgsl",

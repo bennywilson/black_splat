@@ -4,7 +4,7 @@ use cgmath::InnerSpace;
 
 use black_splat::{
     egui, config::*, engine::*, game_object::*, input::*, renderer::*, utils::*,
-    log, render_groups::gaussian_splat::SplatParams,
+    log, passes::gaussian_splat::SplatParams,
 };
 
 // Splat clouds the demo preloads and cycles between with [Space].  Missing files

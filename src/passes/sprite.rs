@@ -9,7 +9,7 @@ use crate::{
     assets::*, config::*, game_object::*, resource::*, utils::*, log, PERF_SCOPE,
 };
 
-pub struct SpriteRenderGroup {
+pub struct SpritePass {
     pub opaque_pipeline: wgpu::RenderPipeline,
     pub alpha_blend_pipeline: wgpu::RenderPipeline,
     pub vertex_buffer: wgpu::Buffer,
@@ -22,7 +22,7 @@ pub struct SpriteRenderGroup {
     pub texture_index: u32,
 }
 
-impl SpriteRenderGroup {
+impl SpritePass {
     pub async fn new(
         texture_file: String,
         texture_index: u32,
@@ -30,7 +30,7 @@ impl SpriteRenderGroup {
         asset_manager: &mut AssetManager,
         game_config: &Config,
     ) -> Self {
-        log!("Creating SpriteRenderGroup...");
+        log!("Creating SpritePass...");
 
         let device = &device_resources.device;
         let surface_config = &device_resources.surface_config;
@@ -263,7 +263,7 @@ impl SpriteRenderGroup {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        SpriteRenderGroup {
+        SpritePass {
             opaque_pipeline,
             alpha_blend_pipeline,
             vertex_buffer,
@@ -293,7 +293,7 @@ impl SpriteRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("SpriteRenderGroup::render()"),
+                    label: Some("SpritePass::render()"),
                 });
 
         let mut frame_instances = Vec::<SpriteDrawInstance>::new();
@@ -312,7 +312,7 @@ impl SpriteRenderGroup {
 
             if frame_instances.len() >= game_config.max_render_instances as usize {
                 log::warn!(
-                    "SpriteRenderGroup: hit max_render_instances ({}); dropping remaining sprites this frame",
+                    "SpritePass: hit max_render_instances ({}); dropping remaining sprites this frame",
                     game_config.max_render_instances
                 );
                 break;

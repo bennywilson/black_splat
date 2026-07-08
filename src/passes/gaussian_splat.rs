@@ -407,7 +407,7 @@ fn sphere_in_frustum(vp: cgmath::Matrix4<f32>, center: [f32; 3], radius: f32) ->
     true
 }
 
-pub struct GaussianSplatRenderGroup {
+pub struct GaussianSplatPass {
     pipeline: wgpu::RenderPipeline,
     uniform: SplatUniform,
     uniform_buffer: wgpu::Buffer,
@@ -431,12 +431,12 @@ pub struct GaussianSplatRenderGroup {
     params: SplatParams,
 }
 
-impl GaussianSplatRenderGroup {
+impl GaussianSplatPass {
     pub async fn new(
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
-        log!("Creating GaussianSplatRenderGroup");
+        log!("Creating GaussianSplatPass");
         let device = &device_resources.device;
         let surface_config = &device_resources.surface_config;
 
@@ -633,7 +633,7 @@ impl GaussianSplatRenderGroup {
         let sort_pipeline_scan_add = make_pipeline("Splat_sort_scan_add", "cs_scan_add");
         let sort_pipeline_scatter = make_pipeline("Splat_sort_scatter", "cs_scatter");
 
-        GaussianSplatRenderGroup {
+        GaussianSplatPass {
             pipeline,
             uniform,
             uniform_buffer,
@@ -992,7 +992,7 @@ impl GaussianSplatRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("GaussianSplatRenderGroup::render()"),
+                    label: Some("GaussianSplatPass::render()"),
                 });
 
         // GPU radix sort (Reduce-Scan-Scan-Scatter).  Every phase is its own compute

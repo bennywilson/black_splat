@@ -12,7 +12,7 @@ pub struct BulletHoleUniform {
 }
 
 #[allow(dead_code)]
-pub struct BulletHoleRenderGroup {
+pub struct BulletHolePass {
     pub pipeline: wgpu::RenderPipeline,
     pub uniform: BulletHoleUniform,
     pub uniform_buffer: wgpu::Buffer,
@@ -21,13 +21,13 @@ pub struct BulletHoleRenderGroup {
 }
 
 #[allow(dead_code)]
-impl BulletHoleRenderGroup {
+impl BulletHolePass {
     pub async fn new(
         shader_path: &str,
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
-        log!("Creating BulletHoleRenderGroup with shader {shader_path}");
+        log!("Creating BulletHolePass with shader {shader_path}");
         let device = &device_resources.device;
         let surface_config = &device_resources.surface_config;
 
@@ -36,7 +36,7 @@ impl BulletHoleRenderGroup {
             ..Default::default()
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("BulletHoleRenderGroup::uniform_buffer"),
+            label: Some("BulletHolePass::uniform_buffer"),
             contents: bytemuck::cast_slice(&[uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -70,7 +70,7 @@ impl BulletHoleRenderGroup {
                     count: None,
                 },
             ],
-            label: Some("BulletHoleRenderGroup::bind_group_layout"),
+            label: Some("BulletHolePass::bind_group_layout"),
         });
 
         let scorch_texture = asset_manager
@@ -93,13 +93,13 @@ impl BulletHoleRenderGroup {
                     resource: wgpu::BindingResource::Sampler(&scorch_tex.sampler),
                 },
             ],
-            label: Some("BulletHoleRenderGroup::bind_group"),
+            label: Some("BulletHolePass::bind_group"),
         });
 
         log!("  Creating pipeline");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ModelRenderGroup_render_pipeline_layout"),
+            label: Some("ModelPass_render_pipeline_layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
             immediate_size: 0,
         });
@@ -127,7 +127,7 @@ impl BulletHoleRenderGroup {
             },
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("BulletHoleRenderGroup::pipeline"),
+            label: Some("BulletHolePass::pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: model_shader,
@@ -168,7 +168,7 @@ impl BulletHoleRenderGroup {
         surface_config.height = 1024;
 
         //  let render_texture = Texture::new_render_texture(&device, &surface_config).unwrap();
-        BulletHoleRenderGroup {
+        BulletHolePass {
             pipeline,
             uniform,
             uniform_buffer,
@@ -190,7 +190,7 @@ impl BulletHoleRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("ModelRenderGroup::render()"),
+                    label: Some("ModelPass::render()"),
                 });
 
         let model_mappings = asset_manager.get_model_mappings();
@@ -216,7 +216,7 @@ impl BulletHoleRenderGroup {
         self.first_run = false;
 
         let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("BulletHoleRenderGroup::render_pass"),
+            label: Some("BulletHolePass::render_pass"),
             color_attachments: &[Some(color_attachment)],
             depth_stencil_attachment: None,
             occlusion_query_set: None,

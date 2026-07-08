@@ -17,7 +17,7 @@ pub mod input;
 pub mod renderer;
 pub mod resource;
 pub mod utils;
-pub mod render_groups {
+pub mod passes {
     pub mod bullet_hole;
     pub mod gaussian_splat;
     pub mod line;

@@ -2,7 +2,7 @@ use instant::Instant;
 //use cgmath::InnerSpace;
 
 use crate::{
-    assets::*, config::*, resource::*, utils::*, render_groups::model::*,
+    assets::*, config::*, resource::*, utils::*, passes::model::*,
 };
 
 static mut NEXT_ACTOR_ID: u32 = 0;
@@ -303,8 +303,8 @@ pub struct Actor {
     color: CgVec4,
     custom_data_1: CgVec4,
 
-    render_group: RenderGroupType,
-    custom_render_group_handle: Option<usize>,
+    pass: RenderGroupType,
+    custom_pass_handle: Option<usize>,
 
     model_handle: ModelHandle,
 }
@@ -326,8 +326,8 @@ impl Actor {
                 scale: CG_VEC3_ONE,
                 color: CG_VEC4_ONE,
                 custom_data_1: CG_VEC4_ZERO,
-                render_group: RenderGroupType::World,
-                custom_render_group_handle: None,
+                pass: RenderGroupType::World,
+                custom_pass_handle: None,
                 model_handle: ModelHandle::make_invalid(),
             }
         }
@@ -365,18 +365,18 @@ impl Actor {
         self.model_handle
     }
 
-    pub fn set_render_group(
+    pub fn set_pass(
         &mut self,
-        new_render_group: &RenderGroupType,
-        custom_render_group_handle: &Option<usize>,
+        new_pass: &RenderGroupType,
+        custom_pass_handle: &Option<usize>,
     ) {
-        self.render_group = new_render_group.clone();
-        self.custom_render_group_handle
-            .clone_from(custom_render_group_handle);
+        self.pass = new_pass.clone();
+        self.custom_pass_handle
+            .clone_from(custom_pass_handle);
     }
 
-    pub fn get_render_group(&self) -> (RenderGroupType, Option<usize>) {
-        (self.render_group.clone(), self.custom_render_group_handle)
+    pub fn get_pass(&self) -> (RenderGroupType, Option<usize>) {
+        (self.pass.clone(), self.custom_pass_handle)
     }
 
     pub fn set_color(&mut self, color: CgVec4) {

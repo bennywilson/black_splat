@@ -29,9 +29,9 @@ pub struct Example3DGame {
     shotgun_model: ModelHandle,
     monster_model: ModelHandle,
 
-    monster_render_group: usize,
-    outline_render_group: usize,
-    decal_render_group: usize,
+    monster_pass: usize,
+    outline_pass: usize,
+    decal_pass: usize,
 
     monster_spawn_timer: Instant,
     barrel_spawn_timer: Instant,
@@ -74,8 +74,8 @@ impl Example3DGame {
         let mut monster = GameMob::new(
             &monster_pos,
             &self.monster_model,
-            self.monster_render_group,
-            self.outline_render_group,
+            self.monster_pass,
+            self.outline_pass,
             &mut self.collision_manager,
         );
 
@@ -99,7 +99,7 @@ impl Example3DGame {
             &GamePropType::Barrel,
             &barrel_pos,
             &self.barrel_model,
-            self.outline_render_group,
+            self.outline_pass,
             &mut self.collision_manager,
             [smoke_handle_1, smoke_handle_2],
         );
@@ -119,14 +119,14 @@ impl Example3DGame {
             &GamePropType::Shotgun,
             &shotgun_pos,
             &self.shotgun_model,
-            self.outline_render_group,
+            self.outline_pass,
             &mut self.collision_manager,
             [INVALID_PARTICLE_HANDLE, INVALID_PARTICLE_HANDLE],
         );
         let shotgun_actors = shotgun.get_actors();
-        shotgun_actors[1].set_render_group(
+        shotgun_actors[1].set_pass(
             &RenderGroupType::WorldCustom,
-            &Some(self.outline_render_group),
+            &Some(self.outline_pass),
         );
 
         for actor in shotgun_actors {
@@ -143,18 +143,18 @@ impl Example3DGame {
                 &GamePropType::Sign,
                 &sign_pos,
                 model_handle,
-                self.outline_render_group,
+                self.outline_pass,
                 &mut self.collision_manager,
                 [INVALID_PARTICLE_HANDLE, INVALID_PARTICLE_HANDLE],
             );
             let sign_actors = sign.get_actors();
-            sign_actors[0].set_render_group(
+            sign_actors[0].set_pass(
                 &RenderGroupType::WorldHole,
-                &Some(self.outline_render_group),
+                &Some(self.outline_pass),
             );
-            sign_actors[1].set_render_group(
+            sign_actors[1].set_pass(
                 &RenderGroupType::WorldCustom,
-                &Some(self.outline_render_group),
+                &Some(self.outline_pass),
             );
 
             // hack
@@ -196,12 +196,12 @@ impl GameEngine for Example3DGame {
             barrel_model: ModelHandle::make_invalid(),
             shotgun_model: ModelHandle::make_invalid(),
             monster_model: ModelHandle::make_invalid(),
-            monster_render_group: usize::MAX,
+            monster_pass: usize::MAX,
             monster_spawn_timer: Instant::now(),
             shotgun_spawn_timer: Instant::now(),
             barrel_spawn_timer: Instant::now(),
-            outline_render_group: usize::MAX,
-            decal_render_group: usize::MAX,
+            outline_pass: usize::MAX,
+            decal_pass: usize::MAX,
             player: None,
             crosshair_error: 0.0,
             collision_manager: CollisionManager::new(),
@@ -341,8 +341,8 @@ impl GameEngine for Example3DGame {
             game_config.sun_beam_pos_scale = [500.0, 550.0, 500.0, 1550.0].into();
         }
 
-        self.decal_render_group = renderer
-            .add_custom_render_group(
+        self.decal_pass = renderer
+            .add_custom_pass(
                 &RenderGroupType::WorldCustom,
                 &BlendMode::Additive,
                 "engine_assets/shaders/decal.wgsl",
@@ -350,18 +350,18 @@ impl GameEngine for Example3DGame {
             .await;
 
         // First person set up
-        let fp_render_group = Some(
+        let fp_pass = Some(
             renderer
-                .add_custom_render_group(
+                .add_custom_pass(
                     &RenderGroupType::ForegroundCustom,
                     &BlendMode::None,
                     "game_assets/shaders/first_person.wgsl",
                 )
                 .await,
         );
-        let fp_outline_render_group = Some(
+        let fp_outline_pass = Some(
             renderer
-                .add_custom_render_group(
+                .add_custom_pass(
                     &RenderGroupType::ForegroundCustom,
                     &BlendMode::Alpha,
                     "game_assets/shaders/first_person_outline.wgsl",
@@ -374,13 +374,13 @@ impl GameEngine for Example3DGame {
         let mut player = GamePlayer::new(&hands_model).await;
 
         let (hands, hands_outlines) = player.get_actors();
-        hands.set_render_group(&RenderGroupType::ForegroundCustom, &fp_render_group);
+        hands.set_pass(&RenderGroupType::ForegroundCustom, &fp_pass);
         renderer.add_or_update_actor(hands);
 
         for outline in hands_outlines {
-            outline.set_render_group(
+            outline.set_pass(
                 &RenderGroupType::ForegroundCustom,
-                &fp_outline_render_group,
+                &fp_outline_pass,
             );
             renderer.add_or_update_actor(outline);
         }
@@ -390,14 +390,14 @@ impl GameEngine for Example3DGame {
         let monster_model = renderer
             .load_model("game_assets/models/monster.glb", false)
             .await;
-        let monster_render_group = renderer
-            .add_custom_render_group(
+        let monster_pass = renderer
+            .add_custom_pass(
                 &RenderGroupType::WorldCustom,
                 &BlendMode::Additive,
                 "game_assets/shaders/monster.wgsl",
             )
             .await;
-        self.monster_render_group = monster_render_group;
+        self.monster_pass = monster_pass;
         self.monster_model = monster_model;
 
         // World objects
@@ -415,9 +415,9 @@ impl GameEngine for Example3DGame {
             .load_model("game_assets/models/sky_dome.glb", false)
             .await;
         {
-            let sky_render_group = Some(
+            let sky_pass = Some(
                 renderer
-                    .add_custom_render_group(
+                    .add_custom_pass(
                         &RenderGroupType::WorldCustom,
                         &BlendMode::Alpha,
                         "engine_assets/shaders/sky_dome_occlude.wgsl",
@@ -428,14 +428,14 @@ impl GameEngine for Example3DGame {
             actor.set_position(&[0.0, 0.0, 0.0].into());
             actor.set_scale(&[30.0, 30.0, 30.0].into());
             actor.set_model(&sky_model);
-            actor.set_render_group(&RenderGroupType::WorldCustom, &sky_render_group);
+            actor.set_pass(&RenderGroupType::WorldCustom, &sky_pass);
             renderer.add_or_update_actor(&actor);
             self.world_actors.push(actor);
         }
         {
-            let sky_render_group = Some(
+            let sky_pass = Some(
                 renderer
-                    .add_custom_render_group(
+                    .add_custom_pass(
                         &RenderGroupType::WorldCustom,
                         &BlendMode::Alpha,
                         "engine_assets/shaders/sky_dome_draw.wgsl",
@@ -446,13 +446,13 @@ impl GameEngine for Example3DGame {
             actor.set_position(&[0.0, 0.0, 0.0].into());
             actor.set_scale(&[30.0, 30.0, 30.0].into());
             actor.set_model(&sky_model);
-            actor.set_render_group(&RenderGroupType::WorldCustom, &sky_render_group);
+            actor.set_pass(&RenderGroupType::WorldCustom, &sky_pass);
             renderer.add_or_update_actor(&actor);
             self.world_actors.push(actor);
         }
 
-        self.outline_render_group = renderer
-            .add_custom_render_group(
+        self.outline_pass = renderer
+            .add_custom_pass(
                 &RenderGroupType::WorldCustom,
                 &BlendMode::Alpha,
                 "game_assets/shaders/first_person_outline.wgsl",
@@ -483,9 +483,9 @@ impl GameEngine for Example3DGame {
         //  #[cfg(target_arch = "wasm32")]
         actor.set_custom_data_1(CgVec4::new(0.25, 0.08, 0.08, 0.08));
 
-        actor.set_render_group(
+        actor.set_pass(
             &RenderGroupType::WorldCustom,
-            &Some(self.outline_render_group),
+            &Some(self.outline_pass),
         );
         renderer.add_or_update_actor(&actor);
         self.world_actors.push(actor);

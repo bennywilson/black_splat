@@ -23,7 +23,7 @@ pub struct LineUniform {
     pub model_color: [f32; 4],
 }
 
-pub struct LineRenderGroup {
+pub struct LinePass {
     pub vertex_buffer: wgpu::Buffer,
     pub pipeline: wgpu::RenderPipeline,
     pub uniform: LineUniform,
@@ -34,18 +34,18 @@ pub struct LineRenderGroup {
 const MAX_LINES: usize = 1000;
 const MAX_VERTS: usize = 4 * MAX_LINES;
 
-impl LineRenderGroup {
+impl LinePass {
     pub async fn new(
         shader_path: &str,
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
-        log!("Creating ModelRenderGroup with shader {shader_path}");
+        log!("Creating ModelPass with shader {shader_path}");
         let device = &device_resources.device;
         let surface_config = &device_resources.surface_config;
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("LineRenderGroup_vertex_buffer"),
+            label: Some("LinePass_vertex_buffer"),
             mapped_at_creation: false,
             size: (size_of::<Vertex>() * MAX_VERTS) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -56,7 +56,7 @@ impl LineRenderGroup {
             ..Default::default()
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("LineRenderGroup_uniform_buffer"),
+            label: Some("LinePass_uniform_buffer"),
             contents: bytemuck::cast_slice(&[uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -73,7 +73,7 @@ impl LineRenderGroup {
                     },
                     count: None,
                 }],
-                label: Some("LineRenderGroup_uniform_bind_group_layout"),
+                label: Some("LinePass_uniform_bind_group_layout"),
             });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -82,14 +82,14 @@ impl LineRenderGroup {
                 binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
             }],
-            label: Some("LineRenderGroup_uniform_bind_group"),
+            label: Some("LinePass_uniform_bind_group"),
         });
 
         log!("  Creating pipeline");
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("LineRenderGroup_render_pipeline_layout"),
+                label: Some("LinePass_render_pipeline_layout"),
                 bind_group_layouts: &[Some(&uniform_bind_group_layout)],
                 immediate_size: 0,
             });
@@ -99,7 +99,7 @@ impl LineRenderGroup {
             .await;
         let model_shader = asset_manager.get_shader(&shader_handle);
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("LineRenderGroup_opaque_pipeline"),
+            label: Some("LinePass_opaque_pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: model_shader,
@@ -142,7 +142,7 @@ impl LineRenderGroup {
             cache: None,
         });
 
-        LineRenderGroup {
+        LinePass {
             vertex_buffer,
             pipeline,
             uniform,

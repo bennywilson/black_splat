@@ -409,7 +409,7 @@ pub enum PostProcessMode {
     Warp,
 }
 
-/// The borrows every render group needs, bundled so `render_frame` threads
+/// The borrows every pass needs, bundled so `render_frame` threads
 /// them once instead of passing 4-5 separate arguments to each pass.  Split
 /// out of the `Renderer`'s fields (not `&mut self`) so passes can run while
 /// other renderer state is held.  Passes destructure what they use; those

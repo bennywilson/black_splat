@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path, result::Result::Ok};
 use wgpu::ShaderModule;
 
-use crate::{resource::*, log, make_kb_handle, render_groups::model::*};
+use crate::{resource::*, log, make_kb_handle, passes::model::*};
 
 #[cfg(target_arch = "wasm32")]
 fn format_url(file_name: &str) -> reqwest::Url {

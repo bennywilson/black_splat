@@ -425,7 +425,7 @@ impl Model {
                     },
                     count: None,
                 }],
-                label: Some("ModelRenderGroup_uniform_bind_group_layout"),
+                label: Some("ModelPass_uniform_bind_group_layout"),
             });
 
         let uniform = ModelUniform {
@@ -445,7 +445,7 @@ impl Model {
                     binding: 0,
                     resource: uniform_buffer.as_entire_binding(),
                 }],
-                label: Some("ModelRenderGroup_uniform_bind_group"),
+                label: Some("ModelPass_uniform_bind_group"),
             });
 
             uniform_buffers.push(uniform_buffer);
@@ -501,7 +501,7 @@ impl Model {
     }
 }
 
-pub struct ModelRenderGroup {
+pub struct ModelPass {
     pub model_pipeline: wgpu::RenderPipeline,
     pub alpha_blend_pipeline: wgpu::RenderPipeline,
     pub additive_pipeline: wgpu::RenderPipeline,
@@ -511,14 +511,14 @@ pub struct ModelRenderGroup {
     pub blend_mode: BlendMode,
 }
 
-impl ModelRenderGroup {
+impl ModelPass {
     pub async fn new(
         shader_path: &str,
         blend_mode: &BlendMode,
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
-        log!("Creating ModelRenderGroup with shader {shader_path}");
+        log!("Creating ModelPass with shader {shader_path}");
         let device = &device_resources.device;
         let surface_config = &device_resources.surface_config;
 
@@ -544,7 +544,7 @@ impl ModelRenderGroup {
                     },
                     count: None,
                 }],
-                label: Some("ModelRenderGroup_uniform_bind_group_layout"),
+                label: Some("ModelPass_uniform_bind_group_layout"),
             });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -553,7 +553,7 @@ impl ModelRenderGroup {
                 binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
             }],
-            label: Some("ModelRenderGroup_uniform_bind_group"),
+            label: Some("ModelPass_uniform_bind_group"),
         });
 
         let texture_bind_group_layout =
@@ -586,14 +586,14 @@ impl ModelRenderGroup {
                         count: None,
                     },
                 ],
-                label: Some("ModelRenderGroup_texture_bind_group_layout"),
+                label: Some("ModelPass_texture_bind_group_layout"),
             });
 
         log!("  Creating pipeline");
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("ModelRenderGroup_render_pipeline_layout"),
+                label: Some("ModelPass_render_pipeline_layout"),
                 bind_group_layouts: &[Some(&texture_bind_group_layout), Some(&uniform_bind_group_layout)],
                 immediate_size: 0,
             });
@@ -633,7 +633,7 @@ impl ModelRenderGroup {
             write_mask = wgpu::ColorWrites::ALPHA;
         }
         let model_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ModelRenderGroup_opaque_pipeline"),
+            label: Some("ModelPass_opaque_pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: model_shader,
@@ -681,7 +681,7 @@ impl ModelRenderGroup {
             .await;
         let particle_shader = asset_manager.get_shader(&particle_shader_handle);
         let alpha_blend_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ModelRenderGroup::alpha_blend_pipeline"),
+            label: Some("ModelPass::alpha_blend_pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: particle_shader,
@@ -734,7 +734,7 @@ impl ModelRenderGroup {
         };
 
         let additive_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ModelRenderGroup_additive_pipeline"),
+            label: Some("ModelPass_additive_pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: particle_shader,
@@ -777,7 +777,7 @@ impl ModelRenderGroup {
             cache: None,
         });
 
-        ModelRenderGroup {
+        ModelPass {
             model_pipeline,
             alpha_blend_pipeline,
             additive_pipeline,
@@ -792,7 +792,7 @@ impl ModelRenderGroup {
     pub fn render(
         &mut self,
         ctx: &mut RenderContext,
-        render_group: &RenderGroupType,
+        pass: &RenderGroupType,
         custom_group_handle: Option<usize>,
         actors: &HashMap<u32, Actor>,
     ) {
@@ -804,14 +804,14 @@ impl ModelRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("ModelRenderGroup::render()"),
+                    label: Some("ModelPass::render()"),
                 });
 
-        let render_group = (*render_group).clone();
+        let pass = (*pass).clone();
         let (color_attachment, depth_attachment) = {
             let (color_ops, depth_ops) = {
                 let clear_color = game_config.clear_color;
-                if render_group == RenderGroupType::World {
+                if pass == RenderGroupType::World {
                     (
                         wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -827,7 +827,7 @@ impl ModelRenderGroup {
                             store: wgpu::StoreOp::Store,
                         },
                     )
-                } else if render_group == RenderGroupType::Foreground {
+                } else if pass == RenderGroupType::Foreground {
                     (
                         wgpu::Operations {
                             load: wgpu::LoadOp::Load,
@@ -866,7 +866,7 @@ impl ModelRenderGroup {
             )
         };
 
-        let render_pass_label = format!("{:?} {:?}", render_group, self.blend_mode);
+        let render_pass_label = format!("{:?} {:?}", pass, self.blend_mode);
         let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(&render_pass_label),
             color_attachments: &[Some(color_attachment)],
@@ -881,8 +881,8 @@ impl ModelRenderGroup {
         let (view_matrix, view_dir, _) = game_camera.calculate_view_matrix();
         let view_pos = game_camera.get_position();
         let view_pos = [view_pos.x, view_pos.y, view_pos.z, 1.0];
-        let fov = if render_group == RenderGroupType::Foreground
-            || render_group == RenderGroupType::ForegroundCustom
+        let fov = if pass == RenderGroupType::Foreground
+            || pass == RenderGroupType::ForegroundCustom
         {
             game_config.foreground_fov
         } else {
@@ -899,12 +899,12 @@ impl ModelRenderGroup {
         let mut models_to_render = Vec::<ModelHandle>::new();
         let actor_iter = actors.iter();
         for actor_key_value in actor_iter {
-            let (actor_render_group, group_handle) = actor_key_value.1.get_render_group();
-            if actor_render_group != render_group {
+            let (actor_pass, group_handle) = actor_key_value.1.get_pass();
+            if actor_pass != pass {
                 continue;
             }
-            if actor_render_group == RenderGroupType::ForegroundCustom
-                || actor_render_group == RenderGroupType::WorldCustom
+            if actor_pass == RenderGroupType::ForegroundCustom
+                || actor_pass == RenderGroupType::WorldCustom
             {
                 match custom_group_handle {
                     None => {
@@ -1014,7 +1014,7 @@ impl ModelRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("ModelRenderGroup::render_particles()"),
+                    label: Some("ModelPass::render_particles()"),
                 });
 
         // Create instances

@@ -41,7 +41,7 @@ pub struct SunbeamUniform {
     pub extra_data: [f32; 4],
 }
 
-pub struct SunbeamRenderGroup {
+pub struct SunbeamPass {
     pub mask_pipeline: wgpu::RenderPipeline,
     pub draw_pipeline: wgpu::RenderPipeline,
     pub sunbeam_uniform: SunbeamUniform,
@@ -54,7 +54,7 @@ pub struct SunbeamRenderGroup {
     flare_tex_handle: TextureHandle,
 }
 
-impl SunbeamRenderGroup {
+impl SunbeamPass {
     pub async fn new(
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
@@ -208,7 +208,7 @@ impl SunbeamRenderGroup {
                     resource: wgpu::BindingResource::TextureView(&flare_tex.view),
                 },
             ],
-            label: Some("SunbeamRenderGroup::tex_bind_group"),
+            label: Some("SunbeamPass::tex_bind_group"),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
@@ -292,7 +292,7 @@ impl SunbeamRenderGroup {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        SunbeamRenderGroup {
+        SunbeamPass {
             mask_pipeline,
             draw_pipeline,
             sunbeam_uniform,
@@ -321,7 +321,7 @@ impl SunbeamRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("SunbeamRenderGroup::render()"),
+                    label: Some("SunbeamPass::render()"),
                 });
 
         // Mask Pass
@@ -402,7 +402,7 @@ impl SunbeamRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("SunbeamRenderGroup::render()"),
+                    label: Some("SunbeamPass::render()"),
                 });
 
         // Mask Pass
@@ -553,7 +553,7 @@ impl SunbeamRenderGroup {
                     resource: wgpu::BindingResource::TextureView(&flare_tex.view),
                 },
             ],
-            label: Some("SunbeamRenderGroup::tex_bind_group"),
+            label: Some("SunbeamPass::tex_bind_group"),
         });
     }
 

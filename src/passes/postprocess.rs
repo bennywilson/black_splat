@@ -2,7 +2,7 @@ use wgpu::util::DeviceExt;
 
 use crate::{assets::*, resource::*};
 
-pub struct PostprocessRenderGroup {
+pub struct PostprocessPass {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub pipeline: wgpu::RenderPipeline,
@@ -15,7 +15,7 @@ pub struct PostprocessRenderGroup {
     pub tonemap_enabled: bool,
 }
 
-impl PostprocessRenderGroup {
+impl PostprocessPass {
     pub async fn new(
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
@@ -193,7 +193,7 @@ impl PostprocessRenderGroup {
             contents: bytemuck::cast_slice(INDICES),
             usage: wgpu::BufferUsages::INDEX,
         });
-        PostprocessRenderGroup {
+        PostprocessPass {
             pipeline,
             postprocess_uniform,
             uniform_buffer,
@@ -219,7 +219,7 @@ impl PostprocessRenderGroup {
             device_resources
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("PostprocessRenderGroup::render()"),
+                    label: Some("PostprocessPass::render()"),
                 });
 
         let color_attachment = Some(wgpu::RenderPassColorAttachment {

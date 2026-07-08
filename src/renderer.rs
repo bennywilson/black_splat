@@ -9,7 +9,7 @@ use crate::{
     resource::*,
     utils::*,
     log,
-    render_groups::{
+    passes::{
         bullet_hole::*, gaussian_splat::*, line::*, model::*,
         postprocess::*, sprite::*, sunbeam::*,
     },
@@ -20,17 +20,17 @@ use crate::{
 pub struct Renderer<'a> {
     device_resources: DeviceResources<'a>,
 
-    default_sprite_render_group: SpriteRenderGroup,
-    custom_sprite_render_groups: Vec<SpriteRenderGroup>,
-    postprocess_render_group: PostprocessRenderGroup,
-    model_render_group: ModelRenderGroup,
-    model_with_holes_render_group: ModelRenderGroup,
-    line_render_group: LineRenderGroup,
-    sunbeam_render_group: SunbeamRenderGroup,
+    default_sprite_pass: SpritePass,
+    custom_sprite_passes: Vec<SpritePass>,
+    postprocess_pass: PostprocessPass,
+    model_pass: ModelPass,
+    model_with_holes_pass: ModelPass,
+    line_pass: LinePass,
+    sunbeam_pass: SunbeamPass,
     // Built lazily on first load_gaussian_splat() call: its pipeline binds storage
     // buffers in the vertex stage, which WebGL2 can't do, so we must not create it
     // for the GL-backed 2D/3D demos.
-    gaussian_splat_render_group: Option<GaussianSplatRenderGroup>,
+    gaussian_splat_pass: Option<GaussianSplatPass>,
     // In-engine GUI (egui).  The context is shared with the host loop's
     // egui-winit State (which feeds it window input); games build widgets
     // against it during tick_frame, and render_frame paints the tessellated
@@ -48,11 +48,11 @@ pub struct Renderer<'a> {
     status_msg: String,
     status_msg_color: CgVec4,
 
-    bullet_hole_render_group: BulletHoleRenderGroup,
+    bullet_hole_pass: BulletHolePass,
     bullet_hole_actor_index: Option<u32>,
     bullet_hole_trace: (CgVec3, CgVec3),
-    custom_world_render_groups: Vec<ModelRenderGroup>,
-    custom_foreground_render_groups: Vec<ModelRenderGroup>,
+    custom_world_passes: Vec<ModelPass>,
+    custom_foreground_passes: Vec<ModelPass>,
 
     asset_manager: AssetManager,
     actor_map: HashMap<u32, Actor>,
@@ -93,7 +93,7 @@ impl<'a> Renderer<'a> {
 
         let mut asset_manager = AssetManager::new();
         let device_resources = DeviceResources::new(window.clone(), game_config).await;
-        let default_sprite_render_group = SpriteRenderGroup::new(
+        let default_sprite_pass = SpritePass::new(
             "/engine_assets/textures/sprite_sheet.png".to_string(),
             0,
             &device_resources,
@@ -101,9 +101,9 @@ impl<'a> Renderer<'a> {
             game_config,
         )
         .await;
-        let postprocess_render_group =
-            PostprocessRenderGroup::new(&device_resources, &mut asset_manager).await;
-        let model_render_group = ModelRenderGroup::new(
+        let postprocess_pass =
+            PostprocessPass::new(&device_resources, &mut asset_manager).await;
+        let model_pass = ModelPass::new(
             "/engine_assets/shaders/model.wgsl",
             &BlendMode::None,
             &device_resources,
@@ -111,24 +111,24 @@ impl<'a> Renderer<'a> {
         )
         .await;
 
-        let line_render_group = LineRenderGroup::new(
+        let line_pass = LinePass::new(
             "/engine_assets/shaders/line.wgsl",
             &device_resources,
             &mut asset_manager,
         )
         .await;
-        let sunbeam_render_group =
-            SunbeamRenderGroup::new(&device_resources, &mut asset_manager).await;
-        let custom_world_render_groups = Vec::<ModelRenderGroup>::new();
-        let custom_foreground_render_groups = Vec::<ModelRenderGroup>::new();
-        let bullet_hole_render_group = BulletHoleRenderGroup::new(
+        let sunbeam_pass =
+            SunbeamPass::new(&device_resources, &mut asset_manager).await;
+        let custom_world_passes = Vec::<ModelPass>::new();
+        let custom_foreground_passes = Vec::<ModelPass>::new();
+        let bullet_hole_pass = BulletHolePass::new(
             "/engine_assets/shaders/bullet_hole.wgsl",
             &device_resources,
             &mut asset_manager,
         )
         .await;
 
-        let model_with_holes_render_group = ModelRenderGroup::new(
+        let model_with_holes_pass = ModelPass::new(
             "/engine_assets/shaders/model_with_holes.wgsl",
             &BlendMode::None,
             &device_resources,
@@ -147,24 +147,24 @@ impl<'a> Renderer<'a> {
 
         Renderer {
             device_resources,
-            default_sprite_render_group,
-            custom_sprite_render_groups: vec![],
-            model_render_group,
-            model_with_holes_render_group,
-            postprocess_render_group,
-            line_render_group,
-            sunbeam_render_group,
-            gaussian_splat_render_group: None,
+            default_sprite_pass,
+            custom_sprite_passes: vec![],
+            model_pass,
+            model_with_holes_pass,
+            postprocess_pass,
+            line_pass,
+            sunbeam_pass,
+            gaussian_splat_pass: None,
             egui_ctx,
             egui_renderer,
             egui_pass_active: false,
             egui_platform_output: None,
             status_msg: "".to_string(),
             status_msg_color: CgVec4::new(1.0, 0.25, 0.2, 1.0),
-            custom_world_render_groups,
-            custom_foreground_render_groups,
+            custom_world_passes,
+            custom_foreground_passes,
 
-            bullet_hole_render_group,
+            bullet_hole_pass,
             bullet_hole_actor_index: None,
             bullet_hole_trace: (CG_VEC3_ZERO, CG_VEC3_ZERO),
 
@@ -567,18 +567,18 @@ impl<'a> Renderer<'a> {
                 .actor_map
                 .get_mut(&self.bullet_hole_actor_index.unwrap())
                 .unwrap();
-            self.bullet_hole_render_group
+            self.bullet_hole_pass
                 .render(&mut ctx, actor, &self.bullet_hole_trace);
             self.bullet_hole_actor_index = None;
         }
         {
             PERF_SCOPE!("World Opaque");
-            self.model_render_group
+            self.model_pass
                 .render(&mut ctx, &RenderGroupType::World, None, &self.actor_map);
         }
         {
             PERF_SCOPE!("World With Holes");
-            self.model_with_holes_render_group.render(
+            self.model_with_holes_pass.render(
                 &mut ctx,
                 &RenderGroupType::WorldHole,
                 None,
@@ -587,9 +587,9 @@ impl<'a> Renderer<'a> {
         }
         if !self.actor_map.is_empty() {
             PERF_SCOPE!("World Custom");
-            for i in 0..self.custom_world_render_groups.len() {
-                let render_group = &mut self.custom_world_render_groups[i];
-                render_group.render(
+            for i in 0..self.custom_world_passes.len() {
+                let pass = &mut self.custom_world_passes[i];
+                pass.render(
                     &mut ctx,
                     &RenderGroupType::WorldCustom,
                     Some(i),
@@ -600,17 +600,17 @@ impl<'a> Renderer<'a> {
 
         {
             PERF_SCOPE!("World Debug");
-            self.line_render_group.render(&mut ctx, &self.debug_lines);
+            self.line_pass.render(&mut ctx, &self.debug_lines);
         }
 
         if !self.particle_map.is_empty() {
             PERF_SCOPE!("World Transparent");
-            self.model_render_group.render_particles(
+            self.model_pass.render_particles(
                 &mut ctx,
                 ParticleBlendMode::AlphaBlend,
                 &mut self.particle_map,
             );
-            self.model_render_group.render_particles(
+            self.model_pass.render_particles(
                 &mut ctx,
                 ParticleBlendMode::Additive,
                 &mut self.particle_map,
@@ -618,10 +618,10 @@ impl<'a> Renderer<'a> {
         }
 
         if game_config.sunbeams_enabled {
-            self.sunbeam_render_group.render(&mut ctx);
+            self.sunbeam_pass.render(&mut ctx);
         }
 
-        if let Some(splat_group) = &mut self.gaussian_splat_render_group {
+        if let Some(splat_group) = &mut self.gaussian_splat_pass {
             if splat_group.has_model() {
                 PERF_SCOPE!("Gaussian Splats");
                 splat_group.render(&mut ctx);
@@ -630,13 +630,13 @@ impl<'a> Renderer<'a> {
 
         if !self.actor_map.is_empty() {
             PERF_SCOPE!("Foreground Opaque");
-            self.model_render_group
+            self.model_pass
                 .render(&mut ctx, &RenderGroupType::Foreground, None, &self.actor_map);
             {
                 PERF_SCOPE!("Foreground Custom");
-                for i in 0..self.custom_foreground_render_groups.len() {
-                    let render_group = &mut self.custom_foreground_render_groups[i];
-                    render_group.render(
+                for i in 0..self.custom_foreground_passes.len() {
+                    let pass = &mut self.custom_foreground_passes[i];
+                    pass.render(
                         &mut ctx,
                         &RenderGroupType::ForegroundCustom,
                         Some(i),
@@ -649,7 +649,7 @@ impl<'a> Renderer<'a> {
         if !skybox_render_objs.is_empty() {
             PERF_SCOPE!("Sprite Pass Sky");
 
-            self.default_sprite_render_group.render(
+            self.default_sprite_pass.render(
                 &mut ctx,
                 RenderPassType::Opaque,
                 &skybox_render_objs,
@@ -659,7 +659,7 @@ impl<'a> Renderer<'a> {
         if !cloud_render_objs.is_empty() {
             PERF_SCOPE!("Sprite Pass Clouds");
 
-            self.default_sprite_render_group.render(
+            self.default_sprite_pass.render(
                 &mut ctx,
                 RenderPassType::Transparent,
                 &cloud_render_objs,
@@ -669,7 +669,7 @@ impl<'a> Renderer<'a> {
         if !game_render_objs.is_empty() {
             PERF_SCOPE!("2D Game Objects");
 
-            self.default_sprite_render_group.render(
+            self.default_sprite_pass.render(
                 &mut ctx,
                 RenderPassType::Opaque,
                 &game_render_objs,
@@ -677,15 +677,15 @@ impl<'a> Renderer<'a> {
         }
 
         {
-            PERF_SCOPE!("Custom Render Groups");
-            for render_group in &mut self.custom_sprite_render_groups {
-                render_group.render(&mut ctx, RenderPassType::Opaque, &game_render_objs);
+            PERF_SCOPE!("Custom Passes");
+            for pass in &mut self.custom_sprite_passes {
+                pass.render(&mut ctx, RenderPassType::Opaque, &game_render_objs);
             }
         }
 
         {
             PERF_SCOPE!("Postprocess pass");
-            self.postprocess_render_group.render(
+            self.postprocess_pass.render(
                 &mut ctx,
                 &final_view,
                 Some(self.postprocess_mode.clone()),
@@ -723,9 +723,9 @@ impl<'a> Renderer<'a> {
         );
 
         self.device_resources.resize(game_config);
-        self.postprocess_render_group
+        self.postprocess_pass
             .resize(&mut self.device_resources, &self.asset_manager);
-        self.sunbeam_render_group.resize(&mut self.device_resources, &self.asset_manager)
+        self.sunbeam_pass.resize(&mut self.device_resources, &self.asset_manager)
     }
 
     pub fn window_id(&self) -> winit::window::WindowId {
@@ -796,13 +796,13 @@ impl<'a> Renderer<'a> {
     /// it loaded (a missing/unreadable file is skipped and returns false).  Call
     /// repeatedly to preload several clouds, then cycle with `set_active_gaussian_splat`.
     pub async fn load_gaussian_splat(&mut self, file_path: &str, params: &SplatParams) -> bool {
-        if self.gaussian_splat_render_group.is_none() {
-            self.gaussian_splat_render_group = Some(
-                GaussianSplatRenderGroup::new(&self.device_resources, &mut self.asset_manager)
+        if self.gaussian_splat_pass.is_none() {
+            self.gaussian_splat_pass = Some(
+                GaussianSplatPass::new(&self.device_resources, &mut self.asset_manager)
                     .await,
             );
         }
-        let splat_group = self.gaussian_splat_render_group.as_mut().unwrap();
+        let splat_group = self.gaussian_splat_pass.as_mut().unwrap();
         splat_group.set_params(params);
         splat_group.load(file_path, &self.device_resources).await
     }
@@ -819,7 +819,7 @@ impl<'a> Renderer<'a> {
         name: &str,
         params: &SplatParams,
     ) -> Result<SplatLoadInfo, String> {
-        let Some(splat_group) = &mut self.gaussian_splat_render_group else {
+        let Some(splat_group) = &mut self.gaussian_splat_pass else {
             log!("load_gaussian_splat_from_bytes called before the splat pipeline exists");
             return Err("splat renderer not initialized".to_string());
         };
@@ -829,27 +829,27 @@ impl<'a> Renderer<'a> {
 
     /// Number of splat clouds preloaded via `load_gaussian_splat`.
     pub fn num_gaussian_splats(&self) -> usize {
-        self.gaussian_splat_render_group
+        self.gaussian_splat_pass
             .as_ref()
             .map_or(0, |g| g.num_models())
     }
 
     /// Selects which preloaded splat cloud to render (out-of-range is ignored).
     pub fn set_active_gaussian_splat(&mut self, index: usize) {
-        if let Some(splat_group) = &mut self.gaussian_splat_render_group {
+        if let Some(splat_group) = &mut self.gaussian_splat_pass {
             splat_group.set_active_model(index);
         }
     }
 
     /// Number of gaussian splats in the currently active cloud (0 if none).
     pub fn active_gaussian_splat_count(&self) -> u32 {
-        self.gaussian_splat_render_group
+        self.gaussian_splat_pass
             .as_ref()
             .map_or(0, |g| g.active_splat_count())
     }
 
     pub fn set_gaussian_splat_params(&mut self, params: &SplatParams) {
-        if let Some(splat_group) = &mut self.gaussian_splat_render_group {
+        if let Some(splat_group) = &mut self.gaussian_splat_pass {
             splat_group.set_params(params);
         }
     }
@@ -869,13 +869,13 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    pub async fn add_custom_render_group(
+    pub async fn add_custom_pass(
         &mut self,
         render_group_type: &RenderGroupType,
         blend_mode: &BlendMode,
         shader_path: &str,
     ) -> usize {
-        let new_render_group = ModelRenderGroup::new(
+        let new_pass = ModelPass::new(
             shader_path,
             blend_mode,
             &self.device_resources,
@@ -885,18 +885,18 @@ impl<'a> Renderer<'a> {
 
         (match *render_group_type {
             RenderGroupType::ForegroundCustom => {
-                self.custom_foreground_render_groups.push(new_render_group);
-                self.custom_foreground_render_groups.len()
+                self.custom_foreground_passes.push(new_pass);
+                self.custom_foreground_passes.len()
             }
 
             RenderGroupType::WorldCustom => {
-                self.custom_world_render_groups.push(new_render_group);
-                self.custom_world_render_groups.len()
+                self.custom_world_passes.push(new_pass);
+                self.custom_world_passes.len()
             }
 
             _ => {
                 panic!(
-                    "Renderer::add_custom_render_group() - Render type {:?} not supported",
+                    "Renderer::add_custom_pass() - Render type {:?} not supported",
                     render_group_type
                 );
             }
@@ -1003,16 +1003,16 @@ impl<'a> Renderer<'a> {
 
     /// Enables the ACES tonemap applied in the postprocess pass.
     pub fn set_tonemap_enabled(&mut self, enabled: bool) {
-        self.postprocess_render_group.tonemap_enabled = enabled;
+        self.postprocess_pass.tonemap_enabled = enabled;
     }
 
-    pub async fn add_sprite_render_group(
+    pub async fn add_sprite_pass(
         &mut self,
         texture_path: String,
         game_config: &Config,
     ) -> u32 {
-        let new_index = self.custom_sprite_render_groups.len() as u32 + 1;
-        let render_group = SpriteRenderGroup::new(
+        let new_index = self.custom_sprite_passes.len() as u32 + 1;
+        let pass = SpritePass::new(
             texture_path,
             new_index,
             &self.device_resources,
@@ -1020,7 +1020,7 @@ impl<'a> Renderer<'a> {
             game_config,
         )
         .await;
-        self.custom_sprite_render_groups.push(render_group);
+        self.custom_sprite_passes.push(pass);
         new_index
     }
 }
