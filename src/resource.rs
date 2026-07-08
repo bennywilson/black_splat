@@ -409,6 +409,18 @@ pub enum PostProcessMode {
     Warp,
 }
 
+/// The borrows every render group needs, bundled so `render_frame` threads
+/// them once instead of passing 4-5 separate arguments to each pass.  Split
+/// out of the `Renderer`'s fields (not `&mut self`) so passes can run while
+/// other renderer state is held.  Passes destructure what they use; those
+/// that don't need `camera`/`assets` simply ignore them.
+pub struct RenderContext<'ctx, 'dev> {
+    pub device: &'ctx mut DeviceResources<'dev>,
+    pub assets: &'ctx mut crate::assets::AssetManager,
+    pub camera: &'ctx crate::game_object::Camera,
+    pub config: &'ctx crate::config::Config,
+}
+
 #[allow(dead_code)]
 pub struct DeviceResources<'a> {
     pub surface: wgpu::Surface<'a>,

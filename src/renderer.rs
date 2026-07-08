@@ -545,6 +545,21 @@ impl<'a> Renderer<'a> {
             return;
         };
 
+        // Sorted sprite lists are computed up front (they only read game_objects)
+        // so `ctx` can borrow the renderer's fields for the whole pass region
+        // without colliding with this &self call.
+        let (game_render_objs, skybox_render_objs, cloud_render_objs) =
+            self.get_sorted_render_objects(game_objects);
+
+        // Bundle the borrows every pass needs, once, instead of threading
+        // device/assets/camera/config through each render call by hand.
+        let mut ctx = RenderContext {
+            device: &mut self.device_resources,
+            assets: &mut self.asset_manager,
+            camera: &self.game_camera,
+            config: game_config,
+        };
+
         if self.bullet_hole_actor_index.is_some() {
             PERF_SCOPE!("Bullet Holes");
 
@@ -552,37 +567,22 @@ impl<'a> Renderer<'a> {
                 .actor_map
                 .get_mut(&self.bullet_hole_actor_index.unwrap())
                 .unwrap();
-            self.bullet_hole_render_group.render(
-                &mut self.device_resources,
-                &mut self.asset_manager,
-                game_config,
-                actor,
-                &self.bullet_hole_trace,
-            );
+            self.bullet_hole_render_group
+                .render(&mut ctx, actor, &self.bullet_hole_trace);
             self.bullet_hole_actor_index = None;
         }
         {
             PERF_SCOPE!("World Opaque");
-            self.model_render_group.render(
-                &RenderGroupType::World,
-                None,
-                &mut self.device_resources,
-                &mut self.asset_manager,
-                &self.game_camera,
-                &self.actor_map,
-                game_config,
-            );
+            self.model_render_group
+                .render(&mut ctx, &RenderGroupType::World, None, &self.actor_map);
         }
         {
             PERF_SCOPE!("World With Holes");
             self.model_with_holes_render_group.render(
+                &mut ctx,
                 &RenderGroupType::WorldHole,
                 None,
-                &mut self.device_resources,
-                &mut self.asset_manager,
-                &self.game_camera,
                 &self.actor_map,
-                game_config,
             );
         }
         if !self.actor_map.is_empty() {
@@ -590,99 +590,68 @@ impl<'a> Renderer<'a> {
             for i in 0..self.custom_world_render_groups.len() {
                 let render_group = &mut self.custom_world_render_groups[i];
                 render_group.render(
+                    &mut ctx,
                     &RenderGroupType::WorldCustom,
                     Some(i),
-                    &mut self.device_resources,
-                    &mut self.asset_manager,
-                    &self.game_camera,
                     &self.actor_map,
-                    game_config,
                 );
             }
         }
 
         {
             PERF_SCOPE!("World Debug");
-            self.line_render_group.render(
-                &mut self.device_resources,
-                &mut self.asset_manager,
-                &self.game_camera,
-                &self.debug_lines,
-                game_config,
-            );
+            self.line_render_group.render(&mut ctx, &self.debug_lines);
         }
 
         if !self.particle_map.is_empty() {
             PERF_SCOPE!("World Transparent");
             self.model_render_group.render_particles(
+                &mut ctx,
                 ParticleBlendMode::AlphaBlend,
-                &mut self.device_resources,
-                &self.game_camera,
                 &mut self.particle_map,
-                game_config,
             );
             self.model_render_group.render_particles(
+                &mut ctx,
                 ParticleBlendMode::Additive,
-                &mut self.device_resources,
-                &self.game_camera,
                 &mut self.particle_map,
-                game_config,
             );
         }
 
         if game_config.sunbeams_enabled {
-            self.sunbeam_render_group.render(
-                &mut self.device_resources,
-                &self.game_camera,
-                game_config,
-            );
+            self.sunbeam_render_group.render(&mut ctx);
         }
 
         if let Some(splat_group) = &mut self.gaussian_splat_render_group {
             if splat_group.has_model() {
                 PERF_SCOPE!("Gaussian Splats");
-                splat_group.render(&mut self.device_resources, &self.game_camera, game_config);
+                splat_group.render(&mut ctx);
             }
         }
 
         if !self.actor_map.is_empty() {
             PERF_SCOPE!("Foreground Opaque");
-            self.model_render_group.render(
-                &RenderGroupType::Foreground,
-                None,
-                &mut self.device_resources,
-                &mut self.asset_manager,
-                &self.game_camera,
-                &self.actor_map,
-                game_config,
-            );
+            self.model_render_group
+                .render(&mut ctx, &RenderGroupType::Foreground, None, &self.actor_map);
             {
                 PERF_SCOPE!("Foreground Custom");
                 for i in 0..self.custom_foreground_render_groups.len() {
                     let render_group = &mut self.custom_foreground_render_groups[i];
                     render_group.render(
+                        &mut ctx,
                         &RenderGroupType::ForegroundCustom,
                         Some(i),
-                        &mut self.device_resources,
-                        &mut self.asset_manager,
-                        &self.game_camera,
                         &self.actor_map,
-                        game_config,
                     );
                 }
             }
         }
 
-        let (game_render_objs, skybox_render_objs, cloud_render_objs) =
-            self.get_sorted_render_objects(game_objects);
-
         if !skybox_render_objs.is_empty() {
             PERF_SCOPE!("Sprite Pass Sky");
 
             self.default_sprite_render_group.render(
+                &mut ctx,
                 RenderPassType::Opaque,
-                &mut self.device_resources,
-                game_config,
                 &skybox_render_objs,
             );
         }
@@ -691,9 +660,8 @@ impl<'a> Renderer<'a> {
             PERF_SCOPE!("Sprite Pass Clouds");
 
             self.default_sprite_render_group.render(
+                &mut ctx,
                 RenderPassType::Transparent,
-                &mut self.device_resources,
-                game_config,
                 &cloud_render_objs,
             );
         }
@@ -702,9 +670,8 @@ impl<'a> Renderer<'a> {
             PERF_SCOPE!("2D Game Objects");
 
             self.default_sprite_render_group.render(
+                &mut ctx,
                 RenderPassType::Opaque,
-                &mut self.device_resources,
-                game_config,
                 &game_render_objs,
             );
         }
@@ -712,21 +679,15 @@ impl<'a> Renderer<'a> {
         {
             PERF_SCOPE!("Custom Render Groups");
             for render_group in &mut self.custom_sprite_render_groups {
-                render_group.render(
-                    RenderPassType::Opaque,
-                    &mut self.device_resources,
-                    game_config,
-                    &game_render_objs,
-                );
+                render_group.render(&mut ctx, RenderPassType::Opaque, &game_render_objs);
             }
         }
 
         {
             PERF_SCOPE!("Postprocess pass");
             self.postprocess_render_group.render(
+                &mut ctx,
                 &final_view,
-                &mut self.device_resources,
-                game_config,
                 Some(self.postprocess_mode.clone()),
             );
         }

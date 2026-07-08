@@ -279,15 +279,16 @@ impl SpriteRenderGroup {
 
     pub fn render(
         &mut self,
+        ctx: &mut RenderContext,
         render_pass_type: RenderPassType,
-        device_resources: &mut DeviceResources,
-        game_config: &Config,
         game_objects: &Vec<GameObject>,
     ) {
         if game_objects.is_empty() {
             return;
         }
 
+        let device_resources = &mut *ctx.device;
+        let game_config = ctx.config;
         let mut command_encoder =
             device_resources
                 .device

@@ -2,7 +2,7 @@ use cgmath::InnerSpace;
 use cgmath::SquareMatrix;
 use wgpu::util::DeviceExt;
 
-use crate::{assets::*, config::*, game_object::*, resource::*, utils::*, log};
+use crate::{assets::*, game_object::*, resource::*, utils::*, log};
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -180,12 +180,12 @@ impl BulletHoleRenderGroup {
 
     pub fn render(
         &mut self,
-        device_resources: &mut DeviceResources,
-        asset_manager: &mut AssetManager,
-        _game_config: &Config,
+        ctx: &mut RenderContext,
         actor: &Actor,
         traces: &(CgVec3, CgVec3),
     ) {
+        let device_resources = &mut *ctx.device;
+        let asset_manager = &mut *ctx.assets;
         let mut command_encoder =
             device_resources
                 .device

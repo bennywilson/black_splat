@@ -3,7 +3,7 @@ use std::mem::size_of;
 use std::num::NonZeroU64;
 use wgpu::util::DeviceExt;
 
-use crate::{assets::*, config::*, game_object::*, resource::*, log};
+use crate::{assets::*, resource::*, log};
 
 /// Per-platform cap on splats per cloud.  The GPU-side ceiling is computed at
 /// load time from the device's actual limits (see `load`); this constant bounds
@@ -906,12 +906,10 @@ impl GaussianSplatRenderGroup {
         !self.models.is_empty()
     }
 
-    pub fn render(
-        &mut self,
-        device_resources: &mut DeviceResources,
-        game_camera: &Camera,
-        game_config: &Config,
-    ) {
+    pub fn render(&mut self, ctx: &mut RenderContext) {
+        let device_resources = &mut *ctx.device;
+        let game_camera = ctx.camera;
+        let game_config = ctx.config;
         let model = match self.models.get_mut(self.active_model) {
             Some(m) => m,
             None => return,

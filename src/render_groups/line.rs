@@ -2,7 +2,7 @@ use cgmath::InnerSpace;
 use std::mem::size_of;
 use wgpu::util::DeviceExt;
 
-use crate::{assets::*, config::*, game_object::*, resource::*, utils::*, log};
+use crate::{assets::*, resource::*, utils::*, log};
 
 #[derive(Clone, Copy)]
 pub struct Line {
@@ -151,14 +151,10 @@ impl LineRenderGroup {
         }
     }
 
-    pub fn render(
-        &mut self,
-        device_resources: &mut DeviceResources,
-        _asset_manager: &mut AssetManager,
-        game_camera: &Camera,
-        lines: &Vec<Line>,
-        game_config: &Config,
-    ) {
+    pub fn render(&mut self, ctx: &mut RenderContext, lines: &Vec<Line>) {
+        let device_resources = &mut *ctx.device;
+        let game_camera = ctx.camera;
+        let game_config = ctx.config;
         let mut command_encoder =
             device_resources
                 .device

@@ -1,6 +1,6 @@
 use wgpu::util::DeviceExt;
 
-use crate::{assets::*, config::*, resource::*};
+use crate::{assets::*, resource::*};
 
 pub struct PostprocessRenderGroup {
     pub vertex_buffer: wgpu::Buffer,
@@ -209,11 +209,12 @@ impl PostprocessRenderGroup {
 
     pub fn render(
         &mut self,
+        ctx: &mut RenderContext,
         target_view: &wgpu::TextureView,
-        device_resources: &mut DeviceResources,
-        game_config: &Config,
         postprocess_override: Option<PostProcessMode>,
     ) {
+        let device_resources = &mut *ctx.device;
+        let game_config = ctx.config;
         let mut command_encoder =
             device_resources
                 .device

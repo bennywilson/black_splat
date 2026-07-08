@@ -5,7 +5,7 @@ use wgpu::{
     TextureSampleType, TextureViewDimension,
 };
 
-use crate::{assets::*, config::*, game_object::*, resource::*, log};
+use crate::{assets::*, game_object::*, resource::*, log};
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -791,14 +791,15 @@ impl ModelRenderGroup {
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
+        ctx: &mut RenderContext,
         render_group: &RenderGroupType,
         custom_group_handle: Option<usize>,
-        device_resources: &mut DeviceResources,
-        asset_manager: &mut AssetManager,
-        game_camera: &Camera,
         actors: &HashMap<u32, Actor>,
-        game_config: &Config,
     ) {
+        let device_resources = &mut *ctx.device;
+        let asset_manager = &mut *ctx.assets;
+        let game_camera = ctx.camera;
+        let game_config = ctx.config;
         let mut command_encoder =
             device_resources
                 .device
@@ -1002,12 +1003,13 @@ impl ModelRenderGroup {
 
     pub fn render_particles(
         &mut self,
+        ctx: &mut RenderContext,
         blend_mode: ParticleBlendMode,
-        device_resources: &mut DeviceResources,
-        game_camera: &Camera,
         particles: &mut HashMap<ParticleHandle, ParticleActor>,
-        game_config: &Config,
     ) {
+        let device_resources = &mut *ctx.device;
+        let game_camera = ctx.camera;
+        let game_config = ctx.config;
         let mut command_encoder =
             device_resources
                 .device

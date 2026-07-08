@@ -306,14 +306,9 @@ impl SunbeamRenderGroup {
         }
     }
 
-    pub fn render(
-        &mut self,
-        device_resources: &mut DeviceResources,
-        camera: &Camera,
-        game_config: &Config,
-    ) {
-        self.render_mask(device_resources, camera, game_config);
-        self.render_beams(device_resources, camera, game_config);
+    pub fn render(&mut self, ctx: &mut RenderContext) {
+        self.render_mask(ctx.device, ctx.camera, ctx.config);
+        self.render_beams(ctx.device, ctx.camera, ctx.config);
     }
 
     pub fn render_mask(
