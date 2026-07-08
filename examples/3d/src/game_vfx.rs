@@ -1,6 +1,6 @@
-use kb_engine3::{
-    kb_assets::*, kb_collision::*, kb_config::*, kb_game_object::*, kb_renderer::*, kb_resource::*,
-    kb_utils::*,
+use black_splat::{
+    assets::*, collision::*, config::*, game_object::*, renderer::*, resource::*,
+    utils::*,
 };
 
 use crate::game_actors::*;
@@ -8,53 +8,53 @@ use crate::game_actors::*;
 const MAX_DECALS: usize = 16;
 
 pub struct GameVfxManager {
-    pooled_gib_particles: Vec<KbParticleHandle>,
+    pooled_gib_particles: Vec<ParticleHandle>,
     next_pooled_gib: usize,
 
-    pooled_impact_particles: Vec<KbParticleHandle>,
+    pooled_impact_particles: Vec<ParticleHandle>,
     next_pooled_impact: usize,
 
-    pooled_smoke_particles: Vec<KbParticleHandle>,
+    pooled_smoke_particles: Vec<ParticleHandle>,
     next_pooled_smoke: usize,
 
-    pooled_muzzle_flashes: Vec<KbParticleHandle>,
+    pooled_muzzle_flashes: Vec<ParticleHandle>,
     next_muzzle_flash: usize,
 
-    pooled_barrel_explosions: Vec<KbParticleHandle>,
+    pooled_barrel_explosions: Vec<ParticleHandle>,
     next_barrel_explosion: usize,
 
     decals: Vec<GameDecal>,
     num_active_decals: usize,
-    decal_model: Option<KbModelHandle>,
-    decal_render_group: usize,
+    decal_model: Option<ModelHandle>,
+    decal_pass: usize,
 }
 
 impl GameVfxManager {
     pub fn new() -> Self {
         GameVfxManager {
-            pooled_gib_particles: Vec::<KbParticleHandle>::new(),
+            pooled_gib_particles: Vec::<ParticleHandle>::new(),
             next_pooled_gib: 0,
 
-            pooled_impact_particles: Vec::<KbParticleHandle>::new(),
+            pooled_impact_particles: Vec::<ParticleHandle>::new(),
             next_pooled_impact: 0,
 
-            pooled_smoke_particles: Vec::<KbParticleHandle>::new(),
+            pooled_smoke_particles: Vec::<ParticleHandle>::new(),
             next_pooled_smoke: 0,
 
-            pooled_muzzle_flashes: Vec::<KbParticleHandle>::new(),
+            pooled_muzzle_flashes: Vec::<ParticleHandle>::new(),
             next_muzzle_flash: 0,
 
-            pooled_barrel_explosions: Vec::<KbParticleHandle>::new(),
+            pooled_barrel_explosions: Vec::<ParticleHandle>::new(),
             next_barrel_explosion: 0,
 
             decals: Vec::<GameDecal>::new(),
             num_active_decals: 0,
             decal_model: None,
-            decal_render_group: usize::MAX,
+            decal_pass: usize::MAX,
         }
     }
 
-    pub fn spawn_gibs(&mut self, gibs_position: &CgVec3, renderer: &mut KbRenderer<'_>) {
+    pub fn spawn_gibs(&mut self, gibs_position: &CgVec3, renderer: &mut Renderer<'_>) {
         self.next_pooled_gib = (self.next_pooled_gib + 1) % self.pooled_gib_particles.len();
         renderer.enable_particle_actor(&self.pooled_gib_particles[self.next_pooled_gib], true);
         renderer.update_particle_transform(
@@ -64,7 +64,7 @@ impl GameVfxManager {
         );
     }
 
-    pub fn spawn_impact(&mut self, impact_position: &CgVec3, renderer: &mut KbRenderer<'_>) {
+    pub fn spawn_impact(&mut self, impact_position: &CgVec3, renderer: &mut Renderer<'_>) {
         self.next_pooled_impact =
             (self.next_pooled_impact + 1) % self.pooled_impact_particles.len();
         renderer
@@ -79,8 +79,8 @@ impl GameVfxManager {
     pub fn spawn_barrel_smoke(
         &mut self,
         barrel_pos: &CgVec3,
-        renderer: &mut KbRenderer<'_>,
-    ) -> (KbParticleHandle, KbParticleHandle) {
+        renderer: &mut Renderer<'_>,
+    ) -> (ParticleHandle, ParticleHandle) {
         self.next_pooled_smoke = (self.next_pooled_smoke + 1) % self.pooled_smoke_particles.len();
         let particle_handle_1 = self.pooled_smoke_particles[self.next_pooled_smoke].clone();
         renderer.enable_particle_actor(&particle_handle_1, true);
@@ -95,7 +95,7 @@ impl GameVfxManager {
         (particle_handle_1, particle_handle_2)
     }
 
-    pub fn spawn_explosion(&mut self, explosion_position: &CgVec3, renderer: &mut KbRenderer<'_>) {
+    pub fn spawn_explosion(&mut self, explosion_position: &CgVec3, renderer: &mut Renderer<'_>) {
         self.next_barrel_explosion =
             (self.next_barrel_explosion + 1) % self.pooled_barrel_explosions.len();
         renderer.enable_particle_actor(
@@ -125,7 +125,7 @@ impl GameVfxManager {
         &mut self,
         position: &CgVec3,
         scale: &CgVec3,
-        renderer: &mut KbRenderer<'_>,
+        renderer: &mut Renderer<'_>,
     ) {
         self.next_muzzle_flash = (self.next_muzzle_flash + 1) % self.pooled_muzzle_flashes.len();
         renderer.enable_particle_actor(&self.pooled_muzzle_flashes[self.next_muzzle_flash], true);
@@ -136,7 +136,7 @@ impl GameVfxManager {
         );
     }
 
-    pub fn tick(&mut self, position: &CgVec3, renderer: &mut KbRenderer, game_config: &KbConfig) {
+    pub fn tick(&mut self, position: &CgVec3, renderer: &mut Renderer, game_config: &Config) {
         for muzzle_flash in &mut self.pooled_muzzle_flashes {
             renderer.update_particle_transform(muzzle_flash, position, &None);
         }
@@ -162,9 +162,9 @@ impl GameVfxManager {
         &mut self,
         mob_pos: &CgVec3,
         view_dir: &CgVec3,
-        renderer: &mut KbRenderer<'_>,
-        collision_manager: &mut KbCollisionManager,
-        game_config: &KbConfig,
+        renderer: &mut Renderer<'_>,
+        collision_manager: &mut CollisionManager,
+        game_config: &Config,
     ) {
         self.spawn_gibs(mob_pos, renderer);
 
@@ -173,43 +173,43 @@ impl GameVfxManager {
         }
 
         // Floor decals
-        let num_floor_decals = kb_random_u32(3, 7);
+        let num_floor_decals = random_u32(3, 7);
         for _ in 0..num_floor_decals {
-            let mut decal_actor = KbActor::new();
+            let mut decal_actor = Actor::new();
 
             let mut ground_pos =
-                mob_pos + kb_random_vec3(CgVec3::new(-3.0, 0.0, -3.0), CgVec3::new(3.0, 0.0, 3.0));
+                mob_pos + random_vec3(CgVec3::new(-3.0, 0.0, -3.0), CgVec3::new(3.0, 0.0, 3.0));
             ground_pos.y = 0.05;
             decal_actor.set_position(&ground_pos);
 
-            let scale = kb_random_f32(1.0, 5.0);
+            let scale = random_f32(1.0, 5.0);
             decal_actor.set_scale(&CgVec3::new(scale, scale, scale));
 
-            let decal_rotation = cgmath::Rad::from(cgmath::Deg(kb_random_f32(0.0, 360.0)));
+            let decal_rotation = cgmath::Rad::from(cgmath::Deg(random_f32(0.0, 360.0)));
             let rotation = cgmath::Quaternion::from(CgMat3::from_angle_y(decal_rotation));
             decal_actor.set_rotation(&rotation);
 
             decal_actor.set_model(self.decal_model.as_ref().unwrap());
-            decal_actor.set_render_group(
-                &KbRenderGroupType::WorldCustom,
-                &Some(self.decal_render_group),
+            decal_actor.set_layer(
+                &SceneLayer::WorldCustom,
+                &Some(self.decal_pass),
             );
             renderer.add_or_update_actor(&decal_actor);
             let decal = GameDecal {
                 actor: decal_actor,
                 start_time: game_config.start_time.elapsed().as_secs_f32()
-                    + kb_random_f32(-0.25, 0.25),
+                    + random_f32(-0.25, 0.25),
             };
             self.decals.push(decal);
         }
 
         // Wall decals
-        let num_wall_decals = kb_random_u32(3, 5);
+        let num_wall_decals = random_u32(3, 5);
         let decal_position_range = CgVec3::new(3.0, 3.0, 3.0);
         for _ in 0..num_wall_decals {
-            let rot_1 = cgmath::Rad::from(cgmath::Deg(kb_random_f32(-15.0, 15.0)));
-            let rot_2 = cgmath::Rad::from(cgmath::Deg(kb_random_f32(-15.0, 15.0)));
-            let rot_3 = cgmath::Rad::from(cgmath::Deg(kb_random_f32(-15.0, 15.0)));
+            let rot_1 = cgmath::Rad::from(cgmath::Deg(random_f32(-15.0, 15.0)));
+            let rot_2 = cgmath::Rad::from(cgmath::Deg(random_f32(-15.0, 15.0)));
+            let rot_3 = cgmath::Rad::from(cgmath::Deg(random_f32(-15.0, 15.0)));
             let rotation = cgmath::Quaternion::from(
                 CgMat3::from_angle_x(rot_1)
                     * CgMat3::from_angle_y(rot_2)
@@ -219,14 +219,14 @@ impl GameVfxManager {
 
             let (t, _, decal_hit_loc, _) = collision_manager.cast_ray(mob_pos, &splat_dir);
             if (0.0..1.0).contains(&t) {
-                splat_dir.y += kb_random_f32(-decal_position_range.x, decal_position_range.x);
+                splat_dir.y += random_f32(-decal_position_range.x, decal_position_range.x);
 
                 // The world is a cube that extends from approximately (-20.0, -20.0, -20.0) to (20.0, 20.0, 20.0)
                 let (pos, rotation) = {
                     let decal_hit_loc = decal_hit_loc.unwrap();
                     if decal_hit_loc.x.abs() > decal_hit_loc.z.abs() {
                         splat_dir.z +=
-                            kb_random_f32(-decal_position_range.z, decal_position_range.z);
+                            random_f32(-decal_position_range.z, decal_position_range.z);
                         if decal_hit_loc.x < 0.0 {
                             (CgVec3::new(-18.0, splat_dir.y, splat_dir.z), 90.0)
                         } else {
@@ -234,7 +234,7 @@ impl GameVfxManager {
                         }
                     } else {
                         splat_dir.x +=
-                            kb_random_f32(-decal_position_range.x, decal_position_range.x);
+                            random_f32(-decal_position_range.x, decal_position_range.x);
                         if decal_hit_loc.z < 0.0 {
                             (CgVec3::new(splat_dir.x, splat_dir.y, -18.0), 180.0)
                         } else {
@@ -243,15 +243,15 @@ impl GameVfxManager {
                     }
                 };
 
-                let mut decal_actor = KbActor::new();
+                let mut decal_actor = Actor::new();
 
                 decal_actor.set_position(&pos);
-                let scale = kb_random_f32(1.0, 5.0);
+                let scale = random_f32(1.0, 5.0);
                 decal_actor.set_scale(&CgVec3::new(scale, scale, scale));
 
                 let decal_fix = cgmath::Rad::from(cgmath::Deg(90.0));
                 let decal_rotation = cgmath::Rad::from(cgmath::Deg(rotation));
-                let spin = cgmath::Rad::from(cgmath::Deg(kb_random_f32(0.0, 360.0)));
+                let spin = cgmath::Rad::from(cgmath::Deg(random_f32(0.0, 360.0)));
                 let rotation = cgmath::Quaternion::from(
                     CgMat3::from_angle_y(decal_rotation)
                         * CgMat3::from_angle_x(decal_fix)
@@ -260,40 +260,40 @@ impl GameVfxManager {
                 decal_actor.set_rotation(&rotation);
 
                 decal_actor.set_model(self.decal_model.as_ref().unwrap());
-                decal_actor.set_render_group(
-                    &KbRenderGroupType::WorldCustom,
-                    &Some(self.decal_render_group),
+                decal_actor.set_layer(
+                    &SceneLayer::WorldCustom,
+                    &Some(self.decal_pass),
                 );
                 renderer.add_or_update_actor(&decal_actor);
 
                 let decal = GameDecal {
                     actor: decal_actor,
                     start_time: game_config.start_time.elapsed().as_secs_f32()
-                        + kb_random_f32(-0.25, 0.25),
+                        + random_f32(-0.25, 0.25),
                 };
                 self.decals.push(decal);
             }
         }
     }
 
-    pub async fn init(&mut self, renderer: &mut KbRenderer<'_>) {
+    pub async fn init(&mut self, renderer: &mut Renderer<'_>) {
         self.decal_model = Some(
             renderer
                 .load_model("game_assets/models/decal.glb", false)
                 .await,
         );
-        self.decal_render_group = renderer
-            .add_custom_render_group(
-                &KbRenderGroupType::WorldCustom,
-                &KbBlendMode::Additive,
+        self.decal_pass = renderer
+            .add_custom_pass(
+                &SceneLayer::WorldCustom,
+                &BlendMode::Additive,
                 "engine_assets/shaders/decal.wgsl",
             )
             .await;
 
         // Pooled gibs
-        let particle_params = KbParticleParams {
+        let particle_params = ParticleParams {
             texture_file: "/game_assets/fx/monster_gibs_t.png".to_string(),
-            blend_mode: KbParticleBlendMode::AlphaBlend,
+            blend_mode: ParticleBlendMode::AlphaBlend,
 
             min_burst_count: 75,
             max_burst_count: 100,
@@ -334,7 +334,7 @@ impl GameVfxManager {
             end_color_0: CgVec4::new(0.0, 0.0, 0.0, 0.0),
             _end_color1: CgVec4::new(0.0, 0.0, 0.0, 0.0),
         };
-        let particle_transform = KbActorTransform::from_position(CgVec3::new(3.0, 3.5, 0.0));
+        let particle_transform = ActorTransform::from_position(CgVec3::new(3.0, 3.5, 0.0));
         for _ in 0..20 {
             let particle_handle = renderer
                 .add_particle_actor(&particle_transform, &particle_params, false)
@@ -343,9 +343,9 @@ impl GameVfxManager {
         }
 
         // Pooled Impacts
-        let particle_params = KbParticleParams {
+        let particle_params = ParticleParams {
             texture_file: "/game_assets/fx/smoke_t.png".to_string(),
-            blend_mode: KbParticleBlendMode::AlphaBlend,
+            blend_mode: ParticleBlendMode::AlphaBlend,
 
             min_burst_count: 100,
             max_burst_count: 100,
@@ -386,7 +386,7 @@ impl GameVfxManager {
             end_color_0: CgVec4::new(0.7, 0.7, 0.7, 0.0),
             _end_color1: CgVec4::new(0.9, 0.8, 0.8, 0.0),
         };
-        let particle_transform = KbActorTransform::from_position(CgVec3::new(3.0, 3.5, 0.0));
+        let particle_transform = ActorTransform::from_position(CgVec3::new(3.0, 3.5, 0.0));
         for _ in 0..20 {
             let particle_handle = renderer
                 .add_particle_actor(&particle_transform, &particle_params, false)
@@ -395,9 +395,9 @@ impl GameVfxManager {
         }
 
         // Pooled smoke
-        let particle_smoke_params = KbParticleParams {
+        let particle_smoke_params = ParticleParams {
             texture_file: "/game_assets/fx/smoke_t.png".to_string(),
-            blend_mode: KbParticleBlendMode::AlphaBlend,
+            blend_mode: ParticleBlendMode::AlphaBlend,
 
             min_burst_count: 0,
             max_burst_count: 0,
@@ -438,14 +438,14 @@ impl GameVfxManager {
             end_color_0: CgVec4::new(-0.5, -0.5, -0.5, 0.0),
             _end_color1: CgVec4::new(-0.5, -0.5, -0.5, 1.0),
         };
-        let particle_transform = KbActorTransform::from_position(CgVec3::new(0.0, 3.5, 0.0));
+        let particle_transform = ActorTransform::from_position(CgVec3::new(0.0, 3.5, 0.0));
         let _ = renderer
             .add_particle_actor(&particle_transform, &particle_params, true)
             .await;
 
-        let particle_ember_params = KbParticleParams {
+        let particle_ember_params = ParticleParams {
             texture_file: "./game_assets/fx/ember_t.png".to_string(),
-            blend_mode: KbParticleBlendMode::Additive,
+            blend_mode: ParticleBlendMode::Additive,
 
             min_burst_count: 0,
             max_burst_count: 0,
@@ -486,7 +486,7 @@ impl GameVfxManager {
             end_color_0: CgVec4::new(1.0, 0.8, -0.1, 0.0),
             _end_color1: CgVec4::new(1.0, 0.8, -0.1, 1.0),
         };
-        let particle_transform = KbActorTransform::from_position(CgVec3::new(0.0, 3.5, 0.0));
+        let particle_transform = ActorTransform::from_position(CgVec3::new(0.0, 3.5, 0.0));
         let _ = renderer
             .add_particle_actor(&particle_transform, &particle_params, true)
             .await;
@@ -504,9 +504,9 @@ impl GameVfxManager {
         }
 
         // Pooled Muzzle Flashes
-        let muzzle_flash_params = KbParticleParams {
+        let muzzle_flash_params = ParticleParams {
             texture_file: "/game_assets/fx/muzzle_flash_t.png".to_string(),
-            blend_mode: KbParticleBlendMode::Additive,
+            blend_mode: ParticleBlendMode::Additive,
 
             min_burst_count: 1,
             max_burst_count: 1,
@@ -556,9 +556,9 @@ impl GameVfxManager {
         }
 
         // Barrel Explosions
-        let barrel_explosion_fire_params = KbParticleParams {
+        let barrel_explosion_fire_params = ParticleParams {
             texture_file: "/game_assets/fx/fire_t.png".to_string(),
-            blend_mode: KbParticleBlendMode::Additive,
+            blend_mode: ParticleBlendMode::Additive,
 
             min_burst_count: 23,
             max_burst_count: 50,
@@ -600,9 +600,9 @@ impl GameVfxManager {
             _end_color1: CgVec4::new(-0.5, -0.5, -0.5, 1.0),
         };
 
-        let barrel_explosion_smoke_params = KbParticleParams {
+        let barrel_explosion_smoke_params = ParticleParams {
             texture_file: "/game_assets/fx/smoke_t.png".to_string(),
-            blend_mode: KbParticleBlendMode::AlphaBlend,
+            blend_mode: ParticleBlendMode::AlphaBlend,
             min_burst_count: 23,
             max_burst_count: 50,
 
@@ -642,7 +642,7 @@ impl GameVfxManager {
             end_color_0: CgVec4::new(0.0, 0.0, 0.0, 0.0),
             _end_color1: CgVec4::new(-0.5, -0.5, -0.5, 1.0),
         };
-        let particle_transform = KbActorTransform::from_position(CgVec3::new(0.0, 3.5, 0.0));
+        let particle_transform = ActorTransform::from_position(CgVec3::new(0.0, 3.5, 0.0));
 
         for _ in 0..24 {
             let particle_handle = renderer

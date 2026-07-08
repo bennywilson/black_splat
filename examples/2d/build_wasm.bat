@@ -4,7 +4,7 @@ if errorlevel 1 ( echo cargo build failed & pause & exit /b 1 )
 where wasm-bindgen >nul 2>nul
 if errorlevel 1 ( echo wasm-bindgen not found - run: cargo install wasm-bindgen-cli --version 0.2.126 & pause & exit /b 1 )
 
-wasm-bindgen --target web --out-dir target/wasm32-unknown-unknown/release target/wasm32-unknown-unknown/release/kb_engine_2D_demo.wasm
+wasm-bindgen --target web --out-dir target/wasm32-unknown-unknown/release target/wasm32-unknown-unknown/release/black_splat_2d_demo.wasm
 if errorlevel 1 ( echo wasm-bindgen failed & pause & exit /b 1 )
 
 powershell cp index.html target/wasm32-unknown-unknown/release

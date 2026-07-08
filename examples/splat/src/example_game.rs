@@ -2,9 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use cgmath::InnerSpace;
 
-use kb_engine3::{
-    egui, kb_config::*, kb_engine::*, kb_game_object::*, kb_input::*, kb_renderer::*, kb_utils::*,
-    log, render_groups::kb_gaussian_splat_group::KbSplatParams,
+use black_splat::{
+    egui, config::*, engine::*, game_object::*, input::*, renderer::*, utils::*,
+    log, passes::gaussian_splat::SplatParams,
 };
 
 // Splat clouds the demo preloads and cycles between with [Space].  Missing files
@@ -88,8 +88,8 @@ const STATUS_WHITE: CgVec4 = CgVec4::new(1.0, 1.0, 1.0, 1.0);
 
 pub struct SplatGame {
     game_objects: Vec<GameObject>,
-    game_camera: KbCamera,
-    splat_params: KbSplatParams,
+    game_camera: Camera,
+    splat_params: SplatParams,
     // Display names of the clouds that actually loaded, aligned with the
     // renderer's splat indices; `active_splat` is the one being shown.
     splat_names: Vec<String>,
@@ -154,16 +154,16 @@ impl SplatGame {
     }
 }
 
-impl KbGameEngine for SplatGame {
-    fn new(game_config: &KbConfig) -> Self {
+impl GameEngine for SplatGame {
+    fn new(game_config: &Config) -> Self {
         log!("SplatGame::new()");
-        let mut game_camera = KbCamera::new();
+        let mut game_camera = Camera::new();
         game_camera.set_position(&game_config.start_position);
         game_camera.set_rotation(&game_config.start_rotation);
         Self {
             game_objects: Vec::new(),
             game_camera,
-            splat_params: KbSplatParams {
+            splat_params: SplatParams {
                 falloff: 4.65,
                 scale: 3.0,
                 contrast: 1.0,
@@ -183,8 +183,8 @@ impl KbGameEngine for SplatGame {
 
     async fn initialize_world(
         &mut self,
-        renderer: &mut KbRenderer<'_>,
-        game_config: &mut KbConfig,
+        renderer: &mut Renderer<'_>,
+        game_config: &mut Config,
     ) {
         log!("SplatGame::initialize_world()");
         game_config.clear_color = CgVec4::new(0.02, 0.02, 0.03, 1.0);
@@ -218,9 +218,9 @@ impl KbGameEngine for SplatGame {
 
     fn tick_frame_internal(
         &mut self,
-        renderer: &mut KbRenderer,
-        input_manager: &KbInputManager,
-        game_config: &KbConfig,
+        renderer: &mut Renderer,
+        input_manager: &InputManager,
+        game_config: &Config,
     ) {
         let delta_time = game_config.delta_time;
         let (_view, view_dir, right_dir) = self.game_camera.calculate_view_matrix();

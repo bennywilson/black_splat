@@ -1,5 +1,5 @@
 [package]
-name = "kb_engine_3D_demo"
+name = "black_splat_3d_demo"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,7 +9,7 @@ getrandom = { version = "0.2", features = ["js"] }
 instant = { version = "0.1.12", features = [ "wasm-bindgen"] }
 pollster = "0.3"
 
-kb_engine3 = { path = "../../", features = ["wasm_include_3d"] }
+black_splat = { path = "../../", features = ["wasm_include_3d"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4.42"

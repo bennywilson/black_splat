@@ -9,7 +9,7 @@
 // Instead every phase is its own dispatch (its own pass boundary), and all scans run in workgroup shared memory
 // with no subgroup intrinsics (also not guaranteed on the web).
 //
-// Phases per sort (the host drives the dispatch order; see kb_gaussian_splat_group.rs):
+// Phases per sort (the host drives the dispatch order; see gaussian_splat.rs):
 //   cs_compute_keys  - once: depth -> sortable u32 key, payload = splat index.
 //   per digit (shift 0/8/16/24):
 //     cs_histogram   - per-tile bucket counts, written bucket-major into g_hist.
