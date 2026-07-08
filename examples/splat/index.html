@@ -7,13 +7,13 @@
      canvas -- the page is just a host for the wasm module. -->
 
 <script type="module">
-	import init from "./kb_engine_splat_demo.js";
+	import init from "./black_splat_splat_demo.js";
     window.addEventListener("load", () => {
         // Cache-bust the wasm URL so Chrome's compiled-wasm cache can't serve a
         // stale build across rebuilds (a plain reload otherwise reuses it).
         init({
             module_or_path: new URL(
-                `./kb_engine_splat_demo_bg.wasm?v=${Date.now()}`,
+                `./black_splat_splat_demo_bg.wasm?v=${Date.now()}`,
                 import.meta.url
             ),
         });

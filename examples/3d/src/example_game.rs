@@ -1,9 +1,9 @@
 use cgmath::InnerSpace;
 use instant::Instant;
 
-use kb_engine3::{
-    kb_assets::*, kb_collision::*, kb_config::*, kb_engine::*, kb_game_object::*, kb_input::*,
-    kb_renderer::*, kb_resource::*, kb_utils::*, log,
+use black_splat::{
+    assets::*, collision::*, config::*, engine::*, game_object::*, input::*,
+    renderer::*, resource::*, utils::*, log,
 };
 
 use crate::{game_actors::*, game_vfx::*};
@@ -15,19 +15,19 @@ pub const CROSSHAIR_ERROR_RATE: f32 = 10.0;
 pub struct Example3DGame {
     player: Option<GamePlayer>,
     mobs: Vec<GameMob>,
-    world_actors: Vec<KbActor>,
+    world_actors: Vec<Actor>,
     props: Vec<GameProp>,
 
     game_objects: Vec<GameObject>,
-    game_camera: KbCamera,
+    game_camera: Camera,
 
-    collision_manager: KbCollisionManager,
+    collision_manager: CollisionManager,
     vfx_manager: GameVfxManager,
 
     sign_prop: Option<GameProp>,
-    barrel_model: KbModelHandle,
-    shotgun_model: KbModelHandle,
-    monster_model: KbModelHandle,
+    barrel_model: ModelHandle,
+    shotgun_model: ModelHandle,
+    monster_model: ModelHandle,
 
     monster_render_group: usize,
     outline_render_group: usize,
@@ -46,11 +46,11 @@ pub struct Example3DGame {
     debug_collision: bool,
     pause_monsters: bool,
 
-    post_process_override: KbPostProcessMode,
+    post_process_override: PostProcessMode,
 }
 
 impl Example3DGame {
-    fn spawn_monster(&mut self, renderer: &mut KbRenderer<'_>) {
+    fn spawn_monster(&mut self, renderer: &mut Renderer<'_>) {
         if self.pause_monsters {
             return;
         }
@@ -70,7 +70,7 @@ impl Example3DGame {
             CgVec3::new(0.0, 2.0, -15.0),
         ];
 
-        let monster_pos = pos[kb_random_u32(0, 7) as usize];
+        let monster_pos = pos[random_u32(0, 7) as usize];
         let mut monster = GameMob::new(
             &monster_pos,
             &self.monster_model,
@@ -86,9 +86,9 @@ impl Example3DGame {
         self.mobs.push(monster);
     }
 
-    fn spawn_barrel(&mut self, renderer: &mut KbRenderer<'_>) {
+    fn spawn_barrel(&mut self, renderer: &mut Renderer<'_>) {
         let barrel_pos =
-            kb_random_vec3(CgVec3::new(-15.0, 0.0, -15.0), CgVec3::new(15.0, 0.0, 15.0));
+            random_vec3(CgVec3::new(-15.0, 0.0, -15.0), CgVec3::new(15.0, 0.0, 15.0));
         let smoke_pos = barrel_pos + CgVec3::new(0.0, 3.5, 0.0);
 
         // Smoke
@@ -111,9 +111,9 @@ impl Example3DGame {
         self.props.push(barrel);
     }
 
-    fn spawn_shotgun(&mut self, renderer: &mut KbRenderer<'_>) {
+    fn spawn_shotgun(&mut self, renderer: &mut Renderer<'_>) {
         let shotgun_pos =
-            kb_random_vec3(CgVec3::new(-15.0, 0.0, -15.0), CgVec3::new(15.0, 0.0, 15.0));
+            random_vec3(CgVec3::new(-15.0, 0.0, -15.0), CgVec3::new(15.0, 0.0, 15.0));
 
         let mut shotgun = GameProp::new(
             &GamePropType::Shotgun,
@@ -125,7 +125,7 @@ impl Example3DGame {
         );
         let shotgun_actors = shotgun.get_actors();
         shotgun_actors[1].set_render_group(
-            &KbRenderGroupType::WorldCustom,
+            &RenderGroupType::WorldCustom,
             &Some(self.outline_render_group),
         );
 
@@ -135,7 +135,7 @@ impl Example3DGame {
         self.props.push(shotgun);
     }
 
-    fn spawn_sign(&mut self, renderer: &mut KbRenderer<'_>, model_handle: &KbModelHandle) {
+    fn spawn_sign(&mut self, renderer: &mut Renderer<'_>, model_handle: &ModelHandle) {
         {
             let sign_pos = CgVec3::new(0.0, 0.0, 0.0);
 
@@ -149,11 +149,11 @@ impl Example3DGame {
             );
             let sign_actors = sign.get_actors();
             sign_actors[0].set_render_group(
-                &KbRenderGroupType::WorldHole,
+                &RenderGroupType::WorldHole,
                 &Some(self.outline_render_group),
             );
             sign_actors[1].set_render_group(
-                &KbRenderGroupType::WorldCustom,
+                &RenderGroupType::WorldCustom,
                 &Some(self.outline_render_group),
             );
 
@@ -177,25 +177,25 @@ impl Example3DGame {
     }
 }
 
-impl KbGameEngine for Example3DGame {
-    fn new(_game_config: &KbConfig) -> Self {
+impl GameEngine for Example3DGame {
+    fn new(_game_config: &Config) -> Self {
         log!("GameEngine::new() caled...");
         let game_objects = Vec::<GameObject>::new();
 
-        let mut game_camera = KbCamera::new();
+        let mut game_camera = Camera::new();
         game_camera.set_position(&CgVec3::new(0.0, 3.5, -5.0));
 
         Self {
-            world_actors: Vec::<KbActor>::new(),
+            world_actors: Vec::<Actor>::new(),
             mobs: Vec::<GameMob>::new(),
             props: Vec::<GameProp>::new(),
             game_objects,
             game_camera,
             vfx_manager: GameVfxManager::new(),
             sign_prop: None,
-            barrel_model: KbModelHandle::make_invalid(),
-            shotgun_model: KbModelHandle::make_invalid(),
-            monster_model: KbModelHandle::make_invalid(),
+            barrel_model: ModelHandle::make_invalid(),
+            shotgun_model: ModelHandle::make_invalid(),
+            monster_model: ModelHandle::make_invalid(),
             monster_render_group: usize::MAX,
             monster_spawn_timer: Instant::now(),
             shotgun_spawn_timer: Instant::now(),
@@ -204,21 +204,21 @@ impl KbGameEngine for Example3DGame {
             decal_render_group: usize::MAX,
             player: None,
             crosshair_error: 0.0,
-            collision_manager: KbCollisionManager::new(),
+            collision_manager: CollisionManager::new(),
             debug_collision: false,
             invert_y: false,
             pause_monsters: false,
             score: 0,
             high_score: 0,
             next_harm_time: -1.0,
-            post_process_override: KbPostProcessMode::Passthrough,
+            post_process_override: PostProcessMode::Passthrough,
         }
     }
 
     async fn initialize_world(
         &mut self,
-        renderer: &mut KbRenderer<'_>,
-        game_config: &mut KbConfig,
+        renderer: &mut Renderer<'_>,
+        game_config: &mut Config,
     ) {
         log!("GameEngine::initialize_world()...");
         game_config.clear_color = CgVec4::new(0.87, 0.58, 0.24, 1.0);
@@ -240,7 +240,7 @@ impl KbGameEngine for Example3DGame {
                 life_start_time: Instant::now(),
                 state_start_time: Instant::now(),
                 gravity_scale: 0.0,
-                random_val: kb_random_f32(0.0, 1000.0),
+                random_val: random_f32(0.0, 1000.0),
                 is_enemy: false,
                 uv_tiles: (1.0, 1.0),
             });
@@ -261,7 +261,7 @@ impl KbGameEngine for Example3DGame {
             life_start_time: Instant::now(),
             state_start_time: Instant::now(),
             gravity_scale: 0.0,
-            random_val: kb_random_f32(0.0, 1000.0),
+            random_val: random_f32(0.0, 1000.0),
             is_enemy: false,
             uv_tiles: (2.0, 2.0),
         });
@@ -280,7 +280,7 @@ impl KbGameEngine for Example3DGame {
             life_start_time: Instant::now(),
             state_start_time: Instant::now(),
             gravity_scale: 0.0,
-            random_val: kb_random_f32(0.0, 1000.0),
+            random_val: random_f32(0.0, 1000.0),
             is_enemy: false,
             uv_tiles: (2.0, 2.0),
         });
@@ -299,7 +299,7 @@ impl KbGameEngine for Example3DGame {
             life_start_time: Instant::now(),
             state_start_time: Instant::now(),
             gravity_scale: 0.0,
-            random_val: kb_random_f32(0.0, 1000.0),
+            random_val: random_f32(0.0, 1000.0),
             is_enemy: false,
             uv_tiles: (1.0, 1.0),
         });
@@ -318,7 +318,7 @@ impl KbGameEngine for Example3DGame {
             life_start_time: Instant::now(),
             state_start_time: Instant::now(),
             gravity_scale: 0.0,
-            random_val: kb_random_f32(0.0, 1000.0),
+            random_val: random_f32(0.0, 1000.0),
             is_enemy: false,
             uv_tiles: (1.0, 1.0),
         });
@@ -343,8 +343,8 @@ impl KbGameEngine for Example3DGame {
 
         self.decal_render_group = renderer
             .add_custom_render_group(
-                &KbRenderGroupType::WorldCustom,
-                &KbBlendMode::Additive,
+                &RenderGroupType::WorldCustom,
+                &BlendMode::Additive,
                 "engine_assets/shaders/decal.wgsl",
             )
             .await;
@@ -353,8 +353,8 @@ impl KbGameEngine for Example3DGame {
         let fp_render_group = Some(
             renderer
                 .add_custom_render_group(
-                    &KbRenderGroupType::ForegroundCustom,
-                    &KbBlendMode::None,
+                    &RenderGroupType::ForegroundCustom,
+                    &BlendMode::None,
                     "game_assets/shaders/first_person.wgsl",
                 )
                 .await,
@@ -362,8 +362,8 @@ impl KbGameEngine for Example3DGame {
         let fp_outline_render_group = Some(
             renderer
                 .add_custom_render_group(
-                    &KbRenderGroupType::ForegroundCustom,
-                    &KbBlendMode::Alpha,
+                    &RenderGroupType::ForegroundCustom,
+                    &BlendMode::Alpha,
                     "game_assets/shaders/first_person_outline.wgsl",
                 )
                 .await,
@@ -374,12 +374,12 @@ impl KbGameEngine for Example3DGame {
         let mut player = GamePlayer::new(&hands_model).await;
 
         let (hands, hands_outlines) = player.get_actors();
-        hands.set_render_group(&KbRenderGroupType::ForegroundCustom, &fp_render_group);
+        hands.set_render_group(&RenderGroupType::ForegroundCustom, &fp_render_group);
         renderer.add_or_update_actor(hands);
 
         for outline in hands_outlines {
             outline.set_render_group(
-                &KbRenderGroupType::ForegroundCustom,
+                &RenderGroupType::ForegroundCustom,
                 &fp_outline_render_group,
             );
             renderer.add_or_update_actor(outline);
@@ -392,8 +392,8 @@ impl KbGameEngine for Example3DGame {
             .await;
         let monster_render_group = renderer
             .add_custom_render_group(
-                &KbRenderGroupType::WorldCustom,
-                &KbBlendMode::Additive,
+                &RenderGroupType::WorldCustom,
+                &BlendMode::Additive,
                 "game_assets/shaders/monster.wgsl",
             )
             .await;
@@ -404,7 +404,7 @@ impl KbGameEngine for Example3DGame {
         let level_model = renderer
             .load_model("game_assets/models/level.glb", false)
             .await;
-        let mut actor = KbActor::new();
+        let mut actor = Actor::new();
         actor.set_position(&[0.0, 0.0, 0.0].into());
         actor.set_scale(&(CgVec3::new(10.0, 19.0, 10.0) * GLOBAL_SCALE.x));
         actor.set_model(&level_model);
@@ -418,17 +418,17 @@ impl KbGameEngine for Example3DGame {
             let sky_render_group = Some(
                 renderer
                     .add_custom_render_group(
-                        &KbRenderGroupType::WorldCustom,
-                        &KbBlendMode::Alpha,
+                        &RenderGroupType::WorldCustom,
+                        &BlendMode::Alpha,
                         "engine_assets/shaders/sky_dome_occlude.wgsl",
                     )
                     .await,
             );
-            let mut actor = KbActor::new();
+            let mut actor = Actor::new();
             actor.set_position(&[0.0, 0.0, 0.0].into());
             actor.set_scale(&[30.0, 30.0, 30.0].into());
             actor.set_model(&sky_model);
-            actor.set_render_group(&KbRenderGroupType::WorldCustom, &sky_render_group);
+            actor.set_render_group(&RenderGroupType::WorldCustom, &sky_render_group);
             renderer.add_or_update_actor(&actor);
             self.world_actors.push(actor);
         }
@@ -436,32 +436,32 @@ impl KbGameEngine for Example3DGame {
             let sky_render_group = Some(
                 renderer
                     .add_custom_render_group(
-                        &KbRenderGroupType::WorldCustom,
-                        &KbBlendMode::Alpha,
+                        &RenderGroupType::WorldCustom,
+                        &BlendMode::Alpha,
                         "engine_assets/shaders/sky_dome_draw.wgsl",
                     )
                     .await,
             );
-            let mut actor = KbActor::new();
+            let mut actor = Actor::new();
             actor.set_position(&[0.0, 0.0, 0.0].into());
             actor.set_scale(&[30.0, 30.0, 30.0].into());
             actor.set_model(&sky_model);
-            actor.set_render_group(&KbRenderGroupType::WorldCustom, &sky_render_group);
+            actor.set_render_group(&RenderGroupType::WorldCustom, &sky_render_group);
             renderer.add_or_update_actor(&actor);
             self.world_actors.push(actor);
         }
 
         self.outline_render_group = renderer
             .add_custom_render_group(
-                &KbRenderGroupType::WorldCustom,
-                &KbBlendMode::Alpha,
+                &RenderGroupType::WorldCustom,
+                &BlendMode::Alpha,
                 "game_assets/shaders/first_person_outline.wgsl",
             )
             .await;
         let pinky_model = renderer
             .load_model("game_assets/models/pinky.glb", false)
             .await;
-        let mut actor = KbActor::new();
+        let mut actor = Actor::new();
         actor.set_position(&[16.5, 0.5, 6.0].into());
         let pinky_rot_x = cgmath::Rad::from(cgmath::Deg(90.0));
         let pinky_rot_z = cgmath::Rad::from(cgmath::Deg(115.0));
@@ -474,7 +474,7 @@ impl KbGameEngine for Example3DGame {
         renderer.add_or_update_actor(&actor);
         self.world_actors.push(actor);
 
-        let mut actor = KbActor::new();
+        let mut actor = Actor::new();
         actor.set_position(&[16.5, 0.5, 6.0].into());
         actor.set_rotation(&pinky_rot);
         actor.set_scale(&GLOBAL_SCALE);
@@ -484,42 +484,42 @@ impl KbGameEngine for Example3DGame {
         actor.set_custom_data_1(CgVec4::new(0.25, 0.08, 0.08, 0.08));
 
         actor.set_render_group(
-            &KbRenderGroupType::WorldCustom,
+            &RenderGroupType::WorldCustom,
             &Some(self.outline_render_group),
         );
         renderer.add_or_update_actor(&actor);
         self.world_actors.push(actor);
 
         // World Collision
-        let collision_box = KbCollisionShape::AABB(KbCollisionAABB {
+        let collision_box = CollisionShape::AABB(CollisionAABB {
             position: CgVec3::new(0.0, 2.4, 20.0),
             extents: CgVec3::new(20.0, 10.0, 2.0),
             block: true,
         });
         let _ = self.collision_manager.add_collision(&collision_box);
 
-        let collision_box = KbCollisionShape::AABB(KbCollisionAABB {
+        let collision_box = CollisionShape::AABB(CollisionAABB {
             position: CgVec3::new(0.0, 2.4, -20.0),
             extents: CgVec3::new(-20.0, 10.0, 2.0),
             block: true,
         });
         let _ = self.collision_manager.add_collision(&collision_box);
 
-        let collision_box = KbCollisionShape::AABB(KbCollisionAABB {
+        let collision_box = CollisionShape::AABB(CollisionAABB {
             position: CgVec3::new(20.0, 2.4, 0.0),
             extents: CgVec3::new(2.0, 10.0, 20.0),
             block: true,
         });
         let _ = self.collision_manager.add_collision(&collision_box);
 
-        let collision_box = KbCollisionShape::AABB(KbCollisionAABB {
+        let collision_box = CollisionShape::AABB(CollisionAABB {
             position: CgVec3::new(-20.0, 2.4, 0.0),
             extents: CgVec3::new(2.0, 10.0, 20.0),
             block: true,
         });
         let _ = self.collision_manager.add_collision(&collision_box);
 
-        let collision_box = KbCollisionShape::AABB(KbCollisionAABB {
+        let collision_box = CollisionShape::AABB(CollisionAABB {
             position: CgVec3::new(0.0, -0.5, 0.0),
             extents: CgVec3::new(20.0, 0.0, 20.0),
             block: true,
@@ -597,9 +597,9 @@ impl KbGameEngine for Example3DGame {
 
     fn tick_frame_internal(
         &mut self,
-        renderer: &mut KbRenderer,
-        input_manager: &KbInputManager,
-        game_config: &KbConfig,
+        renderer: &mut Renderer,
+        input_manager: &InputManager,
+        game_config: &Config,
     ) {
         for game_object in &mut self.game_objects {
             game_object.update(game_config.delta_time);
@@ -784,7 +784,7 @@ impl KbGameEngine for Example3DGame {
                 let trace_end_pos = {
                     let end = trace_start_pos + view_dir * 10000.0;
                     if i > 0 {
-                        end + kb_random_vec3(
+                        end + random_vec3(
                             CgVec3::new(-2100.0, -2100.0, -2100.0),
                             CgVec3::new(2100.0, 2100.0, 2100.0),
                         )
@@ -965,19 +965,19 @@ impl KbGameEngine for Example3DGame {
             if self.next_harm_time < 0.0 {
                 self.next_harm_time = elapsed_time + 1.0;
             } else if elapsed_time > self.next_harm_time {
-                renderer.set_postprocess_mode(&KbPostProcessMode::ScanLines);
+                renderer.set_postprocess_mode(&PostProcessMode::ScanLines);
                 self.next_harm_time = elapsed_time + 1.0;
                 self.score = (self.score - 1).max(0);
             }
         } else {
-            renderer.set_postprocess_mode(&KbPostProcessMode::Passthrough);
+            renderer.set_postprocess_mode(&PostProcessMode::Passthrough);
         }
 
-        if !matches!(self.post_process_override, KbPostProcessMode::Passthrough) {
+        if !matches!(self.post_process_override, PostProcessMode::Passthrough) {
             renderer.set_postprocess_mode(&self.post_process_override);
         }
 
-        if !matches!(self.post_process_override, KbPostProcessMode::Passthrough) {
+        if !matches!(self.post_process_override, PostProcessMode::Passthrough) {
             renderer.set_postprocess_mode(&self.post_process_override);
         }
 
@@ -1041,7 +1041,7 @@ impl KbGameEngine for Example3DGame {
                     life_start_time: Instant::now(),
                     state_start_time: Instant::now(),
                     gravity_scale: 0.0,
-                    random_val: kb_random_f32(0.0, 1000.0),
+                    random_val: random_f32(0.0, 1000.0),
                     is_enemy: false,
                     uv_tiles: (1.0, 1.0),
                 });
@@ -1073,10 +1073,10 @@ impl KbGameEngine for Example3DGame {
 
         if input_manager.get_key_state("+").just_pressed() {
             self.post_process_override = match self.post_process_override {
-                KbPostProcessMode::Passthrough => KbPostProcessMode::Desaturation,
-                KbPostProcessMode::Desaturation => KbPostProcessMode::ScanLines,
-                KbPostProcessMode::ScanLines => KbPostProcessMode::Warp,
-                KbPostProcessMode::Warp => KbPostProcessMode::Passthrough,
+                PostProcessMode::Passthrough => PostProcessMode::Desaturation,
+                PostProcessMode::Desaturation => PostProcessMode::ScanLines,
+                PostProcessMode::ScanLines => PostProcessMode::Warp,
+                PostProcessMode::Warp => PostProcessMode::Passthrough,
             }
         }
 

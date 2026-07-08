@@ -1,4 +1,4 @@
-use kb_engine3::kb_config::KbConfig;
+use black_splat::config::Config;
 
 mod example_game;
 mod game_actors;
@@ -8,9 +8,9 @@ use example_game::Example3DGame;
 
 fn main() {
     let config_file_text = include_str!("game_config.txt");
-    let game_config = KbConfig::new(config_file_text);
+    let game_config = Config::new(config_file_text);
 
-    let run_game = kb_engine3::run_game::<Example3DGame>(game_config);
+    let run_game = black_splat::run_game::<Example3DGame>(game_config);
 
     #[cfg(target_arch = "wasm32")]
     {

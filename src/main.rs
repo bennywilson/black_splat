@@ -1,12 +1,12 @@
 use cgmath::Vector3;
 
-use kb_engine3::log;
-use kb_engine3::{
-    kb_config::KbConfig,
-    kb_engine::KbGameEngine,
-    kb_game_object::{GameObject, GameObjectType},
-    kb_input::KbInputManager,
-    kb_renderer::KbRenderer,
+use black_splat::log;
+use black_splat::{
+    config::Config,
+    engine::GameEngine,
+    game_object::{GameObject, GameObjectType},
+    input::InputManager,
+    renderer::Renderer,
 };
 
 const SKY_Z: f32 = 0.0;
@@ -14,15 +14,15 @@ const SUN_Z: f32 = 15.0;
 const HILL_Z: f32 = 30.0;
 const BUILDING_Z: f32 = 50.0;
 
-// Game clients should create a game struct that implement the KbGameEngine trait which provides functions for
+// Game clients should create a game struct that implement the GameEngine trait which provides functions for
 // init, update, and collecting game objects for rendering.
 
 pub struct EmptyGame {
     pub game_objects: Vec<GameObject>, // List of objects to be rendered
 }
 
-impl KbGameEngine for EmptyGame {
-    fn new(_game_config: &KbConfig) -> Self {
+impl GameEngine for EmptyGame {
+    fn new(_game_config: &Config) -> Self {
         log!("EmptyGame::new() caled...");
 
         Self {
@@ -32,8 +32,8 @@ impl KbGameEngine for EmptyGame {
 
     async fn initialize_world(
         &mut self,
-        _game_renderer: &mut KbRenderer<'_>,
-        _game_config: &mut KbConfig,
+        _game_renderer: &mut Renderer<'_>,
+        _game_config: &mut Config,
     ) {
         log!("EmptyGame::initialize_world() caled...");
 
@@ -92,9 +92,9 @@ impl KbGameEngine for EmptyGame {
 
     fn tick_frame_internal(
         &mut self,
-        _game_renderer: &mut KbRenderer,
-        _input_manager: &KbInputManager,
-        _game_config: &KbConfig,
+        _game_renderer: &mut Renderer,
+        _input_manager: &InputManager,
+        _game_config: &Config,
     ) {
         // Add game update logic here
     }
@@ -102,10 +102,10 @@ impl KbGameEngine for EmptyGame {
 
 fn main() {
     let config_file_text = include_str!("../engine_assets/game_config.txt");
-    let game_config = KbConfig::new(config_file_text);
+    let game_config = Config::new(config_file_text);
 
     // Pass your Game's type to run_game() which will create an instance and call functions on it
-    let run_game = kb_engine3::run_game::<EmptyGame>(game_config);
+    let run_game = black_splat::run_game::<EmptyGame>(game_config);
 
     #[cfg(target_arch = "wasm32")]
     {

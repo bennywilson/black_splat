@@ -8,37 +8,37 @@ use winit::{
 // engine renders with (no version-matching burden in game crates).
 pub use egui;
 
-pub mod kb_assets;
-pub mod kb_collision;
-pub mod kb_config;
-pub mod kb_engine;
-pub mod kb_game_object;
-pub mod kb_input;
-pub mod kb_renderer;
-pub mod kb_resource;
-pub mod kb_utils;
+pub mod assets;
+pub mod collision;
+pub mod config;
+pub mod engine;
+pub mod game_object;
+pub mod input;
+pub mod renderer;
+pub mod resource;
+pub mod utils;
 pub mod render_groups {
-    pub mod kb_bullet_hole_group;
-    pub mod kb_gaussian_splat_group;
-    pub mod kb_line_group;
-    pub mod kb_model_group;
-    pub mod kb_postprocess_group;
-    pub mod kb_sprite_group;
-    pub mod kb_sunbeam_group;
+    pub mod bullet_hole;
+    pub mod gaussian_splat;
+    pub mod line;
+    pub mod model;
+    pub mod postprocess;
+    pub mod sprite;
+    pub mod sunbeam;
 }
 
-use crate::kb_config::*;
-use crate::kb_engine::*;
-use crate::kb_input::*;
-use crate::kb_renderer::*;
-use crate::kb_resource::*;
+use crate::config::*;
+use crate::engine::*;
+use crate::input::*;
+use crate::renderer::*;
+use crate::resource::*;
 
 #[cfg(target_arch = "wasm32")]
 const WEBAPP_CANVAS_ID: &str = "target";
 
-pub async fn run_game<T>(mut game_config: KbConfig)
+pub async fn run_game<T>(mut game_config: Config)
 where
-    T: KbGameEngine + 'static,
+    T: GameEngine + 'static,
 {
     env_logger::init();
 
@@ -80,8 +80,8 @@ where
     ));
 
     let mut game_engine = T::new(&game_config);
-    let mut input_manager = KbInputManager::new();
-    let mut game_renderer = KbRenderer::new(window.clone(), &game_config).await;
+    let mut input_manager = InputManager::new();
+    let mut game_renderer = Renderer::new(window.clone(), &game_config).await;
 
     // Input side of the in-engine GUI: collects window events into
     // egui::RawInput for the renderer's egui context, and applies egui's

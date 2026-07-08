@@ -16,3 +16,5 @@ Cargo.lock
 
 .vs/
 target/
+# Build artifacts
+*.exe
