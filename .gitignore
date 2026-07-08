@@ -18,3 +18,7 @@ Cargo.lock
 target/
 # Build artifacts
 *.exe
+
+# Python bytecode cache
+__pycache__/
+*.pyc

@@ -22,6 +22,13 @@ For browser (wasm) builds, also:
    ```
 5. Install [Python 3](https://www.python.org/) to serve the build locally.
 
+For testing the **Gaussian-splat** demo on a phone (it needs WebGPU over HTTPS — see below), also:
+
+6. Install `cloudflared` for an HTTPS tunnel:
+   ```sh
+   scoop install cloudflared
+   ```
+
 ## Building and Debugging
 
 Run the examples from a command prompt:
@@ -29,17 +36,42 @@ Run the examples from a command prompt:
 | Demo | Directory | Command |
 | --- | --- | --- |
 | 2D demo #1 | this directory | `cargo run` |
-| 2D demo #2 | `kbEngine3/Examples/2D/` | `cargo run` |
-| 3D demo #3 | `kbEngine3/Examples/3D/` | `cargo run` |
-| Gaussian splats | `kbEngine3/Examples/splat/` | `cargo run --release` |
+| 2D demo #2 | `examples/2d/` | `cargo run` |
+| 3D demo #3 | `examples/3d/` | `cargo run` |
+| Gaussian splats | `examples/splat/` | `cargo run --release` |
 
-To run a browser build:
+> **Note:** Set your working directory to the root of the `black_splat` folder when debugging in Visual Studio, running from RenderDoc, etc.
 
-1. Run `kbEngine3/Examples/3D/build_wasm.bat` or `kbEngine3/Examples/2D/build_wasm.bat`.
-2. Navigate to <http://127.0.0.1:8000> in a web browser.
-3. You may need to close the browser or use an incognito window to avoid old cached builds.
+## Running in a Browser (WASM)
 
-> **Note:** Set your working directory to the root of the `kbEngine3` folder when debugging in Visual Studio, running from RenderDoc, etc.
+Each example has a `build_wasm.bat` that compiles to wasm, runs `wasm-bindgen`,
+and serves the result on <http://127.0.0.1:8000> (the built-in `serve.py` sends
+no-cache headers so you always get the fresh build — no incognito needed).
+
+**Which backend a demo uses matters for the browser:**
+
+| Demo | Browser backend | Needs |
+| --- | --- | --- |
+| 2D / 3D | WebGL2 | Any modern browser; works over plain http |
+| Gaussian splats | WebGPU | A WebGPU browser (iOS 18.2+ / Chrome / Safari 18+) **and an HTTPS (secure) context** — the GPU radix sort uses compute shaders + storage buffers, which WebGL2 lacks |
+
+### Testing on a phone
+
+The `serve.py` server binds all interfaces, so any device on your Wi-Fi can reach it.
+
+- **2D / 3D (WebGL2):** run `build_wasm.bat`, then on the phone open
+  `http://<your-PC-LAN-IP>:8000/` (find the IP with `ipconfig`). Plain http is
+  fine — WebGL2 doesn't require a secure context. You may need to allow inbound
+  port 8000 through Windows Firewall the first time.
+
+- **Gaussian splats (WebGPU):** WebGPU (`navigator.gpu`) is only exposed in a
+  *secure context*, and a plain `http://<LAN-IP>` is not one — so LAN http gives
+  a black canvas. Run `build_wasm_tunneled.bat` instead: it builds, serves, and
+  starts a Cloudflare quick tunnel that gives a real `https://…trycloudflare.com`
+  URL (requires `cloudflared` — see Setup). It prints a **QR code** — scan it with
+  the phone camera to skip typing the URL. The tunnel URL stays valid across
+  rebuilds, so you can bookmark it once and just refresh; it only changes when you
+  restart the tunnel.
 
 ## Config File
 
