@@ -51,6 +51,12 @@ web-sys = { version = "0.3.69", features = [
     "Element",
     "Location",
     "HtmlInputElement",
+    # For the text agent (virtual keyboard support, see src/text_agent.rs):
+    "HtmlElement",
+    "CssStyleDeclaration",
+    "EventTarget",
+    "InputEvent",
+    "KeyboardEvent",
 ]}
 
 [features]

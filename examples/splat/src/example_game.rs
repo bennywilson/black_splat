@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 use cgmath::InnerSpace;
 
 use black_splat::{
-    egui, assets::*, config::*, engine::*, fly_camera::*, game_object::*, input::*, renderer::*,
-    touch_pads::*, utils::*, log, passes::gaussian_splat::SplatParams,
+    egui, assets::*, config::*, editor::{self, GizmoMode, TransformGizmo}, engine::*,
+    fly_camera::*, game_object::*, input::*, renderer::*, touch_pads::*, utils::*, log,
+    passes::gaussian_splat::SplatParams,
 };
 
 // Splat clouds the demo preloads and cycles between with [Space].  Missing files
@@ -15,12 +16,12 @@ const SPLAT_PLY_PATHS: &[&str] = &[
     "game_assets/splats/opera.ply",
 ];
 
-// Models the editor's "Add" menu can drop into the scene, as (display name,
-// path) pairs.  These are preloaded in initialize_world -- model loading is
-// async and the frame tick isn't -- so the menu can instance them synchronously.
-const MODEL_PALETTE: &[(&str, &str)] = &[
-    ("Barrel", "game_assets/models/barrel.glb"),
-    ("Shotgun", "game_assets/models/shotgun.glb"),
+// Model resources preloaded for the editor (the Resources tab and the Details
+// panel's model dropdown).  Loaded in initialize_world -- model loading is
+// async and the frame tick isn't -- so they're always available to assign.
+const PRELOADED_MODELS: &[&str] = &[
+    "game_assets/models/barrel.glb",
+    "game_assets/models/shotgun.glb",
 ];
 
 // How far in front of the camera a newly added game object is dropped.
@@ -41,6 +42,20 @@ fn draw_mode_switch(ui: &mut egui::Ui, editor_mode: &mut bool) {
     if ui.selectable_label(!*editor_mode, "Game").clicked() {
         *editor_mode = false;
     }
+}
+
+// "game_assets/models/barrel.glb" -> "barrel" for resource lists.
+fn resource_display_name(path: &str) -> String {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string()
+}
+
+/// Which tab of the right-hand editor panel is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditorTab {
+    Outliner,
+    Details,
+    Resources,
 }
 
 // "6185394" -> "6,185,394" for status messages.
@@ -70,25 +85,20 @@ enum PickerState {
 const STATUS_RED: CgVec4 = CgVec4::new(1.0, 0.25, 0.2, 1.0);
 const STATUS_WHITE: CgVec4 = CgVec4::new(1.0, 1.0, 1.0, 1.0);
 
-/// A model-backed game object the editor placed in the scene.  Owns its
-/// renderable `Actor` (transform + model) and the display name shown in the
-/// outliner.
-struct SceneObject {
-    name: String,
-    actor: Actor,
-}
-
 pub struct SplatGame {
     game_objects: Vec<GameObject>,
     game_camera: Camera,
     splat_params: SplatParams,
-    // Models the "Add" menu can instance, loaded once in initialize_world.
-    // Aligned with MODEL_PALETTE.
-    model_palette: Vec<(String, ModelHandle)>,
-    // Game objects the editor has placed, listed in the outliner.
-    scene_objects: Vec<SceneObject>,
-    // Outliner selection: index into `scene_objects`, if any.
+    // Actors the editor has placed, listed in the outliner.  An actor carries
+    // its own display name (see Actor's editor markup).
+    scene_actors: Vec<Actor>,
+    // Outliner selection: index into `scene_actors`, if any.
     selected_object: Option<usize>,
+    // Viewport translate/rotate gizmo for the selected actor.
+    gizmo: TransformGizmo,
+    // Which tab the right-hand editor panel shows; None keeps the panel
+    // collapsed to just its tab strip.
+    active_tab: Option<EditorTab>,
     // Monotonic counter so added objects get unique default names.
     next_object_num: u32,
     // Display names of the clouds that actually loaded, aligned with the
@@ -154,37 +164,32 @@ impl SplatGame {
         std::thread::spawn(move || pollster::block_on(pick));
     }
 
-    /// Drops a fresh instance of palette model `palette_index` into the scene a
-    /// few units ahead of the camera, registers it with the renderer, and
-    /// selects it in the outliner.
-    fn add_model_object(&mut self, palette_index: usize, renderer: &mut Renderer) {
-        let (model_name, model_handle) = match self.model_palette.get(palette_index) {
-            Some((name, handle)) => (name.clone(), *handle),
-            None => return,
-        };
-
+    /// Drops a fresh empty Actor into the scene a few units ahead of the
+    /// camera and selects it, flipping to the Details tab so its model and
+    /// transform can be set right away.
+    fn add_actor(&mut self, renderer: &mut Renderer) {
         let (_view, view_dir, _right) = self.game_camera.calculate_view_matrix();
         let spawn_pos = self.game_camera.get_position() + view_dir * ADD_OBJECT_DISTANCE;
 
         let mut actor = Actor::new();
-        actor.set_model(&model_handle);
+        actor.set_name(&format!("Actor {}", self.next_object_num));
         actor.set_position(&spawn_pos);
         renderer.add_or_update_actor(&actor);
 
-        let name = format!("{model_name} {}", self.next_object_num);
         self.next_object_num += 1;
-        self.scene_objects.push(SceneObject { name, actor });
-        self.selected_object = Some(self.scene_objects.len() - 1);
+        self.scene_actors.push(actor);
+        self.selected_object = Some(self.scene_actors.len() - 1);
+        self.active_tab = Some(EditorTab::Details);
     }
 
-    /// Removes the scene object at `index` from both the scene list and the
+    /// Removes the scene actor at `index` from both the scene list and the
     /// renderer, keeping the outliner selection valid.
     fn delete_scene_object(&mut self, index: usize, renderer: &mut Renderer) {
-        if index >= self.scene_objects.len() {
+        if index >= self.scene_actors.len() {
             return;
         }
-        let object = self.scene_objects.remove(index);
-        renderer.remove_actor(&object.actor);
+        let actor = self.scene_actors.remove(index);
+        renderer.remove_actor(&actor);
         self.selected_object = match self.selected_object {
             Some(sel) if sel == index => None,
             Some(sel) if sel > index => Some(sel - 1),
@@ -211,9 +216,10 @@ impl GameEngine for SplatGame {
             },
             splat_names: Vec::new(),
             active_splat: 0,
-            model_palette: Vec::new(),
-            scene_objects: Vec::new(),
+            scene_actors: Vec::new(),
             selected_object: None,
+            gizmo: TransformGizmo::default(),
+            active_tab: None,
             next_object_num: 1,
             picked_ply: Arc::new(Mutex::new(None)),
             picker_state: Arc::new(Mutex::new(PickerState::Idle)),
@@ -253,11 +259,10 @@ impl GameEngine for SplatGame {
         renderer.set_active_gaussian_splat(0);
         renderer.set_tonemap_enabled(true);
 
-        // Preload the models the editor's "Add" menu can instance.  Done here
-        // (async) so placing them from the frame tick is a synchronous clone.
-        for (name, path) in MODEL_PALETTE {
-            let handle = renderer.load_model(path, false).await;
-            self.model_palette.push((name.to_string(), handle));
+        // Preload the editor's model resources (Resources tab / the Details
+        // panel's model dropdown).  Done here because loading is async.
+        for path in PRELOADED_MODELS {
+            renderer.load_model(path, false).await;
         }
 
         // Help is reachable from the menu bar's Help button, so drop the
@@ -334,10 +339,22 @@ impl GameEngine for SplatGame {
         // applied after the egui pass (avoids borrowing self inside closures).
         let mut do_save_scene = false;
         let mut do_load_scene = false;
-        let mut add_model_index: Option<usize> = None;
+        let mut do_add_actor = false;
         let mut delete_object_index: Option<usize> = None;
         let mut select_object: Option<Option<usize>> = None;
         let mut select_splat: Option<usize> = None;
+        // True when the Details panel changed the selected actor this frame;
+        // the renderer's copy is refreshed after the egui pass.
+        let mut actor_edited = false;
+
+        // Loaded model resources for the Resources tab and the Details panel's
+        // model dropdown, as (display name, handle).  Fetched up front so the
+        // panel closure doesn't need to borrow the renderer.
+        let model_resources: Vec<(String, ModelHandle)> = renderer
+            .get_model_resources()
+            .into_iter()
+            .map(|(path, handle)| (resource_display_name(&path), handle))
+            .collect();
 
         // Editor vs game mode.  In editor mode the full bar is always shown --
         // the mode switch, File (open), Debug (scene cycle + future toggles),
@@ -369,14 +386,9 @@ impl GameEngine for SplatGame {
                             do_load |= ui.button("Load .ply…").clicked();
                         });
                         ui.menu_button("Add", |ui| {
-                            if self.model_palette.is_empty() {
-                                ui.label("(no models loaded)");
-                            }
-                            for (i, (name, _)) in self.model_palette.iter().enumerate() {
-                                if ui.button(name).clicked() {
-                                    add_model_index = Some(i);
-                                }
-                            }
+                            // Just empty actors for now; a model is assigned
+                            // afterwards in the Details panel.
+                            do_add_actor |= ui.button("Actor").clicked();
                         });
                         ui.menu_button("Debug", |ui| {
                             do_cycle |= ui.button("Next scene").clicked();
@@ -437,58 +449,180 @@ impl GameEngine for SplatGame {
         let bar_bottom_px = menu_bar.response.rect.bottom() * ctx.pixels_per_point();
         renderer.set_debug_text_top_offset(bar_bottom_px + 6.0);
 
-        // Outliner: a right-anchored panel listing every game object in the
-        // scene -- the loaded splat clouds and the models the editor has placed.
-        // Editor mode only; game mode keeps the view unobstructed.  Drawn as an
-        // Area (same as the menu bar) so it sits over the 3D view.  Its widgets
-        // only set the local action flags above; they're applied after the egui
-        // pass so the closure never has to borrow `self`/`renderer` mutably.
-        const OUTLINER_WIDTH: f32 = 220.0;
+        // Right-hand editor panel, tabbed: Outliner (scene contents), Details
+        // (selected actor's properties), Resources (loaded assets).  Editor mode
+        // only; game mode keeps the view unobstructed.  Drawn as an Area (same
+        // as the menu bar) so it sits over the 3D view.  Collapsed to just the
+        // tab strip until a tab is clicked; clicking the active tab collapses
+        // it again.  Open, it runs the full height of the view like a docked
+        // sidebar.  Selection/deletion set the local action flags above and are
+        // applied after the egui pass; Details edits mutate the actor directly
+        // and set `actor_edited` so the renderer's copy is refreshed afterwards.
+        // Gizmo mode toolbar, centered under the menu bar (both corners are
+        // taken by the debug overlays).
         if editor {
             let top = menu_bar.response.rect.bottom();
-            egui::Area::new(egui::Id::new("outliner"))
-                .fixed_pos(egui::pos2(screen.right() - OUTLINER_WIDTH, top))
+            egui::Area::new(egui::Id::new("gizmo_toolbar"))
+                .pivot(egui::Align2::CENTER_TOP)
+                .fixed_pos(egui::pos2(screen.center().x, top))
                 .constrain(true)
                 .show(&ctx, |ui| {
                     egui::Frame::side_top_panel(ui.style()).show(ui, |ui| {
-                        ui.set_width(OUTLINER_WIDTH);
-                        ui.heading("Outliner");
-                        ui.separator();
-                        egui::ScrollArea::vertical()
-                            .max_height((screen.bottom() - top - 40.0).max(80.0))
-                            .show(ui, |ui| {
-                                ui.set_width(OUTLINER_WIDTH);
-                                ui.label(egui::RichText::new("Splats").strong());
-                                if self.splat_names.is_empty() {
-                                    ui.label("(none)");
+                        ui.horizontal(|ui| {
+                            for (mode, label) in
+                                [(GizmoMode::Translate, "Move"), (GizmoMode::Rotate, "Rotate")]
+                            {
+                                if ui.selectable_label(self.gizmo.mode == mode, label).clicked()
+                                {
+                                    self.gizmo.mode = mode;
                                 }
-                                for (i, name) in self.splat_names.iter().enumerate() {
-                                    let is_active =
-                                        i == self.active_splat && self.selected_object.is_none();
-                                    if ui.selectable_label(is_active, name).clicked() {
-                                        select_splat = Some(i);
-                                    }
-                                }
+                            }
+                        });
+                    });
+                });
+        }
 
-                                ui.add_space(8.0);
-                                ui.label(egui::RichText::new("Models").strong());
-                                if self.scene_objects.is_empty() {
-                                    ui.label("(none)");
+        const PANEL_WIDTH: f32 = 260.0;
+        if editor {
+            let top = menu_bar.response.rect.bottom();
+            egui::Area::new(egui::Id::new("editor_panel"))
+                .fixed_pos(egui::pos2(screen.right() - PANEL_WIDTH, top))
+                // Constrain to the region below the menu bar: if the panel
+                // ever ends up too tall, egui slides a constrained Area back
+                // inside its rect -- against the whole screen that shoved the
+                // panel (tab strip included) up over the menu bar.
+                .constrain_to(egui::Rect::from_min_max(
+                    egui::pos2(screen.left(), top),
+                    screen.right_bottom(),
+                ))
+                .show(&ctx, |ui| {
+                    let frame = egui::Frame::side_top_panel(ui.style());
+                    let frame_bottom = frame.total_margin().bottom;
+                    frame.show(ui, |ui| {
+                        ui.set_width(PANEL_WIDTH);
+                        ui.horizontal(|ui| {
+                            for (tab, label) in [
+                                (EditorTab::Outliner, "Outliner"),
+                                (EditorTab::Details, "Details"),
+                                (EditorTab::Resources, "Resources"),
+                            ] {
+                                let is_active = self.active_tab == Some(tab);
+                                if ui.selectable_label(is_active, label).clicked() {
+                                    self.active_tab = if is_active { None } else { Some(tab) };
                                 }
-                                for (i, object) in self.scene_objects.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        let selected = self.selected_object == Some(i);
-                                        if ui.selectable_label(selected, &object.name).clicked() {
-                                            select_object = Some(Some(i));
+                            }
+                        });
+                        let Some(active_tab) = self.active_tab else {
+                            return;
+                        };
+                        // Stretch to the bottom of the view.  set_min_height
+                        // reserves space from the cursor (i.e. below the tab
+                        // strip), so measure the remaining space from there --
+                        // measuring from the panel top makes the Area overshoot
+                        // the screen and get shoved upward.
+                        ui.set_min_height(
+                            (screen.bottom() - ui.cursor().top() - frame_bottom).max(80.0),
+                        );
+                        ui.separator();
+                        let scroll_height =
+                            (screen.bottom() - ui.cursor().top() - frame_bottom).max(60.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(scroll_height)
+                            .show(ui, |ui| {
+                                ui.set_width(PANEL_WIDTH);
+                                match active_tab {
+                                    EditorTab::Outliner => {
+                                        ui.label(egui::RichText::new("Splats").strong());
+                                        if self.splat_names.is_empty() {
+                                            ui.label("(none)");
                                         }
-                                        if ui.small_button("✕").clicked() {
-                                            delete_object_index = Some(i);
+                                        for (i, name) in self.splat_names.iter().enumerate() {
+                                            let is_active = i == self.active_splat
+                                                && self.selected_object.is_none();
+                                            if ui.selectable_label(is_active, name).clicked() {
+                                                select_splat = Some(i);
+                                            }
                                         }
-                                    });
+
+                                        ui.add_space(8.0);
+                                        ui.label(egui::RichText::new("Actors").strong());
+                                        if self.scene_actors.is_empty() {
+                                            ui.label("(none)");
+                                        }
+                                        for (i, actor) in self.scene_actors.iter().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                let selected = self.selected_object == Some(i);
+                                                if ui
+                                                    .selectable_label(selected, actor.get_name())
+                                                    .clicked()
+                                                {
+                                                    select_object = Some(Some(i));
+                                                }
+                                                if ui.small_button("✕").clicked() {
+                                                    delete_object_index = Some(i);
+                                                }
+                                            });
+                                        }
+                                    }
+                                    EditorTab::Details => match self.selected_object {
+                                        Some(index) => {
+                                            actor_edited |= editor::draw_properties(
+                                                ui,
+                                                &mut self.scene_actors[index],
+                                                &model_resources,
+                                            );
+                                        }
+                                        None => {
+                                            ui.label("Nothing selected.");
+                                            ui.label("Pick an actor in the Outliner.");
+                                        }
+                                    },
+                                    EditorTab::Resources => {
+                                        ui.label(egui::RichText::new("Models").strong());
+                                        if model_resources.is_empty() {
+                                            ui.label("(none)");
+                                        }
+                                        for (name, _) in &model_resources {
+                                            ui.label(name.as_str());
+                                        }
+
+                                        ui.add_space(8.0);
+                                        ui.label(egui::RichText::new("Splats").strong());
+                                        if self.splat_names.is_empty() {
+                                            ui.label("(none)");
+                                        }
+                                        for name in &self.splat_names {
+                                            ui.label(name.as_str());
+                                        }
+                                    }
                                 }
                             });
                     });
                 });
+        }
+
+        // Translate/rotate gizmo on the selected actor, drawn over the 3D
+        // view.  Its edits ride the same actor_edited path as the Details
+        // panel's.
+        if editor {
+            if let Some(actor) = self
+                .selected_object
+                .and_then(|i| self.scene_actors.get_mut(i))
+            {
+                let mut position = actor.get_position();
+                let mut rotation = actor.get_rotation();
+                if self.gizmo.ui(
+                    &ctx,
+                    &self.game_camera,
+                    game_config,
+                    &mut position,
+                    &mut rotation,
+                ) {
+                    actor.set_position(&position);
+                    actor.set_rotation(&rotation);
+                    actor_edited = true;
+                }
+            }
         }
 
         // Apply the editor actions gathered from the menus / outliner.
@@ -502,11 +636,17 @@ impl GameEngine for SplatGame {
         if let Some(sel) = select_object {
             self.selected_object = sel;
         }
-        if let Some(i) = add_model_index {
-            self.add_model_object(i, renderer);
+        if do_add_actor {
+            self.add_actor(renderer);
         }
         if let Some(i) = delete_object_index {
             self.delete_scene_object(i, renderer);
+        }
+        // Push Details-panel / gizmo edits to the renderer's copy of the actor.
+        if actor_edited {
+            if let Some(actor) = self.selected_object.and_then(|i| self.scene_actors.get(i)) {
+                renderer.add_or_update_actor(actor);
+            }
         }
         if do_save_scene {
             self.status = Some(("Save Scene: not implemented yet".to_string(), STATUS_WHITE, 4.0));

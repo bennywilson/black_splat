@@ -536,4 +536,17 @@ impl AssetManager {
     pub fn get_model_mappings(&mut self) -> &mut HashMap<ModelHandle, Model> {
         &mut self.model_mappings.handles_to_assets
     }
+
+    /// Every loaded model as (file path, handle), sorted by path -- feeds the
+    /// editor's resource list and model dropdowns.
+    pub fn get_model_resources(&self) -> Vec<(String, ModelHandle)> {
+        let mut resources: Vec<(String, ModelHandle)> = self
+            .model_mappings
+            .get_names_to_handles()
+            .iter()
+            .map(|(name, handle)| (name.clone(), *handle))
+            .collect();
+        resources.sort_by(|a, b| a.0.cmp(&b.0));
+        resources
+    }
 }

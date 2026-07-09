@@ -297,6 +297,7 @@ impl ParticleActor {
 #[derive(Debug, Clone)]
 pub struct Actor {
     pub id: u32,
+    name: String,
     position: CgVec3,
     rotation: CgQuat,
     scale: CgVec3,
@@ -309,6 +310,17 @@ pub struct Actor {
     model_handle: ModelHandle,
 }
 
+// Editor markup: the fields the editor's Details panel shows and how each is
+// edited (see crate::editor).  Lives here because the fields are private.
+crate::editor_properties!(Actor {
+    name: text("Name"),
+    position: vec3("Position"),
+    rotation: rotation("Rotation"),
+    scale: vec3("Scale"),
+    layer: choice("Scene Layer"),
+    model_handle: model("Model"),
+});
+
 impl Default for Actor {
     fn default() -> Self {
         Self::new()
@@ -317,20 +329,30 @@ impl Default for Actor {
 
 impl Actor {
     pub fn new() -> Self {
-        unsafe {
+        let id = unsafe {
             NEXT_ACTOR_ID += 1;
-            Actor {
-                id: NEXT_ACTOR_ID,
-                position: CG_VEC3_ZERO,
-                rotation: (0.0, 0.0, 0.0, 1.0).into(),
-                scale: CG_VEC3_ONE,
-                color: CG_VEC4_ONE,
-                custom_data_1: CG_VEC4_ZERO,
-                layer: SceneLayer::World,
-                custom_pass_handle: None,
-                model_handle: ModelHandle::make_invalid(),
-            }
+            NEXT_ACTOR_ID
+        };
+        Actor {
+            id,
+            name: format!("Actor {id}"),
+            position: CG_VEC3_ZERO,
+            rotation: (0.0, 0.0, 0.0, 1.0).into(),
+            scale: CG_VEC3_ONE,
+            color: CG_VEC4_ONE,
+            custom_data_1: CG_VEC4_ZERO,
+            layer: SceneLayer::World,
+            custom_pass_handle: None,
+            model_handle: ModelHandle::make_invalid(),
         }
+    }
+
+    pub fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
     }
 
     pub fn set_position(&mut self, position: &CgVec3) {

@@ -108,6 +108,12 @@ macro_rules! make_handle {
                     next_handle,
                 }
             }
+
+            /// Name -> handle view of every loaded asset, for editor
+            /// resource lists.
+            pub fn get_names_to_handles(&self) -> &HashMap<String, $handle_type> {
+                &self.names_to_handles
+            }
         }
     };
 }

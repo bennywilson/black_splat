@@ -30,6 +30,38 @@ pub enum SceneLayer {
     ForegroundCustom,
 }
 
+/// Editor dropdown support.  The `*Custom` layers are offered too; an actor
+/// set to one only draws once a matching custom pass handle is assigned.
+impl crate::editor::EditorChoice for SceneLayer {
+    const NAMES: &'static [&'static str] = &[
+        "World",
+        "World Hole",
+        "World Custom",
+        "Foreground",
+        "Foreground Custom",
+    ];
+
+    fn choice_index(&self) -> usize {
+        match self {
+            SceneLayer::World => 0,
+            SceneLayer::WorldHole => 1,
+            SceneLayer::WorldCustom => 2,
+            SceneLayer::Foreground => 3,
+            SceneLayer::ForegroundCustom => 4,
+        }
+    }
+
+    fn from_choice_index(index: usize) -> Self {
+        match index {
+            1 => SceneLayer::WorldHole,
+            2 => SceneLayer::WorldCustom,
+            3 => SceneLayer::Foreground,
+            4 => SceneLayer::ForegroundCustom,
+            _ => SceneLayer::World,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {

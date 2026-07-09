@@ -792,6 +792,12 @@ impl<'a> Renderer<'a> {
             .await
     }
 
+    /// Every loaded model as (file path, handle), sorted by path -- feeds the
+    /// editor's resource list and model dropdowns.
+    pub fn get_model_resources(&self) -> Vec<(String, ModelHandle)> {
+        self.asset_manager.get_model_resources()
+    }
+
     /// Loads a splat .ply and appends it as a selectable cloud.  Returns true if
     /// it loaded (a missing/unreadable file is skipped and returns false).  Call
     /// repeatedly to preload several clouds, then cycle with `set_active_gaussian_splat`.

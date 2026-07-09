@@ -906,20 +906,18 @@ impl ModelPass {
             if actor_layer == SceneLayer::ForegroundCustom
                 || actor_layer == SceneLayer::WorldCustom
             {
-                match custom_pass_handle {
-                    None => {
-                        continue;
-                    }
-                    Some(h) => {
-                        if h != pass_handle.unwrap() {
-                            continue;
-                        }
-                    }
+                // Custom-layer actors only draw in their matching custom pass;
+                // ones without a pass handle assigned yet don't draw at all.
+                if custom_pass_handle.is_none() || custom_pass_handle != pass_handle {
+                    continue;
                 }
             }
             let actor = actor_key_value.1;
             let model_handle = actor.get_model();
-            let model = asset_manager.get_model(&model_handle).unwrap();
+            // Editor-placed actors can exist before a model is assigned.
+            let Some(model) = asset_manager.get_model(&model_handle) else {
+                continue;
+            };
 
             if !models_to_render.contains(&model_handle) {
                 models_to_render.push(model_handle);
