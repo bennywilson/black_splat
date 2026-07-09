@@ -57,6 +57,7 @@ web-sys = { version = "0.3.69", features = [
     "EventTarget",
     "InputEvent",
     "KeyboardEvent",
+    "Navigator",
 ]}
 
 [features]

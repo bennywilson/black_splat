@@ -114,15 +114,19 @@ macro_rules! editor_property {
 
 /// Draws `object`'s marked-up properties into `ui` and returns true if any
 /// changed this frame.  `model_resources` are the (display name, handle) pairs
-/// offered by `model(...)` property dropdowns.
+/// offered by `model(...)` property dropdowns; `selected_resource` is the one
+/// currently picked in the editor's resource browser, if any, which the
+/// dropdown offers to apply with one click.
 pub fn draw_properties(
     ui: &mut egui::Ui,
     object: &mut dyn EditorInspect,
     model_resources: &[(String, ModelHandle)],
+    selected_resource: Option<ModelHandle>,
 ) -> bool {
     object.inspect_properties(&mut EguiPropertyEditor {
         ui,
         model_resources,
+        selected_resource,
     })
 }
 
@@ -130,6 +134,7 @@ pub fn draw_properties(
 struct EguiPropertyEditor<'a> {
     ui: &'a mut egui::Ui,
     model_resources: &'a [(String, ModelHandle)],
+    selected_resource: Option<ModelHandle>,
 }
 
 impl EguiPropertyEditor<'_> {
@@ -206,9 +211,11 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
     }
 
     fn edit_model(&mut self, name: &str, value: &mut ModelHandle) -> bool {
+        let selected_resource = self.selected_resource;
         let Self {
             ui,
             model_resources,
+            ..
         } = self;
         let mut changed = false;
         ui.label(name);
@@ -216,18 +223,33 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
             .iter()
             .find(|(_, handle)| handle == value)
             .map_or("(none)", |(res_name, _)| res_name.as_str());
-        egui::ComboBox::from_id_salt(name)
-            .selected_text(selected)
-            .show_ui(ui, |ui| {
-                changed |= ui
-                    .selectable_value(value, ModelHandle::make_invalid(), "(none)")
-                    .changed();
-                for (res_name, res_handle) in model_resources.iter() {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt(name)
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
                     changed |= ui
-                        .selectable_value(value, *res_handle, res_name.as_str())
+                        .selectable_value(value, ModelHandle::make_invalid(), "(none)")
                         .changed();
+                    for (res_name, res_handle) in model_resources.iter() {
+                        changed |= ui
+                            .selectable_value(value, *res_handle, res_name.as_str())
+                            .changed();
+                    }
+                });
+            // One-click apply of the resource browser's selection
+            // (Unreal-style "use selected asset").
+            let use_selected = ui
+                .add_enabled(selected_resource.is_some(), egui::Button::new("◀").small())
+                .on_hover_text("Use the model selected in the Resources panel");
+            if use_selected.clicked() {
+                if let Some(handle) = selected_resource {
+                    if *value != handle {
+                        *value = handle;
+                        changed = true;
+                    }
                 }
-            });
+            }
+        });
         changed
     }
 }
@@ -249,6 +271,8 @@ const GIZMO_COLORS: [egui::Color32; 3] = [
     egui::Color32::from_rgb(115, 210, 75),
     egui::Color32::from_rgb(85, 135, 245),
 ];
+// Hovered or dragged handles light up yellow.
+const GIZMO_HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(255, 220, 60);
 // How close (in points) the pointer must be to a handle to grab it.
 const GIZMO_HIT_RADIUS: f32 = 12.0;
 // On-screen gizmo size: world size = distance to camera * this.
@@ -323,21 +347,25 @@ impl TransformGizmo {
             egui::Id::new("transform_gizmo"),
         ));
 
-        let (pointer, pressed, down, delta) = ctx.input(|i| {
+        let (pointer, pressed, down, delta, any_down) = ctx.input(|i| {
             (
                 i.pointer.interact_pos(),
                 i.pointer.primary_pressed(),
                 i.pointer.primary_down(),
                 i.pointer.delta(),
+                // Any button, so hover highlights stay off during e.g. a
+                // right-drag camera look sweeping across the gizmo.
+                i.pointer.any_down(),
             )
         });
         if !down {
             self.drag_axis = None;
         }
-        // A grab must start on a handle and not through the editor UI.  (A
+        // Neither grabs nor hover highlights reach through the editor UI.  (A
         // drag that started on the gizmo and passes over a panel keeps going:
         // egui_wants_pointer_input stays false for drags started outside it.)
-        let can_grab = pressed && !ctx.egui_wants_pointer_input();
+        let over_ui = ctx.egui_wants_pointer_input();
+        let can_grab = pressed && !over_ui;
 
         let mut changed = false;
         for (axis, dir) in GIZMO_AXES.iter().enumerate() {
@@ -346,14 +374,13 @@ impl TransformGizmo {
                     let Some(tip) = project(*position + *dir * world_size) else {
                         continue;
                     };
-                    if can_grab {
-                        if let Some(p) = pointer {
-                            if distance_to_segment(p, center, tip) < GIZMO_HIT_RADIUS {
-                                self.drag_axis = Some(axis);
-                            }
-                        }
+                    let hover_dist = pointer
+                        .map_or(f32::MAX, |p| distance_to_segment(p, center, tip));
+                    if can_grab && hover_dist < GIZMO_HIT_RADIUS {
+                        self.drag_axis = Some(axis);
                     }
                     let active = self.drag_axis == Some(axis);
+                    let hovered = !any_down && !over_ui && hover_dist < GIZMO_HIT_RADIUS;
                     if active && down {
                         // Pointer movement along the axis' screen direction,
                         // converted back to world units.
@@ -368,7 +395,14 @@ impl TransformGizmo {
                     painter.arrow(
                         center,
                         tip - center,
-                        egui::Stroke::new(if active { 4.0 } else { 2.5 }, GIZMO_COLORS[axis]),
+                        egui::Stroke::new(
+                            if active { 4.5 } else { 3.0 },
+                            if active || hovered {
+                                GIZMO_HIGHLIGHT
+                            } else {
+                                GIZMO_COLORS[axis]
+                            },
+                        ),
                     );
                 }
                 GizmoMode::Rotate => {
@@ -395,6 +429,7 @@ impl TransformGizmo {
                         self.drag_axis = Some(axis);
                     }
                     let active = self.drag_axis == Some(axis);
+                    let hovered = !any_down && !over_ui && min_dist < GIZMO_HIT_RADIUS;
                     if active && down {
                         if let Some(ptr) = pointer {
                             // Rotate by the pointer's angle change around the
@@ -421,7 +456,14 @@ impl TransformGizmo {
                     }
                     painter.add(egui::Shape::line(
                         points,
-                        egui::Stroke::new(if active { 4.0 } else { 2.0 }, GIZMO_COLORS[axis]),
+                        egui::Stroke::new(
+                            if active { 5.0 } else { 3.5 },
+                            if active || hovered {
+                                GIZMO_HIGHLIGHT
+                            } else {
+                                GIZMO_COLORS[axis]
+                            },
+                        ),
                     ));
                 }
             }

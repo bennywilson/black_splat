@@ -44,18 +44,26 @@ fn draw_mode_switch(ui: &mut egui::Ui, editor_mode: &mut bool) {
     }
 }
 
+/// Whether this browser reports a touch screen.  Finger-friendly GUI sizing
+/// should only kick in on actual touch devices; desktop browsers keep egui's
+/// defaults so the GUI matches the native desktop build.
+#[cfg(target_arch = "wasm32")]
+fn is_touch_device() -> bool {
+    web_sys::window().is_some_and(|w| w.navigator().max_touch_points() > 0)
+}
+
 // "game_assets/models/barrel.glb" -> "barrel" for resource lists.
 fn resource_display_name(path: &str) -> String {
     let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
     file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string()
 }
 
-/// Which tab of the right-hand editor panel is showing.
+/// Which tab of the right-hand editor panel is showing.  (Resources is a
+/// separate bottom panel.)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorTab {
-    Outliner,
+    Scene,
     Details,
-    Resources,
 }
 
 // "6185394" -> "6,185,394" for status messages.
@@ -89,16 +97,35 @@ pub struct SplatGame {
     game_objects: Vec<GameObject>,
     game_camera: Camera,
     splat_params: SplatParams,
-    // Actors the editor has placed, listed in the outliner.  An actor carries
-    // its own display name (see Actor's editor markup).
+    // Actors the editor has placed, listed in the Scene tab.  An actor
+    // carries its own display name (see Actor's editor markup).
     scene_actors: Vec<Actor>,
-    // Outliner selection: index into `scene_actors`, if any.
+    // Scene-tab selection: index into `scene_actors`, if any.
     selected_object: Option<usize>,
+    // Actor index awaiting delete confirmation (the Scene tab's ✕ button).
+    confirm_delete: Option<usize>,
+    // Model highlighted in the resources browser, offered to the Details
+    // panel's Model row as a one-click assignment.
+    selected_resource: Option<ModelHandle>,
+    // Actor index currently being renamed (double-click in the Scene tab).
+    name_edit: Option<usize>,
+    // The rename field's working text.  Persists across frames -- re-deriving
+    // it from the actor each frame would wipe every keystroke and commit the
+    // unchanged name.  Seeded from the actor's name when a rename begins.
+    name_edit_buffer: String,
+    // Set when a rename begins so the text field grabs keyboard focus on its
+    // first frame; cleared once focused (requesting every frame would block
+    // click-away-to-save).
+    name_edit_focus: bool,
     // Viewport translate/rotate gizmo for the selected actor.
     gizmo: TransformGizmo,
     // Which tab the right-hand editor panel shows; None keeps the panel
     // collapsed to just its tab strip.
     active_tab: Option<EditorTab>,
+    // Bottom resources panel: shown/hidden by its "Resources" tab, height set
+    // by dragging the grab strip along its top edge.
+    resources_open: bool,
+    resources_height: f32,
     // Monotonic counter so added objects get unique default names.
     next_object_num: u32,
     // Display names of the clouds that actually loaded, aligned with the
@@ -179,11 +206,10 @@ impl SplatGame {
         self.next_object_num += 1;
         self.scene_actors.push(actor);
         self.selected_object = Some(self.scene_actors.len() - 1);
-        self.active_tab = Some(EditorTab::Details);
     }
 
     /// Removes the scene actor at `index` from both the scene list and the
-    /// renderer, keeping the outliner selection valid.
+    /// renderer, keeping the Scene-tab selection valid.
     fn delete_scene_object(&mut self, index: usize, renderer: &mut Renderer) {
         if index >= self.scene_actors.len() {
             return;
@@ -218,8 +244,15 @@ impl GameEngine for SplatGame {
             active_splat: 0,
             scene_actors: Vec::new(),
             selected_object: None,
+            confirm_delete: None,
+            selected_resource: None,
+            name_edit: None,
+            name_edit_buffer: String::new(),
+            name_edit_focus: false,
             gizmo: TransformGizmo::default(),
             active_tab: None,
+            resources_open: false,
+            resources_height: 200.0,
             next_object_num: 1,
             picked_ply: Arc::new(Mutex::new(None)),
             picker_state: Arc::new(Mutex::new(PickerState::Idle)),
@@ -300,20 +333,17 @@ impl GameEngine for SplatGame {
         // --- GUI (egui, same on native + web) ---
         let ctx = renderer.egui_ctx().clone();
 
-        // On web, egui's pixels-per-point follows the browser devicePixelRatio,
-        // which on a high-DPR display left the fixed 1280x720 canvas with very
-        // few layout "points" -- the panels ballooned.  Pin ppp to the surface
-        // instead.  A 480-point-tall design space gives ppp ~1.5, matching the
-        // native desktop look (which was fine) so the GUI reads at a comfortable
-        // size instead of tiny.  Native is left alone (honors OS scaling).
+        // Touch web only: on a high-DPR phone/tablet, egui's default
+        // pixels-per-point (the devicePixelRatio) leaves the fixed 1280x720
+        // canvas with very few layout "points" and the panels balloon -- pin
+        // ppp to a 480-point-tall design space instead.  Then enlarge egui's
+        // interactive sizing for finger-friendly tap targets (set on the
+        // global style so dropdown popups get it too).  Desktop web is left
+        // alone: the devicePixelRatio default mirrors the OS scaling that the
+        // native desktop build honors, so both look the same.
         #[cfg(target_arch = "wasm32")]
-        {
+        if is_touch_device() {
             ctx.set_pixels_per_point((game_config.window_height as f32 / 480.0).max(0.5));
-            // Finger-friendly tap targets (iOS especially): enlarge egui's
-            // interactive sizing so menu items, dropdown entries and sliders are
-            // easy to tap.  Set on the global style so dropdown popups -- which
-            // don't inherit a per-`ui` spacing tweak -- get it too.  Desktop web
-            // gets slightly larger controls as well, which is fine.
             ctx.all_styles_mut(|s| {
                 s.spacing.button_padding = egui::vec2(16.0, 12.0);
                 s.spacing.interact_size.y = 38.0;
@@ -335,7 +365,7 @@ impl GameEngine for SplatGame {
         let mut do_load = false;
         let mut do_cycle = false;
         let mut params_changed = false;
-        // Editor actions collected from the menus / outliner this frame and
+        // Editor actions collected from the menus / Scene tab this frame and
         // applied after the egui pass (avoids borrowing self inside closures).
         let mut do_save_scene = false;
         let mut do_load_scene = false;
@@ -449,7 +479,7 @@ impl GameEngine for SplatGame {
         let bar_bottom_px = menu_bar.response.rect.bottom() * ctx.pixels_per_point();
         renderer.set_debug_text_top_offset(bar_bottom_px + 6.0);
 
-        // Right-hand editor panel, tabbed: Outliner (scene contents), Details
+        // Right-hand editor panel, tabbed: Scene (splats + actors), Details
         // (selected actor's properties), Resources (loaded assets).  Editor mode
         // only; game mode keeps the view unobstructed.  Drawn as an Area (same
         // as the menu bar) so it sits over the 3D view.  Collapsed to just the
@@ -482,6 +512,102 @@ impl GameEngine for SplatGame {
                 });
         }
 
+        // Resources: a full-width bottom panel (content-browser style).
+        // Closed, it collapses to a small "Resources" tab at the bottom-left
+        // corner; open, the grab strip along its top edge drags to resize.
+        // The right-hand editor panel stops above it (panel_bottom).
+        let mut panel_bottom = screen.bottom();
+        if editor {
+            if self.resources_open {
+                let max_height = (screen.height() * 0.7).max(120.0);
+                self.resources_height = self.resources_height.clamp(120.0, max_height);
+                let top_y = screen.bottom() - self.resources_height;
+                panel_bottom = top_y;
+                egui::Area::new(egui::Id::new("resources_panel"))
+                    .fixed_pos(egui::pos2(screen.left(), top_y))
+                    .constrain_to(screen)
+                    .show(&ctx, |ui| {
+                        let frame = egui::Frame::side_top_panel(ui.style());
+                        let margin = frame.total_margin();
+                        frame.show(ui, |ui| {
+                            ui.set_width(screen.width() - margin.sum().x);
+                            ui.set_height(self.resources_height - margin.sum().y);
+                            // Grab strip: drag to resize (position catches up
+                            // next frame), painted as a short handle line.
+                            let (strip_rect, strip) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 8.0),
+                                egui::Sense::drag(),
+                            );
+                            let strip = strip.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                            if strip.dragged() {
+                                self.resources_height = (self.resources_height
+                                    - strip.drag_delta().y)
+                                    .clamp(120.0, max_height);
+                            }
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(strip_rect.center().x - 24.0, strip_rect.center().y),
+                                    egui::pos2(strip_rect.center().x + 24.0, strip_rect.center().y),
+                                ],
+                                egui::Stroke::new(2.0, ui.visuals().weak_text_color()),
+                            );
+                            if ui
+                                .selectable_label(true, egui::RichText::new("Resources").strong())
+                                .clicked()
+                            {
+                                self.resources_open = false;
+                            }
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .max_height(ui.available_height())
+                                .show(ui, |ui| {
+                                    ui.columns(2, |columns| {
+                                        let ui = &mut columns[0];
+                                        ui.label(egui::RichText::new("Models").strong());
+                                        if model_resources.is_empty() {
+                                            ui.label("(none)");
+                                        }
+                                        // Click to highlight; the Details
+                                        // panel's Model row can then apply the
+                                        // highlighted model with one click.
+                                        for (name, handle) in &model_resources {
+                                            let is_selected =
+                                                self.selected_resource == Some(*handle);
+                                            if ui
+                                                .selectable_label(is_selected, name.as_str())
+                                                .clicked()
+                                            {
+                                                self.selected_resource =
+                                                    if is_selected { None } else { Some(*handle) };
+                                            }
+                                        }
+                                        let ui = &mut columns[1];
+                                        ui.label(egui::RichText::new("Splats").strong());
+                                        if self.splat_names.is_empty() {
+                                            ui.label("(none)");
+                                        }
+                                        for name in &self.splat_names {
+                                            ui.label(name.as_str());
+                                        }
+                                    });
+                                });
+                        });
+                    });
+            } else {
+                egui::Area::new(egui::Id::new("resources_tab"))
+                    .pivot(egui::Align2::LEFT_BOTTOM)
+                    .fixed_pos(screen.left_bottom())
+                    .constrain(true)
+                    .show(&ctx, |ui| {
+                        egui::Frame::side_top_panel(ui.style()).show(ui, |ui| {
+                            if ui.selectable_label(false, "Resources").clicked() {
+                                self.resources_open = true;
+                            }
+                        });
+                    });
+            }
+        }
+
         const PANEL_WIDTH: f32 = 260.0;
         if editor {
             let top = menu_bar.response.rect.bottom();
@@ -493,7 +619,7 @@ impl GameEngine for SplatGame {
                 // panel (tab strip included) up over the menu bar.
                 .constrain_to(egui::Rect::from_min_max(
                     egui::pos2(screen.left(), top),
-                    screen.right_bottom(),
+                    egui::pos2(screen.right(), panel_bottom),
                 ))
                 .show(&ctx, |ui| {
                     let frame = egui::Frame::side_top_panel(ui.style());
@@ -502,9 +628,8 @@ impl GameEngine for SplatGame {
                         ui.set_width(PANEL_WIDTH);
                         ui.horizontal(|ui| {
                             for (tab, label) in [
-                                (EditorTab::Outliner, "Outliner"),
+                                (EditorTab::Scene, "Scene"),
                                 (EditorTab::Details, "Details"),
-                                (EditorTab::Resources, "Resources"),
                             ] {
                                 let is_active = self.active_tab == Some(tab);
                                 if ui.selectable_label(is_active, label).clicked() {
@@ -515,24 +640,34 @@ impl GameEngine for SplatGame {
                         let Some(active_tab) = self.active_tab else {
                             return;
                         };
-                        // Stretch to the bottom of the view.  set_min_height
-                        // reserves space from the cursor (i.e. below the tab
-                        // strip), so measure the remaining space from there --
-                        // measuring from the panel top makes the Area overshoot
-                        // the screen and get shoved upward.
+                        // Stretch down to the resources panel (or the screen
+                        // bottom).  set_min_height reserves space from the
+                        // cursor (i.e. below the tab strip), so measure the
+                        // remaining space from there -- measuring from the
+                        // panel top makes the Area overshoot and get shoved
+                        // upward.
                         ui.set_min_height(
-                            (screen.bottom() - ui.cursor().top() - frame_bottom).max(80.0),
+                            (panel_bottom - ui.cursor().top() - frame_bottom).max(80.0),
                         );
                         ui.separator();
                         let scroll_height =
-                            (screen.bottom() - ui.cursor().top() - frame_bottom).max(60.0);
+                            (panel_bottom - ui.cursor().top() - frame_bottom).max(60.0);
                         egui::ScrollArea::vertical()
                             .max_height(scroll_height)
                             .show(ui, |ui| {
                                 ui.set_width(PANEL_WIDTH);
                                 match active_tab {
-                                    EditorTab::Outliner => {
-                                        ui.label(egui::RichText::new("Splats").strong());
+                                    EditorTab::Scene => {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Splats").strong());
+                                            if ui
+                                                .small_button("+")
+                                                .on_hover_text("Load a .ply splat")
+                                                .clicked()
+                                            {
+                                                do_load = true;
+                                            }
+                                        });
                                         if self.splat_names.is_empty() {
                                             ui.label("(none)");
                                         }
@@ -545,23 +680,88 @@ impl GameEngine for SplatGame {
                                         }
 
                                         ui.add_space(8.0);
-                                        ui.label(egui::RichText::new("Actors").strong());
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new("Actors").strong());
+                                            if ui
+                                                .small_button("+")
+                                                .on_hover_text("Add an actor")
+                                                .clicked()
+                                            {
+                                                do_add_actor = true;
+                                            }
+                                        });
                                         if self.scene_actors.is_empty() {
                                             ui.label("(none)");
                                         }
+                                        // Accumulate names to update after the UI pass
+                                        // (no mutable borrow of scene_actors while iterating).
+                                        let mut updated_names = Vec::new();
                                         for (i, actor) in self.scene_actors.iter().enumerate() {
                                             ui.horizontal(|ui| {
                                                 let selected = self.selected_object == Some(i);
+                                                let is_editing = self.name_edit == Some(i);
+                                                if is_editing {
+                                                    // Inline text edit: save on Enter/blur,
+                                                    // cancel on Escape.  The buffer lives in
+                                                    // self so it survives across frames.
+                                                    let edit_resp = ui.text_edit_singleline(
+                                                        &mut self.name_edit_buffer,
+                                                    );
+                                                    // Focus the field the frame it appears.
+                                                    if self.name_edit_focus {
+                                                        edit_resp.request_focus();
+                                                        self.name_edit_focus = false;
+                                                    }
+                                                    let finish_edit = edit_resp.lost_focus()
+                                                        || ui.input(|i| {
+                                                            i.key_pressed(egui::Key::Enter)
+                                                        });
+                                                    let cancel_edit =
+                                                        ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                                    if finish_edit || cancel_edit {
+                                                        let new_name =
+                                                            self.name_edit_buffer.trim();
+                                                        if finish_edit && !new_name.is_empty() {
+                                                            updated_names
+                                                                .push((i, new_name.to_string()));
+                                                        }
+                                                        self.name_edit = None;
+                                                    }
+                                                } else {
+                                                    let label_resp = ui.selectable_label(
+                                                        selected,
+                                                        actor.get_name(),
+                                                    );
+                                                    if label_resp.clicked() {
+                                                        select_object = Some(Some(i));
+                                                    }
+                                                    if label_resp.double_clicked() {
+                                                        self.name_edit = Some(i);
+                                                        self.name_edit_focus = true;
+                                                        self.name_edit_buffer =
+                                                            actor.get_name().to_string();
+                                                    }
+                                                }
+                                                // Deletion asks first (the
+                                                // modal below).
                                                 if ui
-                                                    .selectable_label(selected, actor.get_name())
+                                                    .small_button(
+                                                        egui::RichText::new("✕").color(
+                                                            egui::Color32::from_rgb(235, 80, 80),
+                                                        ),
+                                                    )
                                                     .clicked()
                                                 {
-                                                    select_object = Some(Some(i));
-                                                }
-                                                if ui.small_button("✕").clicked() {
-                                                    delete_object_index = Some(i);
+                                                    self.confirm_delete = Some(i);
+                                                    self.name_edit = None; // Cancel any edit.
                                                 }
                                             });
+                                        }
+                                        // Apply name updates.
+                                        for (i, new_name) in updated_names {
+                                            if let Some(actor) = self.scene_actors.get_mut(i) {
+                                                actor.set_name(&new_name);
+                                            }
                                         }
                                     }
                                     EditorTab::Details => match self.selected_object {
@@ -570,35 +770,52 @@ impl GameEngine for SplatGame {
                                                 ui,
                                                 &mut self.scene_actors[index],
                                                 &model_resources,
+                                                self.selected_resource,
                                             );
                                         }
                                         None => {
                                             ui.label("Nothing selected.");
-                                            ui.label("Pick an actor in the Outliner.");
+                                            ui.label("Pick an actor in the Scene tab.");
                                         }
                                     },
-                                    EditorTab::Resources => {
-                                        ui.label(egui::RichText::new("Models").strong());
-                                        if model_resources.is_empty() {
-                                            ui.label("(none)");
-                                        }
-                                        for (name, _) in &model_resources {
-                                            ui.label(name.as_str());
-                                        }
-
-                                        ui.add_space(8.0);
-                                        ui.label(egui::RichText::new("Splats").strong());
-                                        if self.splat_names.is_empty() {
-                                            ui.label("(none)");
-                                        }
-                                        for name in &self.splat_names {
-                                            ui.label(name.as_str());
-                                        }
-                                    }
                                 }
                             });
                     });
                 });
+        }
+
+        // Delete confirmation for the Scene tab's ✕ button.  A modal blocks
+        // the rest of the UI until answered; clicking the backdrop cancels.
+        if let Some(index) = self.confirm_delete {
+            match self.scene_actors.get(index) {
+                None => self.confirm_delete = None, // Stale index.
+                Some(actor) => {
+                    let name = actor.get_name().to_string();
+                    let modal =
+                        egui::Modal::new(egui::Id::new("confirm_delete")).show(&ctx, |ui| {
+                            ui.label(format!("Delete \"{name}\"?"));
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(
+                                        egui::RichText::new("Delete")
+                                            .color(egui::Color32::from_rgb(235, 80, 80)),
+                                    )
+                                    .clicked()
+                                {
+                                    delete_object_index = Some(index);
+                                    self.confirm_delete = None;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.confirm_delete = None;
+                                }
+                            });
+                        });
+                    if modal.should_close() {
+                        self.confirm_delete = None;
+                    }
+                }
+            }
         }
 
         // Translate/rotate gizmo on the selected actor, drawn over the 3D
@@ -625,7 +842,7 @@ impl GameEngine for SplatGame {
             }
         }
 
-        // Apply the editor actions gathered from the menus / outliner.
+        // Apply the editor actions gathered from the menus / Scene tab.
         if let Some(sel) = select_splat {
             if sel < self.splat_names.len() {
                 self.active_splat = sel;

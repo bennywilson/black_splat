@@ -36,10 +36,19 @@ fn push_key(queue: &mut Vec<egui::Event>, key: egui::Key) {
 
 impl TextAgent {
     /// Creates the hidden input and hooks its listeners.  Returns None if the
-    /// DOM isn't available or creation fails; text fields then simply keep
-    /// working the desktop way (hardware keyboard through the canvas).
+    /// DOM isn't available, creation fails, or this isn't a touch device.
+    ///
+    /// Desktop web is deliberately opted out: there, keyboard input already
+    /// flows through the canvas (winit's default path), and focusing a hidden
+    /// input to capture it instead would only *steal* focus from the canvas
+    /// and break typing.  The agent exists solely to summon the on-screen
+    /// keyboard on touch, so it's installed only where that keyboard exists.
     pub fn install() -> Option<Self> {
-        let document = web_sys::window()?.document()?;
+        let window = web_sys::window()?;
+        if window.navigator().max_touch_points() <= 0 {
+            return None;
+        }
+        let document = window.document()?;
         let input: web_sys::HtmlInputElement =
             document.create_element("input").ok()?.dyn_into().ok()?;
         input.set_id(AGENT_ID);
