@@ -2,81 +2,42 @@
 """Control server for the black_splat sample launcher.
 
 A tiny local web dashboard so you can build/run the examples with buttons
-instead of memorising terminal incantations.  It shells out to exactly the same
-tools the old build_wasm*.bat files did (cargo -> wasm-bindgen -> copy assets ->
-serve.py / serve_tunnel.py), but keeps the steps in one place and streams their
+instead of memorising terminal incantations. All the actual build/run/serve
+logic lives in build.py (also usable standalone from the CLI); this file is
+just the HTTP/SSE layer plus per-example job tracking, and streams build.py's
 output back to the page over Server-Sent Events.
 
-Start it with launch.bat (or `python server.py`) and open http://localhost:8090.
+Start it with launch.bat / launch.sh (or `python3 server.py`) and open
+http://localhost:8090.
 
 Per example you get:
   * Native   -> `cargo run --release`            (opens a native window)
   * Wasm     -> build wasm + serve on a LAN port (WebGL2 demos: 2d/3d)
   * Tunnel   -> build wasm + serve over HTTPS via cloudflared (needed for the
-                splat demo's WebGPU on phones); surfaces the public URL
+                splat demo's WebGPU on phones); surfaces the public URL + QR
   * Stop     -> kill the running job for that example
 
 Only one job runs per example at a time; starting a new one stops the old.
 """
 import atexit
-import functools
-import glob as globmod
 import http.server
 import json
 import os
 import queue
 import re
-import shutil
 import signal
-import subprocess
 import sys
-import tempfile
 import threading
-import tomllib
+
+import build
+from build import EXAMPLES, PORTS, CRATES
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-EXAMPLES_DIR = os.path.join(ROOT, "examples")
+CONTROL_PORT = build.DEFAULT_DASHBOARD_PORT
 
-CONTROL_PORT = 8090
-EXAMPLE_BASE_PORT = 8000  # examples get 8000, 8001, 8002, ... by discovery order
-
-# Which extra runtime assets each example's wasm build fetches from /rust_assets/.
-# Only the splat demo pulls assets at runtime (see its old build_wasm.bat); the
-# 2d/3d demos need nothing but index.html.  Keyed by example folder name.
-WASM_ASSETS = {
-    "splat": [
-        ("game_assets/splats/*.ply", "rust_assets"),
-        ("game_assets/models/*.glb", "rust_assets"),
-    ],
-}
-
-URL_RE = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 # cloudflared colorises its logs; those ANSI/OSC escapes render as junk in the
 # browser <pre>, so strip them (CSI ...m colour codes and OSC ...BEL sequences).
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-PY = sys.executable or "python"
-
-
-def discover_examples():
-    """Every examples/<name>/ that is a cargo crate, with its binary name."""
-    out = []
-    for name in sorted(os.listdir(EXAMPLES_DIR)):
-        cargo = os.path.join(EXAMPLES_DIR, name, "Cargo.toml")
-        if not os.path.isfile(cargo):
-            continue
-        with open(cargo, "rb") as f:
-            meta = tomllib.load(f)
-        crate = meta.get("package", {}).get("name")
-        if not crate:
-            continue
-        out.append({"name": name, "crate": crate})
-    return out
-
-
-EXAMPLES = discover_examples()
-PORTS = {e["name"]: EXAMPLE_BASE_PORT + i for i, e in enumerate(EXAMPLES)}
-CRATES = {e["name"]: e["crate"] for e in EXAMPLES}
 
 
 class Job:
@@ -108,6 +69,10 @@ class Job:
 
     def url(self, label, url):
         self.emit({"type": "url", "label": label, "url": url})
+        if label.startswith("Public"):
+            svg = build.qr_svg(url)
+            if svg:
+                self.emit({"type": "qr", "url": url, "svg": svg})
 
     def subscribe(self):
         q = queue.Queue()
@@ -126,162 +91,25 @@ JOBS = {}          # example name -> Job
 JOBS_LOCK = threading.Lock()
 
 
-def kill_tree(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    else:
-        proc.terminate()
-
-
-def stream_step(job, cmd, cwd):
-    """Run a subprocess to completion, streaming merged stdout/stderr into the
-    job log.  Returns the exit code (or 1 if the executable is missing)."""
-    job.log(f"$ {' '.join(cmd)}")
-    try:
-        proc = subprocess.Popen(
-            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-        )
-    except FileNotFoundError:
-        job.log(f"error: '{cmd[0]}' not found on PATH")
-        return 1
-    for line in proc.stdout:
-        job.log(line)
-    proc.wait()
-    return proc.returncode
-
-
-def build_wasm(job, example):
-    """cargo build (wasm) -> wasm-bindgen -> copy index.html + assets.
-    Returns the absolute output dir on success, or None on failure."""
-    ex_dir = os.path.join(EXAMPLES_DIR, example)
-    crate = CRATES[example]
-    rel = os.path.join("target", "wasm32-unknown-unknown", "release")
-    out_dir = os.path.join(ex_dir, rel)
-
-    if stream_step(job, ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"], ex_dir):
-        job.log("cargo build failed")
-        return None
-
-    if shutil.which("wasm-bindgen") is None:
-        job.log("wasm-bindgen not found - run: cargo install wasm-bindgen-cli --version 0.2.126")
-        return None
-
-    wasm_in = os.path.join(rel, f"{crate}.wasm")
-    if stream_step(job, ["wasm-bindgen", "--target", "web", "--out-dir", rel, wasm_in], ex_dir):
-        job.log("wasm-bindgen failed")
-        return None
-
-    shutil.copy(os.path.join(ex_dir, "index.html"), out_dir)
-    job.log("copied index.html")
-
-    for pattern, subdir in WASM_ASSETS.get(example, []):
-        dest = os.path.join(out_dir, subdir)
-        os.makedirs(dest, exist_ok=True)
-        matches = globmod.glob(os.path.join(ex_dir, pattern))
-        for src in matches:
-            shutil.copy(src, dest)
-        job.log(f"copied {len(matches)} file(s): {pattern} -> {subdir}/")
-
-    return out_dir
-
-
-def serve(job, example, out_dir, tunneled):
-    """Launch serve.py / serve_tunnel.py as the job's long-lived process and
-    stream it until it exits or is stopped."""
-    port = PORTS[example]
-    script = "serve_tunnel.py" if tunneled else "serve.py"
-    cmd = [PY, script, out_dir, str(port)]
-    job.log(f"$ {' '.join(cmd)}")
-    # Emit UTF-8, and suppress serve_tunnel's terminal QR: node-qrcode draws the
-    # QR purely with ANSI colour, which can't render in a browser <pre>, so we
-    # render our own scannable SVG on the card instead (see emit_qr below).
-    # PYTHONUNBUFFERED matters most: with stdout piped (not a real terminal),
-    # Python block-buffers instead of line-buffering, so print()s (and the
-    # "waiting on cloudflared" gap) don't reach this log until the buffer
-    # fills or the process exits -- a slow-but-fine run looks identical to a
-    # silently-dead one. Unbuffered output makes progress show up live.
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
-           "PYTHONUNBUFFERED": "1", "LAUNCHER_QR": "0"}
-    proc = subprocess.Popen(
-        cmd, cwd=EXAMPLES_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", bufsize=1, env=env,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-    )
-    job.proc = proc
-    job.url("Local", f"http://localhost:{port}/")
-    for line in proc.stdout:
-        job.log(line)
-        if tunneled:
-            m = URL_RE.search(line)
-            if m:
-                url = m.group(0)
-                job.url("Public (HTTPS)", url)
-                emit_qr(job, url)
-    proc.wait()
-
-
-def emit_qr(job, url):
-    """Render a scannable QR for the tunnel URL as an SVG (white background,
-    black modules -> theme-independent) and push it to the card."""
-    svg = qr_svg(url)
-    if svg:
-        job.emit({"type": "qr", "url": url, "svg": svg})
-
-
-def qr_svg(url):
-    if shutil.which("npx") is None:
-        return None
-    out = os.path.join(tempfile.gettempdir(), f"black_splat_qr_{os.getpid()}.svg")
-    try:
-        cmd = f'npx --yes qrcode -t svg -o "{out}" "{url}"'
-        subprocess.run(cmd if sys.platform == "win32" else
-                       ["npx", "--yes", "qrcode", "-t", "svg", "-o", out, url],
-                       shell=(sys.platform == "win32"),
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       check=False, timeout=60)
-        with open(out, encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return None
-    finally:
-        try:
-            os.remove(out)
-        except OSError:
-            pass
-
-
-def run_native(job, example):
-    ex_dir = os.path.join(EXAMPLES_DIR, example)
-    cmd = ["cargo", "run", "--release"]
-    job.log(f"$ {' '.join(cmd)}")
-    proc = subprocess.Popen(
-        cmd, cwd=ex_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", bufsize=1,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-    )
-    job.proc = proc
-    for line in proc.stdout:
-        job.log(line)
-    proc.wait()
-
-
 def worker(job):
+    example = job.example
+
+    def on_proc(p):
+        job.proc = p
+
     try:
         if job.action == "native":
-            run_native(job, job.example)
+            build.run_native(example, job.log, on_proc=on_proc)
         elif job.action in ("wasm", "tunnel"):
-            out_dir = build_wasm(job, job.example)
+            out_dir = build.build_wasm(example, job.log)
             if out_dir is None:
                 job.set_status("failed")
                 return
-            serve(job, job.example, out_dir, tunneled=(job.action == "tunnel"))
+            build.run_serve(
+                example, out_dir, tunneled=(job.action == "tunnel"),
+                log=job.log, on_proc=on_proc, on_url=job.url,
+                suppress_terminal_qr=True,
+            )
         else:
             job.log(f"unknown action: {job.action}")
             job.set_status("failed")
@@ -304,7 +132,7 @@ def start_job(example, action):
         old = JOBS.get(example)
         if old and old.status == "running":
             old.stop_requested = True
-            kill_tree(old.proc)
+            build.kill_tree(old.proc)
         job = Job(example, action)
         JOBS[example] = job
     threading.Thread(target=worker, args=(job,), daemon=True).start()
@@ -316,7 +144,7 @@ def stop_job(example):
         job = JOBS.get(example)
     if job and job.status == "running":
         job.stop_requested = True
-        kill_tree(job.proc)
+        build.kill_tree(job.proc)
         job.set_status("stopped")
         return True
     return False
@@ -422,7 +250,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     if not EXAMPLES:
-        print("No examples found under", EXAMPLES_DIR)
+        print("No examples found under", build.EXAMPLES_DIR)
         return
     server = QuietServer(("127.0.0.1", CONTROL_PORT), Handler)
     url = f"http://localhost:{CONTROL_PORT}/"
@@ -436,11 +264,13 @@ def main():
         # a serve keeps holding its port after the launcher is gone.
         with JOBS_LOCK:
             for job in JOBS.values():
-                kill_tree(job.proc)
+                build.kill_tree(job.proc)
 
     atexit.register(shutdown)
     # SIGBREAK fires on a console-close (the window's X) on Windows; SIGINT is
-    # Ctrl+C; SIGTERM is a `taskkill`.  Catch them all so children die with us.
+    # Ctrl+C; SIGTERM is a `taskkill` / `kill`. Catch what's available so
+    # children die with us. (If none of these fire -- e.g. a hard window-close
+    # event Python never sees -- `build.py stop` is the manual escape hatch.)
     for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
         if sig is not None:
             try:
