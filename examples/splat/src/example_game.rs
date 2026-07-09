@@ -68,6 +68,218 @@ enum EditorTab {
     Details,
 }
 
+/// The currently selected scene object.  The three lists (actors, lights,
+/// particle systems) are kept separate, so a selection names both the list and
+/// the index into it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    Actor(usize),
+    Light(usize),
+    Particle(usize),
+}
+
+/// What the "Add" menu asked to create this frame (applied after the egui pass).
+#[derive(Clone, Copy)]
+enum AddKind {
+    Actor,
+    Light(LightType),
+    Particle(usize), // index into PARTICLE_PRESETS
+}
+
+/// Built-in particle-system presets the Add menu offers.  Each preset's texture
+/// is preloaded in initialize_world so instances can be spawned synchronously
+/// from the frame tick (see Renderer::spawn_particle_actor).
+const PARTICLE_PRESETS: &[&str] = &["Fire", "Smoke", "Embers"];
+
+/// ParticleParams for a named preset (see PARTICLE_PRESETS).  Shares one emitter
+/// shape; only the texture, blend mode and colors differ.
+fn preset_particle_params(preset: &str) -> ParticleParams {
+    let (texture_file, blend_mode, start_color, end_color) = match preset {
+        "Smoke" => (
+            "game_assets/fx/smoke_t.png",
+            ParticleBlendMode::AlphaBlend,
+            CgVec4::new(0.55, 0.55, 0.55, 0.7),
+            CgVec4::new(0.3, 0.3, 0.3, 0.0),
+        ),
+        "Embers" => (
+            "game_assets/fx/ember_t.png",
+            ParticleBlendMode::Additive,
+            CgVec4::new(1.0, 0.65, 0.2, 1.0),
+            CgVec4::new(1.0, 0.15, 0.0, 0.0),
+        ),
+        // "Fire" and any unknown preset.
+        _ => (
+            "game_assets/fx/fire_t.png",
+            ParticleBlendMode::Additive,
+            CgVec4::new(1.0, 0.8, 0.4, 1.0),
+            CgVec4::new(1.0, 0.3, 0.05, 0.0),
+        ),
+    };
+    ParticleParams {
+        texture_file: texture_file.to_string(),
+        blend_mode,
+        min_burst_count: 0,
+        max_burst_count: 0,
+        min_particle_life: 0.6,
+        max_particle_life: 1.4,
+        _min_actor_life: 0.0,
+        _max_actor_life: 0.0,
+        min_start_spawn_rate: 0.02,
+        max_start_spawn_rate: 0.05,
+        min_start_pos: CgVec3::new(-0.1, 0.0, -0.1),
+        max_start_pos: CgVec3::new(0.1, 0.0, 0.1),
+        min_start_scale: CgVec3::new(0.15, 0.15, 0.15),
+        max_start_scale: CgVec3::new(0.3, 0.3, 0.3),
+        min_end_scale: CgVec3::new(0.4, 0.4, 0.4),
+        max_end_scale: CgVec3::new(0.9, 0.9, 0.9),
+        min_start_velocity: CgVec3::new(-0.3, 1.0, -0.3),
+        max_start_velocity: CgVec3::new(0.3, 2.0, 0.3),
+        min_start_rotation_rate: -60.0,
+        max_start_rotation_rate: 60.0,
+        min_start_acceleration: CgVec3::new(0.0, 0.5, 0.0),
+        max_start_acceleration: CgVec3::new(0.0, 1.0, 0.0),
+        min_end_velocity: CgVec3::new(0.0, 0.0, 0.0),
+        max_end_velocity: CgVec3::new(0.0, 0.0, 0.0),
+        start_color_0: start_color,
+        start_color_1: start_color,
+        end_color_0: end_color,
+        _end_color1: end_color,
+    }
+}
+
+/// Fills an "Add" menu with the object choices, recording the pick in `add`.
+/// Shared by the menu bar's Add menu and the Scene tab's Add button.
+fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>) {
+    // Buttons auto-close the menu chain on click.
+    if ui.button("Actor").clicked() {
+        *add = Some(AddKind::Actor);
+    }
+    ui.menu_button("Light", |ui| {
+        if ui.button("Directional").clicked() {
+            *add = Some(AddKind::Light(LightType::Directional));
+        }
+        if ui.button("Point").clicked() {
+            *add = Some(AddKind::Light(LightType::Point));
+        }
+        if ui.button("Spot").clicked() {
+            *add = Some(AddKind::Light(LightType::Spot));
+        }
+    });
+    ui.menu_button("Particle System", |ui| {
+        for (i, preset) in PARTICLE_PRESETS.iter().enumerate() {
+            if ui.button(*preset).clicked() {
+                *add = Some(AddKind::Particle(i));
+            }
+        }
+    });
+}
+
+/// A particle system placed in the scene.  The live emitter lives in the
+/// renderer (keyed by `handle`); its name and transform are mirrored here so the
+/// outliner, Details panel and gizmo can edit it -- transform edits are pushed
+/// back with Renderer::update_particle_transform.
+struct SceneParticle {
+    name: String,
+    handle: ParticleHandle,
+    position: CgVec3,
+    scale: CgVec3,
+}
+
+impl editor::EditorInspect for SceneParticle {
+    fn inspect_properties(&mut self, visitor: &mut dyn editor::PropertyVisitor) -> bool {
+        let mut changed = false;
+        changed |= visitor.edit_text("Name", &mut self.name);
+        changed |= visitor.edit_vec3("Position", &mut self.position);
+        changed |= visitor.edit_vec3("Scale", &mut self.scale);
+        changed
+    }
+}
+
+/// New selection after deleting the item at `deleted`, keeping indices in the
+/// same list valid (shift later ones down; clear if the deleted item was it).
+fn selection_after_delete(selected: Option<Selection>, deleted: Selection) -> Option<Selection> {
+    fn shift(sel: usize, del: usize) -> Option<usize> {
+        match sel.cmp(&del) {
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(sel - 1),
+            std::cmp::Ordering::Less => Some(sel),
+        }
+    }
+    match (selected, deleted) {
+        (Some(Selection::Actor(s)), Selection::Actor(d)) => shift(s, d).map(Selection::Actor),
+        (Some(Selection::Light(s)), Selection::Light(d)) => shift(s, d).map(Selection::Light),
+        (Some(Selection::Particle(s)), Selection::Particle(d)) => {
+            shift(s, d).map(Selection::Particle)
+        }
+        (other, _) => other,
+    }
+}
+
+/// Draws one outliner list section (header + rows) for objects of one kind.
+/// Rows support click-to-select, double-click-to-rename and a delete button;
+/// picks are reported through the `*_out` accumulators (applied after the pass).
+#[allow(clippy::too_many_arguments)]
+fn draw_outliner_section(
+    ui: &mut egui::Ui,
+    header: &str,
+    make_sel: fn(usize) -> Selection,
+    names: &[String],
+    selected: Option<Selection>,
+    name_edit: &mut Option<Selection>,
+    name_edit_buffer: &mut String,
+    name_edit_focus: &mut bool,
+    select_out: &mut Option<Selection>,
+    rename_out: &mut Vec<(usize, String)>,
+    delete_out: &mut Option<Selection>,
+) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(header).strong());
+    if names.is_empty() {
+        ui.label("(none)");
+    }
+    for (i, name) in names.iter().enumerate() {
+        let this = make_sel(i);
+        ui.horizontal(|ui| {
+            if *name_edit == Some(this) {
+                // Inline rename: save on Enter/blur, cancel on Escape.
+                let edit_resp = ui.text_edit_singleline(name_edit_buffer);
+                if *name_edit_focus {
+                    edit_resp.request_focus();
+                    *name_edit_focus = false;
+                }
+                let finish = edit_resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if finish || cancel {
+                    let new_name = name_edit_buffer.trim();
+                    if finish && !new_name.is_empty() {
+                        rename_out.push((i, new_name.to_string()));
+                    }
+                    *name_edit = None;
+                }
+            } else {
+                let label_resp = ui.selectable_label(selected == Some(this), name.as_str());
+                if label_resp.clicked() {
+                    *select_out = Some(this);
+                }
+                if label_resp.double_clicked() {
+                    *name_edit = Some(this);
+                    *name_edit_focus = true;
+                    *name_edit_buffer = name.clone();
+                }
+            }
+            if ui
+                .small_button(
+                    egui::RichText::new("✕").color(egui::Color32::from_rgb(235, 80, 80)),
+                )
+                .clicked()
+            {
+                *delete_out = Some(this);
+                *name_edit = None; // Cancel any edit.
+            }
+        });
+    }
+}
+
 // "6185394" -> "6,185,394" for status messages.
 fn group_digits(n: usize) -> String {
     let digits = n.to_string();
@@ -102,15 +314,24 @@ pub struct SplatGame {
     // Actors the editor has placed, listed in the Scene tab.  An actor
     // carries its own display name (see Actor's editor markup).
     scene_actors: Vec<Actor>,
-    // Scene-tab selection: index into `scene_actors`, if any.
-    selected_object: Option<usize>,
-    // Actor index awaiting delete confirmation (the Scene tab's ✕ button).
-    confirm_delete: Option<usize>,
+    // Lights the editor has placed (editor data only for now -- nothing samples
+    // them yet; they show an in-world icon and are editable in Details).
+    scene_lights: Vec<Light>,
+    // Particle systems the editor has placed.  The live emitters live in the
+    // renderer; SceneParticle mirrors name + transform for the editor.
+    scene_particles: Vec<SceneParticle>,
+    // Preloaded particle-preset textures, as (texture path, handle), so presets
+    // can be spawned synchronously from the tick (see PARTICLE_PRESETS).
+    particle_textures: Vec<(String, TextureHandle)>,
+    // Scene-tab selection (actor / light / particle), if any.
+    selected: Option<Selection>,
+    // Object awaiting delete confirmation (the Scene tab's ✕ button).
+    confirm_delete: Option<Selection>,
     // Model highlighted in the resources browser, offered to the Details
     // panel's Model row as a one-click assignment.
     selected_resource: Option<ModelHandle>,
-    // Actor index currently being renamed (double-click in the Scene tab).
-    name_edit: Option<usize>,
+    // Object currently being renamed (double-click in the Scene tab).
+    name_edit: Option<Selection>,
     // The rename field's working text.  Persists across frames -- re-deriving
     // it from the actor each frame would wipe every keystroke and commit the
     // unchanged name.  Seeded from the actor's name when a rename begins.
@@ -203,36 +424,197 @@ impl SplatGame {
         std::thread::spawn(move || pollster::block_on(pick));
     }
 
-    /// Drops a fresh empty Actor into the scene a few units ahead of the
-    /// camera and selects it, flipping to the Details tab so its model and
-    /// transform can be set right away.
-    fn add_actor(&mut self, renderer: &mut Renderer) {
+    /// Spawn point a few units ahead of the camera for newly added objects.
+    fn spawn_point(&self) -> CgVec3 {
         let (_view, view_dir, _right) = self.game_camera.calculate_view_matrix();
-        let spawn_pos = self.game_camera.get_position() + view_dir * ADD_OBJECT_DISTANCE;
+        self.game_camera.get_position() + view_dir * ADD_OBJECT_DISTANCE
+    }
 
+    /// Selects `sel` and flips to the Details tab so it can be edited right away.
+    fn select_and_show_details(&mut self, sel: Selection) {
+        self.selected = Some(sel);
+        self.active_tab = Some(EditorTab::Details);
+    }
+
+    /// Drops a fresh empty Actor into the scene ahead of the camera and selects
+    /// it, so its model and transform can be set right away in Details.
+    fn add_actor(&mut self, renderer: &mut Renderer) {
         let mut actor = Actor::new();
         actor.set_name(&format!("Actor {}", self.next_object_num));
-        actor.set_position(&spawn_pos);
+        actor.set_position(&self.spawn_point());
         renderer.add_or_update_actor(&actor);
 
         self.next_object_num += 1;
         self.scene_actors.push(actor);
-        self.selected_object = Some(self.scene_actors.len() - 1);
+        self.select_and_show_details(Selection::Actor(self.scene_actors.len() - 1));
     }
 
-    /// Removes the scene actor at `index` from both the scene list and the
-    /// renderer, keeping the Scene-tab selection valid.
-    fn delete_scene_object(&mut self, index: usize, renderer: &mut Renderer) {
-        if index >= self.scene_actors.len() {
+    /// Drops a new light of the given type into the scene ahead of the camera.
+    fn add_light(&mut self, light_type: LightType) {
+        let mut light = Light::new();
+        light.set_light_type(light_type);
+        light.set_position(&self.spawn_point());
+        self.scene_lights.push(light);
+        self.select_and_show_details(Selection::Light(self.scene_lights.len() - 1));
+    }
+
+    /// Spawns a particle system from the given preset (see PARTICLE_PRESETS)
+    /// ahead of the camera, using the preloaded texture so no async is needed.
+    fn add_particle(&mut self, preset: usize, renderer: &mut Renderer) {
+        let Some(preset_name) = PARTICLE_PRESETS.get(preset) else {
             return;
-        }
-        let actor = self.scene_actors.remove(index);
-        renderer.remove_actor(&actor);
-        self.selected_object = match self.selected_object {
-            Some(sel) if sel == index => None,
-            Some(sel) if sel > index => Some(sel - 1),
-            other => other,
         };
+        let params = preset_particle_params(preset_name);
+        let Some((_, texture)) = self
+            .particle_textures
+            .iter()
+            .find(|(path, _)| *path == params.texture_file)
+        else {
+            self.status = Some((
+                format!("Particle texture not loaded: {}", params.texture_file),
+                STATUS_RED,
+                5.0,
+            ));
+            return;
+        };
+        let texture = *texture;
+        let spawn_pos = self.spawn_point();
+        let transform = ActorTransform::from_position(spawn_pos);
+        let handle = renderer.spawn_particle_actor(&transform, &params, &texture, true);
+
+        self.next_object_num += 1;
+        self.scene_particles.push(SceneParticle {
+            name: format!("{preset_name} {}", self.next_object_num),
+            handle,
+            position: spawn_pos,
+            scale: CG_VEC3_ONE,
+        });
+        self.select_and_show_details(Selection::Particle(self.scene_particles.len() - 1));
+    }
+
+    /// Removes the selected object from its list and the renderer, keeping the
+    /// Scene-tab selection valid.
+    fn delete_selected(&mut self, sel: Selection, renderer: &mut Renderer) {
+        match sel {
+            Selection::Actor(i) => {
+                if i >= self.scene_actors.len() {
+                    return;
+                }
+                let actor = self.scene_actors.remove(i);
+                renderer.remove_actor(&actor);
+            }
+            Selection::Light(i) => {
+                if i >= self.scene_lights.len() {
+                    return;
+                }
+                self.scene_lights.remove(i);
+            }
+            Selection::Particle(i) => {
+                if i >= self.scene_particles.len() {
+                    return;
+                }
+                let particle = self.scene_particles.remove(i);
+                renderer.remove_particle_actor(&particle.handle);
+            }
+        }
+        self.selected = selection_after_delete(self.selected, sel);
+    }
+
+    /// Draws editor billboard icons for every light over the 3D view, and
+    /// returns the index of a light whose icon was clicked this frame (for
+    /// selection).  Point lights show a tinted disc; directional/spot lights add
+    /// a short direction arrow.
+    fn draw_light_icons(&self, ctx: &egui::Context, config: &Config) -> Option<usize> {
+        if self.scene_lights.is_empty() {
+            return None;
+        }
+        let (view, _, _) = self.game_camera.calculate_view_matrix();
+        let proj = cgmath::perspective(
+            cgmath::Deg(config.fov),
+            config.window_width as f32 / config.window_height as f32,
+            0.1,
+            10000.0,
+        );
+        let view_proj = proj * view;
+        let screen = ctx.content_rect();
+        let project = |world: CgVec3| -> Option<egui::Pos2> {
+            let clip = view_proj * CgVec4::new(world.x, world.y, world.z, 1.0);
+            if clip.w < 0.01 {
+                return None; // Behind the camera.
+            }
+            Some(egui::pos2(
+                screen.left() + (clip.x / clip.w + 1.0) * 0.5 * screen.width(),
+                screen.top() + (1.0 - clip.y / clip.w) * 0.5 * screen.height(),
+            ))
+        };
+
+        // Under the panels/menus but over the 3D view (like the gizmo).
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("light_icons"),
+        ));
+        let (pointer, pressed) =
+            ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_pressed()));
+        let over_ui = ctx.egui_wants_pointer_input();
+        let highlight = egui::Color32::from_rgb(255, 220, 60);
+
+        let mut clicked = None;
+        for (i, light) in self.scene_lights.iter().enumerate() {
+            let position = light.get_position();
+            let Some(center) = project(position) else {
+                continue;
+            };
+            let is_selected = self.selected == Some(Selection::Light(i));
+            let c = light.get_color();
+            let tint = egui::Color32::from_rgb(
+                (c.x.clamp(0.0, 1.0) * 255.0) as u8,
+                (c.y.clamp(0.0, 1.0) * 255.0) as u8,
+                (c.z.clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            let radius = 7.0;
+
+            // Direction arrow for directional/spot lights, camera-scaled so it
+            // stays a constant on-screen size.
+            if !matches!(light.get_light_type(), LightType::Point) {
+                let dist = (position - self.game_camera.get_position())
+                    .magnitude()
+                    .max(0.01);
+                let forward = light.get_rotation() * CgVec3::new(0.0, 0.0, 1.0);
+                if let Some(tip) = project(position + forward * dist * 0.18) {
+                    painter.arrow(center, tip - center, egui::Stroke::new(2.0, tint));
+                }
+            }
+
+            painter.circle_filled(center, radius, tint);
+            painter.circle_stroke(
+                center,
+                radius,
+                egui::Stroke::new(
+                    if is_selected { 2.5 } else { 1.5 },
+                    if is_selected {
+                        highlight
+                    } else {
+                        egui::Color32::from_gray(235)
+                    },
+                ),
+            );
+            painter.text(
+                center + egui::vec2(0.0, radius + 2.0),
+                egui::Align2::CENTER_TOP,
+                light.get_name(),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(230),
+            );
+
+            if pressed && !over_ui {
+                if let Some(p) = pointer {
+                    if p.distance(center) < radius + 4.0 {
+                        clicked = Some(i);
+                    }
+                }
+            }
+        }
+        clicked
     }
 }
 
@@ -255,7 +637,10 @@ impl GameEngine for SplatGame {
             splat_names: Vec::new(),
             active_splat: 0,
             scene_actors: Vec::new(),
-            selected_object: None,
+            scene_lights: Vec::new(),
+            scene_particles: Vec::new(),
+            particle_textures: Vec::new(),
+            selected: None,
             confirm_delete: None,
             selected_resource: None,
             name_edit: None,
@@ -312,6 +697,21 @@ impl GameEngine for SplatGame {
         // panel's model dropdown).  Done here because loading is async.
         for path in PRELOADED_MODELS {
             renderer.load_model(path, false).await;
+        }
+
+        // Preload each particle preset's texture so "Add > Particle System" can
+        // spawn one synchronously from the (non-async) frame tick.
+        for preset in PARTICLE_PRESETS {
+            let texture_file = preset_particle_params(preset).texture_file;
+            if self
+                .particle_textures
+                .iter()
+                .any(|(path, _)| *path == texture_file)
+            {
+                continue; // Presets may share a texture.
+            }
+            let handle = renderer.preload_texture(&texture_file).await;
+            self.particle_textures.push((texture_file, handle));
         }
 
         // Help is reachable from the menu bar's Help button, so drop the
@@ -385,13 +785,18 @@ impl GameEngine for SplatGame {
         // applied after the egui pass (avoids borrowing self inside closures).
         let mut do_save_scene = false;
         let mut do_load_scene = false;
-        let mut do_add_actor = false;
-        let mut delete_object_index: Option<usize> = None;
-        let mut select_object: Option<Option<usize>> = None;
+        let mut do_add: Option<AddKind> = None;
+        let mut delete_object: Option<Selection> = None;
+        let mut select_object: Option<Selection> = None;
         let mut select_splat: Option<usize> = None;
-        // True when the Details panel changed the selected actor this frame;
-        // the renderer's copy is refreshed after the egui pass.
-        let mut actor_edited = false;
+        // Local rename accumulators (one per outliner section), applied after the
+        // egui pass so the lists aren't mutably borrowed while iterating.
+        let mut rename_actors: Vec<(usize, String)> = Vec::new();
+        let mut rename_lights: Vec<(usize, String)> = Vec::new();
+        let mut rename_particles: Vec<(usize, String)> = Vec::new();
+        // True when the Details panel or gizmo changed the selected object this
+        // frame; the renderer's copy (actor / particle) is refreshed afterwards.
+        let mut selection_edited = false;
 
         // Loaded model resources for the Resources tab and the Details panel's
         // model dropdown, as (display name, handle).  Fetched up front so the
@@ -432,9 +837,7 @@ impl GameEngine for SplatGame {
                             do_load |= ui.button("Load .ply…").clicked();
                         });
                         ui.menu_button("Add", |ui| {
-                            // Just empty actors for now; a model is assigned
-                            // afterwards in the Details panel.
-                            do_add_actor |= ui.button("Actor").clicked();
+                            add_menu_ui(ui, &mut do_add);
                         });
                         ui.menu_button("Debug", |ui| {
                             do_cycle |= ui.button("Next scene").clicked();
@@ -500,15 +903,16 @@ impl GameEngine for SplatGame {
         let bar_bottom_px = menu_bar.response.rect.bottom() * ctx.pixels_per_point();
         renderer.set_debug_text_top_offset(bar_bottom_px + 6.0);
 
-        // Right-hand editor panel, tabbed: Scene (splats + actors), Details
-        // (selected actor's properties), Resources (loaded assets).  Editor mode
-        // only; game mode keeps the view unobstructed.  Drawn as an Area (same
-        // as the menu bar) so it sits over the 3D view.  Collapsed to just the
-        // tab strip until a tab is clicked; clicking the active tab collapses
-        // it again.  Open, it runs the full height of the view like a docked
-        // sidebar.  Selection/deletion set the local action flags above and are
-        // applied after the egui pass; Details edits mutate the actor directly
-        // and set `actor_edited` so the renderer's copy is refreshed afterwards.
+        // Right-hand editor panel, tabbed: Scene (splats + actors/lights/
+        // particles), Details (selected object's properties), Resources (loaded
+        // assets).  Editor mode only; game mode keeps the view unobstructed.
+        // Drawn as an Area (same as the menu bar) so it sits over the 3D view.
+        // Collapsed to just the tab strip until a tab is clicked; clicking the
+        // active tab collapses it again.  Open, it runs the full height of the
+        // view like a docked sidebar.  Selection/deletion set the local action
+        // flags above and are applied after the egui pass; Details edits mutate
+        // the object directly and set `selection_edited` so the renderer's copy
+        // is refreshed afterwards.
         // Gizmo mode toolbar, centered under the menu bar (both corners are
         // taken by the debug overlays).
         if editor {
@@ -697,109 +1101,112 @@ impl GameEngine for SplatGame {
                                         }
                                         for (i, name) in self.splat_names.iter().enumerate() {
                                             let is_active = i == self.active_splat
-                                                && self.selected_object.is_none();
+                                                && self.selected.is_none();
                                             if ui.selectable_label(is_active, name).clicked() {
                                                 select_splat = Some(i);
                                             }
                                         }
 
+                                        // Unified "Add" menu (actor / light / particle).
                                         ui.add_space(8.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("Actors").strong());
-                                            if ui
-                                                .small_button("+")
-                                                .on_hover_text("Add an actor")
-                                                .clicked()
-                                            {
-                                                do_add_actor = true;
-                                            }
-                                        });
-                                        if self.scene_actors.is_empty() {
-                                            ui.label("(none)");
-                                        }
-                                        // Accumulate names to update after the UI pass
-                                        // (no mutable borrow of scene_actors while iterating).
-                                        let mut updated_names = Vec::new();
-                                        for (i, actor) in self.scene_actors.iter().enumerate() {
-                                            ui.horizontal(|ui| {
-                                                let selected = self.selected_object == Some(i);
-                                                let is_editing = self.name_edit == Some(i);
-                                                if is_editing {
-                                                    // Inline text edit: save on Enter/blur,
-                                                    // cancel on Escape.  The buffer lives in
-                                                    // self so it survives across frames.
-                                                    let edit_resp = ui.text_edit_singleline(
-                                                        &mut self.name_edit_buffer,
-                                                    );
-                                                    // Focus the field the frame it appears.
-                                                    if self.name_edit_focus {
-                                                        edit_resp.request_focus();
-                                                        self.name_edit_focus = false;
-                                                    }
-                                                    let finish_edit = edit_resp.lost_focus()
-                                                        || ui.input(|i| {
-                                                            i.key_pressed(egui::Key::Enter)
-                                                        });
-                                                    let cancel_edit =
-                                                        ui.input(|i| i.key_pressed(egui::Key::Escape));
-                                                    if finish_edit || cancel_edit {
-                                                        let new_name =
-                                                            self.name_edit_buffer.trim();
-                                                        if finish_edit && !new_name.is_empty() {
-                                                            updated_names
-                                                                .push((i, new_name.to_string()));
-                                                        }
-                                                        self.name_edit = None;
-                                                    }
-                                                } else {
-                                                    let label_resp = ui.selectable_label(
-                                                        selected,
-                                                        actor.get_name(),
-                                                    );
-                                                    if label_resp.clicked() {
-                                                        select_object = Some(Some(i));
-                                                    }
-                                                    if label_resp.double_clicked() {
-                                                        self.name_edit = Some(i);
-                                                        self.name_edit_focus = true;
-                                                        self.name_edit_buffer =
-                                                            actor.get_name().to_string();
-                                                    }
-                                                }
-                                                // Deletion asks first (the
-                                                // modal below).
-                                                if ui
-                                                    .small_button(
-                                                        egui::RichText::new("✕").color(
-                                                            egui::Color32::from_rgb(235, 80, 80),
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.confirm_delete = Some(i);
-                                                    self.name_edit = None; // Cancel any edit.
-                                                }
-                                            });
-                                        }
-                                        // Apply name updates.
-                                        for (i, new_name) in updated_names {
-                                            if let Some(actor) = self.scene_actors.get_mut(i) {
-                                                actor.set_name(&new_name);
-                                            }
-                                        }
+                                        ui.menu_button("➕ Add", |ui| add_menu_ui(ui, &mut do_add));
+
+                                        // One outliner section per object kind.  Names are
+                                        // collected first so the lists aren't borrowed while
+                                        // the section mutates self.name_edit etc.
+                                        let actor_names: Vec<String> = self
+                                            .scene_actors
+                                            .iter()
+                                            .map(|a| a.get_name().to_string())
+                                            .collect();
+                                        draw_outliner_section(
+                                            ui,
+                                            "Actors",
+                                            Selection::Actor,
+                                            &actor_names,
+                                            self.selected,
+                                            &mut self.name_edit,
+                                            &mut self.name_edit_buffer,
+                                            &mut self.name_edit_focus,
+                                            &mut select_object,
+                                            &mut rename_actors,
+                                            &mut self.confirm_delete,
+                                        );
+
+                                        let light_names: Vec<String> = self
+                                            .scene_lights
+                                            .iter()
+                                            .map(|l| l.get_name().to_string())
+                                            .collect();
+                                        draw_outliner_section(
+                                            ui,
+                                            "Lights",
+                                            Selection::Light,
+                                            &light_names,
+                                            self.selected,
+                                            &mut self.name_edit,
+                                            &mut self.name_edit_buffer,
+                                            &mut self.name_edit_focus,
+                                            &mut select_object,
+                                            &mut rename_lights,
+                                            &mut self.confirm_delete,
+                                        );
+
+                                        let particle_names: Vec<String> = self
+                                            .scene_particles
+                                            .iter()
+                                            .map(|p| p.name.clone())
+                                            .collect();
+                                        draw_outliner_section(
+                                            ui,
+                                            "Particles",
+                                            Selection::Particle,
+                                            &particle_names,
+                                            self.selected,
+                                            &mut self.name_edit,
+                                            &mut self.name_edit_buffer,
+                                            &mut self.name_edit_focus,
+                                            &mut select_object,
+                                            &mut rename_particles,
+                                            &mut self.confirm_delete,
+                                        );
                                     }
-                                    EditorTab::Details => match self.selected_object {
-                                        Some(index) => {
-                                            actor_edited |= editor::draw_properties(
-                                                ui,
-                                                &mut self.scene_actors[index],
-                                                &model_resources,
-                                                self.selected_resource,
-                                            );
+                                    EditorTab::Details => match self.selected {
+                                        Some(Selection::Actor(i)) => {
+                                            if let Some(actor) = self.scene_actors.get_mut(i) {
+                                                selection_edited |= editor::draw_properties(
+                                                    ui,
+                                                    actor,
+                                                    &model_resources,
+                                                    self.selected_resource,
+                                                );
+                                            }
+                                        }
+                                        Some(Selection::Light(i)) => {
+                                            if let Some(light) = self.scene_lights.get_mut(i) {
+                                                selection_edited |= editor::draw_properties(
+                                                    ui,
+                                                    light,
+                                                    &model_resources,
+                                                    self.selected_resource,
+                                                );
+                                            }
+                                        }
+                                        Some(Selection::Particle(i)) => {
+                                            if let Some(particle) =
+                                                self.scene_particles.get_mut(i)
+                                            {
+                                                selection_edited |= editor::draw_properties(
+                                                    ui,
+                                                    particle,
+                                                    &model_resources,
+                                                    self.selected_resource,
+                                                );
+                                            }
                                         }
                                         None => {
                                             ui.label("Nothing selected.");
-                                            ui.label("Pick an actor in the Scene tab.");
+                                            ui.label("Pick something in the Scene tab.");
                                         }
                                     },
                                 }
@@ -810,11 +1217,15 @@ impl GameEngine for SplatGame {
 
         // Delete confirmation for the Scene tab's ✕ button.  A modal blocks
         // the rest of the UI until answered; clicking the backdrop cancels.
-        if let Some(index) = self.confirm_delete {
-            match self.scene_actors.get(index) {
-                None => self.confirm_delete = None, // Stale index.
-                Some(actor) => {
-                    let name = actor.get_name().to_string();
+        if let Some(sel) = self.confirm_delete {
+            let name = match sel {
+                Selection::Actor(i) => self.scene_actors.get(i).map(|a| a.get_name().to_string()),
+                Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_name().to_string()),
+                Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.name.clone()),
+            };
+            match name {
+                None => self.confirm_delete = None, // Stale selection.
+                Some(name) => {
                     let modal =
                         egui::Modal::new(egui::Id::new("confirm_delete")).show(&ctx, |ui| {
                             ui.label(format!("Delete \"{name}\"?"));
@@ -827,7 +1238,7 @@ impl GameEngine for SplatGame {
                                     )
                                     .clicked()
                                 {
-                                    delete_object_index = Some(index);
+                                    delete_object = Some(sel);
                                     self.confirm_delete = None;
                                 }
                                 if ui.button("Cancel").clicked() {
@@ -954,29 +1365,65 @@ impl GameEngine for SplatGame {
             }
         }
 
-        // Translate/rotate/scale gizmo on the selected actor, drawn over the
-        // 3D view.  Its edits ride the same actor_edited path as the Details
-        // panel's.
+        // In-world editor icons for lights (clicking one selects it).
         if editor {
-            if let Some(actor) = self
-                .selected_object
-                .and_then(|i| self.scene_actors.get_mut(i))
-            {
-                let mut position = actor.get_position();
-                let mut rotation = actor.get_rotation();
-                let mut scale = actor.get_scale();
-                if self.gizmo.ui(
-                    &ctx,
-                    &self.game_camera,
-                    game_config,
-                    &mut position,
-                    &mut rotation,
-                    &mut scale,
-                ) {
-                    actor.set_position(&position);
-                    actor.set_rotation(&rotation);
-                    actor.set_scale(&scale);
-                    actor_edited = true;
+            if let Some(i) = self.draw_light_icons(&ctx, game_config) {
+                select_object = Some(Selection::Light(i));
+            }
+        }
+
+        // Translate/rotate/scale gizmo on the selected object, drawn over the 3D
+        // view.  Its edits ride the same `selection_edited` path as Details.
+        // Lights have no scale (only translate/rotate apply); particles use
+        // translate/scale (rotation is ignored).
+        if editor {
+            if let Some(sel) = self.selected {
+                let current = match sel {
+                    Selection::Actor(i) => self
+                        .scene_actors
+                        .get(i)
+                        .map(|a| (a.get_position(), a.get_rotation(), a.get_scale())),
+                    Selection::Light(i) => self
+                        .scene_lights
+                        .get(i)
+                        .map(|l| (l.get_position(), l.get_rotation(), CG_VEC3_ONE)),
+                    Selection::Particle(i) => self
+                        .scene_particles
+                        .get(i)
+                        .map(|p| (p.position, CG_QUAT_IDENT, p.scale)),
+                };
+                if let Some((mut position, mut rotation, mut scale)) = current {
+                    if self.gizmo.ui(
+                        &ctx,
+                        &self.game_camera,
+                        game_config,
+                        &mut position,
+                        &mut rotation,
+                        &mut scale,
+                    ) {
+                        match sel {
+                            Selection::Actor(i) => {
+                                if let Some(a) = self.scene_actors.get_mut(i) {
+                                    a.set_position(&position);
+                                    a.set_rotation(&rotation);
+                                    a.set_scale(&scale);
+                                }
+                            }
+                            Selection::Light(i) => {
+                                if let Some(l) = self.scene_lights.get_mut(i) {
+                                    l.set_position(&position);
+                                    l.set_rotation(&rotation);
+                                }
+                            }
+                            Selection::Particle(i) => {
+                                if let Some(p) = self.scene_particles.get_mut(i) {
+                                    p.position = position;
+                                    p.scale = scale;
+                                }
+                            }
+                        }
+                        selection_edited = true;
+                    }
                 }
             }
         }
@@ -987,21 +1434,52 @@ impl GameEngine for SplatGame {
                 self.active_splat = sel;
                 renderer.set_active_gaussian_splat(sel);
             }
-            self.selected_object = None;
+            self.selected = None;
         }
         if let Some(sel) = select_object {
-            self.selected_object = sel;
+            self.selected = Some(sel);
         }
-        if do_add_actor {
-            self.add_actor(renderer);
+        // Apply outliner renames (accumulated per section during the pass).
+        for (i, new_name) in rename_actors {
+            if let Some(actor) = self.scene_actors.get_mut(i) {
+                actor.set_name(&new_name);
+            }
         }
-        if let Some(i) = delete_object_index {
-            self.delete_scene_object(i, renderer);
+        for (i, new_name) in rename_lights {
+            if let Some(light) = self.scene_lights.get_mut(i) {
+                light.set_name(&new_name);
+            }
         }
-        // Push Details-panel / gizmo edits to the renderer's copy of the actor.
-        if actor_edited {
-            if let Some(actor) = self.selected_object.and_then(|i| self.scene_actors.get(i)) {
-                renderer.add_or_update_actor(actor);
+        for (i, new_name) in rename_particles {
+            if let Some(particle) = self.scene_particles.get_mut(i) {
+                particle.name = new_name;
+            }
+        }
+        if let Some(kind) = do_add {
+            match kind {
+                AddKind::Actor => self.add_actor(renderer),
+                AddKind::Light(light_type) => self.add_light(light_type),
+                AddKind::Particle(preset) => self.add_particle(preset, renderer),
+            }
+        }
+        if let Some(sel) = delete_object {
+            self.delete_selected(sel, renderer);
+        }
+        // Push Details-panel / gizmo edits to the renderer's copy of the object.
+        if selection_edited {
+            match self.selected {
+                Some(Selection::Actor(i)) => {
+                    if let Some(actor) = self.scene_actors.get(i) {
+                        renderer.add_or_update_actor(actor);
+                    }
+                }
+                Some(Selection::Particle(i)) => {
+                    if let Some(p) = self.scene_particles.get(i) {
+                        renderer.update_particle_transform(&p.handle, &p.position, &Some(p.scale));
+                    }
+                }
+                // Lights are editor-only for now -- nothing to push.
+                _ => {}
             }
         }
         if do_save_scene {

@@ -83,6 +83,23 @@ impl Model {
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
+        // Loading the texture is the only async step; the GPU resources are all
+        // built synchronously in `new_particle_with_texture`.
+        let texture_handle = asset_manager
+            .load_texture(texture_file_path, device_resources)
+            .await;
+        Self::new_particle_with_texture(&texture_handle, device_resources, asset_manager)
+    }
+
+    /// Builds a particle model from an already-loaded texture (see
+    /// `AssetManager::load_texture`).  Synchronous, so callers outside an async
+    /// context (e.g. the frame tick) can spawn particles once the texture has
+    /// been preloaded.
+    pub fn new_particle_with_texture(
+        texture_handle: &TextureHandle,
+        device_resources: &DeviceResources<'_>,
+        asset_manager: &mut AssetManager,
+    ) -> Self {
         let device = &device_resources.device;
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -138,10 +155,7 @@ impl Model {
             });
 
         let mut textures = Vec::<TextureHandle>::new();
-        let texture_handle = asset_manager
-            .load_texture(texture_file_path, device_resources)
-            .await;
-        textures.push(texture_handle);
+        textures.push(*texture_handle);
         let texture = asset_manager.get_texture(&textures[0]);
 
         let tex_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

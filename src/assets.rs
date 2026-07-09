@@ -351,11 +351,19 @@ impl AssetManager {
                 let file_name = path.file_name().unwrap().to_str().unwrap();
                 log!("Path returned {} ", file_name);
 
-                let byte_buffer = self.file_to_byte_buffer.get(file_name).unwrap();
+                // Prefer bytes baked in at build time (include_bytes! above,
+                // gated by the wasm_include_* features). Textures a build didn't
+                // compile in -- e.g. ones the editor loads at runtime -- are
+                // fetched from /rust_assets/ instead, the same place the splat
+                // .ply/.glb files are served from (mirrors load_model).
+                let byte_buffer = match self.file_to_byte_buffer.get(file_name) {
+                    Some(buffer) => buffer.clone(),
+                    None => load_binary(file_path).await.unwrap(),
+                };
                 Texture::from_bytes(
                     &device_resource.device,
                     &device_resource.queue,
-                    byte_buffer,
+                    &byte_buffer,
                     file_name,
                 )
                 .unwrap()

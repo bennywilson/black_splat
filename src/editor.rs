@@ -15,7 +15,14 @@ use crate::utils::{CgQuat, CgVec3, CgVec4};
 /// value.  Each method returns true if it changed the value.
 pub trait PropertyVisitor {
     fn edit_text(&mut self, name: &str, value: &mut String) -> bool;
+    /// A single scalar, edited as a drag value (never taken below zero -- the
+    /// engine's floats are physical quantities like intensity or scale).
+    fn edit_float(&mut self, name: &str, value: &mut f32) -> bool;
+    /// A checkbox.
+    fn edit_bool(&mut self, name: &str, value: &mut bool) -> bool;
     fn edit_vec3(&mut self, name: &str, value: &mut CgVec3) -> bool;
+    /// An RGB color (each channel 0..1), edited with a swatch/color picker.
+    fn edit_color(&mut self, name: &str, value: &mut CgVec3) -> bool;
     /// Rotation is stored as a quaternion but presented as XYZ euler degrees.
     fn edit_rotation(&mut self, name: &str, value: &mut CgQuat) -> bool;
     /// A fixed set of named choices (an enum): `index` selects into `options`.
@@ -91,8 +98,17 @@ macro_rules! editor_property {
     ($self:ident, $visitor:ident, $field:ident, text, $label:literal) => {
         $visitor.edit_text($label, &mut $self.$field)
     };
+    ($self:ident, $visitor:ident, $field:ident, float, $label:literal) => {
+        $visitor.edit_float($label, &mut $self.$field)
+    };
+    ($self:ident, $visitor:ident, $field:ident, bool, $label:literal) => {
+        $visitor.edit_bool($label, &mut $self.$field)
+    };
     ($self:ident, $visitor:ident, $field:ident, vec3, $label:literal) => {
         $visitor.edit_vec3($label, &mut $self.$field)
+    };
+    ($self:ident, $visitor:ident, $field:ident, color, $label:literal) => {
+        $visitor.edit_color($label, &mut $self.$field)
     };
     ($self:ident, $visitor:ident, $field:ident, rotation, $label:literal) => {
         $visitor.edit_rotation($label, &mut $self.$field)
@@ -165,8 +181,36 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
         self.ui.text_edit_singleline(value).changed()
     }
 
+    fn edit_float(&mut self, name: &str, value: &mut f32) -> bool {
+        self.ui.label(name);
+        self.ui
+            .add(
+                egui::DragValue::new(value)
+                    .speed(0.02)
+                    .range(0.0..=f32::MAX)
+                    .max_decimals(3),
+            )
+            .changed()
+    }
+
+    fn edit_bool(&mut self, name: &str, value: &mut bool) -> bool {
+        self.ui.checkbox(value, name).changed()
+    }
+
     fn edit_vec3(&mut self, name: &str, value: &mut CgVec3) -> bool {
         self.drag_row(name, [&mut value.x, &mut value.y, &mut value.z], 0.05, "")
+    }
+
+    fn edit_color(&mut self, name: &str, value: &mut CgVec3) -> bool {
+        self.ui.label(name);
+        // egui edits gamma-space 0..1 rgb; the light color is stored the same way.
+        let mut rgb = [value.x, value.y, value.z];
+        if self.ui.color_edit_button_rgb(&mut rgb).changed() {
+            *value = CgVec3::new(rgb[0], rgb[1], rgb[2]);
+            true
+        } else {
+            false
+        }
     }
 
     fn edit_rotation(&mut self, name: &str, value: &mut CgQuat) -> bool {

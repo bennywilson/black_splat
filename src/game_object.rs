@@ -137,8 +137,36 @@ impl ParticleActor {
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
+        // The only async step is fetching the texture; the model itself is built
+        // synchronously.  Split out so an already-loaded texture can be spawned
+        // from a non-async context (see `from_texture` / the editor).
+        let texture_handle = asset_manager
+            .load_texture(&params.texture_file, device_resources)
+            .await;
+        Self::from_texture(
+            transform,
+            particle_handle,
+            params,
+            &texture_handle,
+            device_resources,
+            asset_manager,
+        )
+    }
+
+    /// Builds a particle actor from a texture that's already loaded (see
+    /// `AssetManager::load_texture`).  Fully synchronous, so it can run inside
+    /// the frame tick -- the editor uses this to spawn particle systems on the
+    /// fly after preloading their texture.
+    pub fn from_texture(
+        transform: &ActorTransform,
+        particle_handle: &ParticleHandle,
+        params: &ParticleParams,
+        texture_handle: &TextureHandle,
+        device_resources: &DeviceResources<'_>,
+        asset_manager: &mut AssetManager,
+    ) -> Self {
         let model =
-            Model::new_particle(&params.texture_file, device_resources, asset_manager).await;
+            Model::new_particle_with_texture(texture_handle, device_resources, asset_manager);
         let spawn_rate = random_f32(params.min_start_spawn_rate, params.max_start_spawn_rate);
         let params = (*params).clone();
         let start_time = instant::Instant::now();
@@ -415,6 +443,133 @@ impl Actor {
 
     pub fn get_custom_data_1(&self) -> CgVec4 {
         self.custom_data_1
+    }
+}
+
+static mut NEXT_LIGHT_ID: u32 = 0;
+
+/// The kind of light, selectable in the editor.  Directional and spot lights
+/// use the light's rotation as their direction; point lights are omnidirectional.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightType {
+    Directional,
+    Point,
+    Spot,
+}
+
+impl crate::editor::EditorChoice for LightType {
+    const NAMES: &'static [&'static str] = &["Directional", "Point", "Spot"];
+
+    fn choice_index(&self) -> usize {
+        match self {
+            LightType::Directional => 0,
+            LightType::Point => 1,
+            LightType::Spot => 2,
+        }
+    }
+
+    fn from_choice_index(index: usize) -> Self {
+        match index {
+            0 => LightType::Directional,
+            2 => LightType::Spot,
+            _ => LightType::Point,
+        }
+    }
+}
+
+/// A scene light.  Purely editor data for now -- nothing samples it yet -- but
+/// it carries everything a lighting pass would need (type, color, intensity,
+/// shadow flag) plus a transform for its in-world editor icon and gizmo.
+#[derive(Debug, Clone)]
+pub struct Light {
+    pub id: u32,
+    name: String,
+    position: CgVec3,
+    rotation: CgQuat,
+    light_type: LightType,
+    color: CgVec3,
+    intensity: f32,
+    casts_shadow: bool,
+}
+
+// Editor markup: the fields the Details panel shows and how each is edited.
+crate::editor_properties!(Light {
+    name: text("Name"),
+    position: vec3("Position"),
+    rotation: rotation("Rotation"),
+    light_type: choice("Type"),
+    color: color("Color"),
+    intensity: float("Intensity"),
+    casts_shadow: bool("Casts Shadow"),
+});
+
+impl Default for Light {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
+impl Light {
+    pub fn new() -> Self {
+        let id = unsafe {
+            NEXT_LIGHT_ID += 1;
+            NEXT_LIGHT_ID
+        };
+        Light {
+            id,
+            name: format!("Light {id}"),
+            position: CG_VEC3_ZERO,
+            rotation: CG_QUAT_IDENT,
+            light_type: LightType::Point,
+            color: CG_VEC3_ONE,
+            intensity: 1.0,
+            casts_shadow: true,
+        }
+    }
+
+    pub fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn set_position(&mut self, position: &CgVec3) {
+        self.position = *position;
+    }
+
+    pub fn get_position(&self) -> CgVec3 {
+        self.position
+    }
+
+    pub fn set_rotation(&mut self, rotation: &CgQuat) {
+        self.rotation = *rotation;
+    }
+
+    pub fn get_rotation(&self) -> CgQuat {
+        self.rotation
+    }
+
+    pub fn set_light_type(&mut self, light_type: LightType) {
+        self.light_type = light_type;
+    }
+
+    pub fn get_light_type(&self) -> LightType {
+        self.light_type
+    }
+
+    pub fn get_color(&self) -> CgVec3 {
+        self.color
+    }
+
+    pub fn get_intensity(&self) -> f32 {
+        self.intensity
+    }
+
+    pub fn casts_shadow(&self) -> bool {
+        self.casts_shadow
     }
 }
 

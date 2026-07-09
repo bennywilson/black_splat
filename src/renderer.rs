@@ -773,6 +773,52 @@ impl<'a> Renderer<'a> {
         self.next_particle_id.clone()
     }
 
+    /// Loads a texture up front and returns its (cached) handle, so a particle
+    /// using it can later be spawned synchronously with `spawn_particle_actor`
+    /// from the non-async frame tick.
+    pub async fn preload_texture(&mut self, file_path: &str) -> TextureHandle {
+        self.asset_manager
+            .load_texture(file_path, &self.device_resources)
+            .await
+    }
+
+    /// Synchronous counterpart to `add_particle_actor`: spawns a particle actor
+    /// from an already-preloaded texture (see `preload_texture`), so it can run
+    /// inside the frame tick.  Returns the new particle's handle.
+    pub fn spawn_particle_actor(
+        &mut self,
+        transform: &ActorTransform,
+        particle_params: &ParticleParams,
+        texture: &TextureHandle,
+        active: bool,
+    ) -> ParticleHandle {
+        self.next_particle_id.index = {
+            if self.next_particle_id.index == u32::MAX {
+                0
+            } else {
+                self.next_particle_id.index + 1
+            }
+        };
+        let mut particle = ParticleActor::from_texture(
+            transform,
+            &self.next_particle_id,
+            particle_params,
+            texture,
+            &self.device_resources,
+            &mut self.asset_manager,
+        );
+        particle.set_active(active);
+        self.particle_map
+            .insert(self.next_particle_id.clone(), particle);
+
+        self.next_particle_id.clone()
+    }
+
+    /// Removes a particle actor (e.g. when the editor deletes it from the scene).
+    pub fn remove_particle_actor(&mut self, handle: &ParticleHandle) {
+        self.particle_map.remove(handle);
+    }
+
     pub fn enable_particle_actor(&mut self, handle: &ParticleHandle, enable: bool) {
         let particle = self.particle_map.get_mut(handle).unwrap();
         particle.set_active(enable);

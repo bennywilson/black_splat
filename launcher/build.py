@@ -41,6 +41,7 @@ WASM_ASSETS = {
     "splat": [
         ("game_assets/splats/*.ply", "rust_assets"),
         ("game_assets/models/*.glb", "rust_assets"),
+        ("game_assets/fx/*.png", "rust_assets"),
     ],
 }
 
