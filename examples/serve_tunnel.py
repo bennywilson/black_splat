@@ -16,6 +16,7 @@ prints the URL.
 Usage: python3 serve_tunnel.py <directory> [port]
 """
 import functools
+import os
 import re
 import shutil
 import socketserver
@@ -40,6 +41,11 @@ def start_server(directory, port):
 def show_qr(url):
     banner = "=" * 60
     print(f"\n{banner}\n  Open on your phone (HTTPS -> WebGPU works):\n  {url}\n{banner}\n")
+    # The web launcher renders its own (scannable) QR image on the dashboard, so
+    # it sets LAUNCHER_QR=0 to suppress the terminal QR -- whose ANSI colour
+    # blocks would just be garbled noise in a browser <pre>.
+    if os.environ.get("LAUNCHER_QR", "1") == "0":
+        return
     npx = shutil.which("npx")
     if not npx:
         print("(install Node for a scannable QR, or just type the URL above)\n")
@@ -61,7 +67,7 @@ def main():
     port = int(sys.argv[2]) if len(sys.argv) > 2 else PORT
 
     start_server(directory, port)
-    print(f"Serving {directory} on http://localhost:{port}/  (LAN + tunnel)")
+    print(f"Serving {directory} on http://localhost:{port}/  (LAN + tunnel)", flush=True)
 
     cloudflared = shutil.which("cloudflared")
     if not cloudflared:
@@ -69,7 +75,8 @@ def main():
             "\ncloudflared not found -- install it for the HTTPS tunnel:\n"
             "  scoop install cloudflared\n\n"
             "The LAN URL above still works for the WebGL2 (2D/3D) demos.\n"
-            "Press Ctrl+C to stop.\n"
+            "Press Ctrl+C to stop.\n",
+            flush=True,
         )
         try:
             threading.Event().wait()
@@ -77,7 +84,7 @@ def main():
             pass
         return
 
-    print("Starting Cloudflare quick tunnel (Ctrl+C to stop)...\n")
+    print("Starting Cloudflare quick tunnel (Ctrl+C to stop)...\n", flush=True)
     proc = subprocess.Popen(
         [cloudflared, "tunnel", "--url", f"http://localhost:{port}"],
         stdout=subprocess.PIPE,
@@ -91,6 +98,7 @@ def main():
         # once and keep draining output so the tunnel stays alive.
         for line in proc.stdout:
             sys.stdout.write(line)
+            sys.stdout.flush()
             if not shown:
                 match = URL_RE.search(line)
                 if match:
