@@ -538,8 +538,19 @@ impl GaussianSplatPass {
                 unclipped_depth: false,
                 conservative: false,
             },
-            // Splats are sorted and alpha-composited; no depth test.
-            depth_stencil: None,
+            // Splats are sorted back-to-front and alpha-composited among
+            // themselves, but they depth-test against the depth the opaque 3D
+            // passes wrote so scene geometry occludes them.  They never WRITE
+            // depth: a splat's quad extends past its visible falloff, and
+            // writing it would punch invisible holes in anything drawn later
+            // (particles, and eventually PBR transparents).
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -1055,7 +1066,17 @@ impl GaussianSplatPass {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                // Shared scene depth, written by the opaque model passes.  The
+                // pipeline only tests against it (writes are disabled), so Load/
+                // Store leaves it intact for later depth-tested passes.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &device_resources.render_textures[1].view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 multiview_mask: None,
                 timestamp_writes: None,

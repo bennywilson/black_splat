@@ -598,6 +598,18 @@ impl<'a> Renderer<'a> {
             }
         }
 
+        // Splats run right after the opaque world passes: they depth-test
+        // against the depth those passes wrote (without writing it), so 3D
+        // geometry occludes them, and everything transparent below (lines,
+        // particles, sunbeams) composites on top.  A future PBR opaque pass
+        // just needs to render above this point.
+        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+            if splat_pass.has_model() {
+                PERF_SCOPE!("Gaussian Splats");
+                splat_pass.render(&mut ctx);
+            }
+        }
+
         {
             PERF_SCOPE!("World Debug");
             self.line_pass.render(&mut ctx, &self.debug_lines);
@@ -619,13 +631,6 @@ impl<'a> Renderer<'a> {
 
         if game_config.sunbeams_enabled {
             self.sunbeam_pass.render(&mut ctx);
-        }
-
-        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
-            if splat_pass.has_model() {
-                PERF_SCOPE!("Gaussian Splats");
-                splat_pass.render(&mut ctx);
-            }
         }
 
         if !self.actor_map.is_empty() {

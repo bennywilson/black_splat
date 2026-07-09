@@ -259,6 +259,7 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
 pub enum GizmoMode {
     Translate,
     Rotate,
+    Scale,
 }
 
 const GIZMO_AXES: [CgVec3; 3] = [
@@ -277,15 +278,26 @@ const GIZMO_HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(255, 220, 60);
 const GIZMO_HIT_RADIUS: f32 = 12.0;
 // On-screen gizmo size: world size = distance to camera * this.
 const GIZMO_SCALE: f32 = 0.2;
+// Side (in points) of the square tips on the scale handles.
+const GIZMO_SCALE_HANDLE_SIZE: f32 = 10.0;
+// Scale drags never shrink an axis past this, so the actor's world matrix
+// stays invertible and the actor stays clickable/recoverable in the viewport.
+const GIZMO_MIN_SCALE: f32 = 0.001;
+// drag_axis value for the scale gizmo's uniform-scale center handle
+// (0..2 are the entries of GIZMO_AXES).
+const GIZMO_CENTER_HANDLE: usize = 3;
 
-/// A screen-space translate/rotate gizmo drawn over the 3D view for the
+/// A screen-space translate/rotate/scale gizmo drawn over the 3D view for the
 /// selected actor.  Translate shows three world-axis arrows; dragging one
 /// slides the position along that axis.  Rotate shows three axis rings;
 /// dragging one spins the rotation about that axis by the pointer's angle
-/// change around the gizmo center.
+/// change around the gizmo center.  Scale shows three square-tipped axis
+/// handles plus a center square; dragging a tip scales that axis, dragging
+/// the center scales all three uniformly.
 pub struct TransformGizmo {
     pub mode: GizmoMode,
-    // Axis (index into GIZMO_AXES) currently being dragged.
+    // Handle currently being dragged: an index into GIZMO_AXES, or
+    // GIZMO_CENTER_HANDLE for the uniform-scale center square.
     drag_axis: Option<usize>,
 }
 
@@ -300,8 +312,8 @@ impl Default for TransformGizmo {
 
 impl TransformGizmo {
     /// Draws the gizmo at `position` and applies any drag to
-    /// `position`/`rotation` (depending on mode).  Returns true if it changed
-    /// them this frame.
+    /// `position`/`rotation`/`scale` (depending on mode).  Returns true if it
+    /// changed them this frame.
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
@@ -309,6 +321,7 @@ impl TransformGizmo {
         config: &Config,
         position: &mut CgVec3,
         rotation: &mut CgQuat,
+        scale: &mut CgVec3,
     ) -> bool {
         // The same view/projection the model pass renders with, so the gizmo
         // lines up with the actor on screen.
@@ -368,6 +381,31 @@ impl TransformGizmo {
         let can_grab = pressed && !over_ui;
 
         let mut changed = false;
+
+        // Scale mode's uniform-scale center square.  Grab-checked before the
+        // axis handles so it wins presses near the center, where all three
+        // axis lines converge; painted after them so it sits on top.
+        let mut center_active = false;
+        let mut center_hovered = false;
+        if self.mode == GizmoMode::Scale {
+            let center_dist = pointer.map_or(f32::MAX, |p| p.distance(center));
+            if can_grab && center_dist < GIZMO_HIT_RADIUS {
+                self.drag_axis = Some(GIZMO_CENTER_HANDLE);
+            }
+            center_active = self.drag_axis == Some(GIZMO_CENTER_HANDLE);
+            center_hovered = !any_down && !over_ui && center_dist < GIZMO_HIT_RADIUS;
+            if center_active && down {
+                // Drag right/up to grow, left/down to shrink (screen y points
+                // down).  Multiplicative, so the feel is the same at any
+                // current scale and an axis can never cross zero.
+                let factor = 1.0 + (delta.x - delta.y) * 0.01;
+                for i in 0..3 {
+                    scale[i] = (scale[i] * factor).max(GIZMO_MIN_SCALE);
+                }
+                changed |= factor != 1.0;
+            }
+        }
+
         for (axis, dir) in GIZMO_AXES.iter().enumerate() {
             match self.mode {
                 GizmoMode::Translate => {
@@ -466,7 +504,66 @@ impl TransformGizmo {
                         ),
                     ));
                 }
+                GizmoMode::Scale => {
+                    let Some(tip) = project(*position + *dir * world_size) else {
+                        continue;
+                    };
+                    let hover_dist = pointer
+                        .map_or(f32::MAX, |p| distance_to_segment(p, center, tip));
+                    // is_none() keeps a center grab (checked above) from being
+                    // stolen by the axis lines that pass through it.
+                    if can_grab && self.drag_axis.is_none() && hover_dist < GIZMO_HIT_RADIUS {
+                        self.drag_axis = Some(axis);
+                    }
+                    let active = self.drag_axis == Some(axis);
+                    let hovered = !any_down && !over_ui && hover_dist < GIZMO_HIT_RADIUS;
+                    if active && down {
+                        // Pointer movement along the axis' screen direction as
+                        // a fraction of the gizmo length, applied
+                        // multiplicatively: dragging outward grows, inward
+                        // shrinks, same feel at any current scale.
+                        let screen_axis = tip - center;
+                        let len2 = screen_axis.length_sq();
+                        if len2 > 1.0 {
+                            let t = delta.dot(screen_axis) / len2;
+                            scale[axis] = (scale[axis] * (1.0 + t)).max(GIZMO_MIN_SCALE);
+                            changed |= t != 0.0;
+                        }
+                    }
+                    let color = if active || hovered {
+                        GIZMO_HIGHLIGHT
+                    } else {
+                        GIZMO_COLORS[axis]
+                    };
+                    painter.line_segment(
+                        [center, tip],
+                        egui::Stroke::new(if active { 4.5 } else { 3.0 }, color),
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(
+                            tip,
+                            egui::Vec2::splat(GIZMO_SCALE_HANDLE_SIZE),
+                        ),
+                        1.0,
+                        color,
+                    );
+                }
             }
+        }
+
+        if self.mode == GizmoMode::Scale {
+            painter.rect_filled(
+                egui::Rect::from_center_size(
+                    center,
+                    egui::Vec2::splat(GIZMO_SCALE_HANDLE_SIZE),
+                ),
+                1.0,
+                if center_active || center_hovered {
+                    GIZMO_HIGHLIGHT
+                } else {
+                    egui::Color32::from_gray(220)
+                },
+            );
         }
         changed
     }

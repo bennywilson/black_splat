@@ -935,7 +935,13 @@ impl ModelPass {
                     actor.get_scale().z,
                 );
             uniform_data.world = world_matrix.into();
-            uniform_data.inv_world = world_matrix.invert().unwrap().into();
+            // A zero scale on any axis (easy to hit while dragging the editor's
+            // Scale field) makes the matrix singular: render the degenerate
+            // frame with an identity inverse instead of panicking.
+            uniform_data.inv_world = world_matrix
+                .invert()
+                .unwrap_or_else(cgmath::Matrix4::identity)
+                .into();
             uniform_data.mvp_matrix = (proj_matrix * view_matrix * world_matrix).into();
             uniform_data.view_proj = (proj_matrix * view_matrix).into();
             uniform_data.camera_dir = [view_dir.x, view_dir.y, view_dir.z, 0.0];
@@ -1083,7 +1089,11 @@ impl ModelPass {
             let mut uniform = ModelUniform {
                 ..Default::default()
             };
-            uniform.inv_world = world_matrix.invert().unwrap().into();
+            // Same zero-scale guard as the actor path above.
+            uniform.inv_world = world_matrix
+                .invert()
+                .unwrap_or_else(cgmath::Matrix4::identity)
+                .into();
             uniform.mvp_matrix = (view_proj_matrix * world_matrix).into();
             uniform.view_proj = (proj_matrix * view_matrix).into();
             uniform.camera_pos = view_pos;

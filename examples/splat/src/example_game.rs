@@ -117,7 +117,7 @@ pub struct SplatGame {
     // first frame; cleared once focused (requesting every frame would block
     // click-away-to-save).
     name_edit_focus: bool,
-    // Viewport translate/rotate gizmo for the selected actor.
+    // Viewport translate/rotate/scale gizmo for the selected actor.
     gizmo: TransformGizmo,
     // Which tab the right-hand editor panel shows; None keeps the panel
     // collapsed to just its tab strip.
@@ -499,9 +499,11 @@ impl GameEngine for SplatGame {
                 .show(&ctx, |ui| {
                     egui::Frame::side_top_panel(ui.style()).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            for (mode, label) in
-                                [(GizmoMode::Translate, "Move"), (GizmoMode::Rotate, "Rotate")]
-                            {
+                            for (mode, label) in [
+                                (GizmoMode::Translate, "Move"),
+                                (GizmoMode::Rotate, "Rotate"),
+                                (GizmoMode::Scale, "Scale"),
+                            ] {
                                 if ui.selectable_label(self.gizmo.mode == mode, label).clicked()
                                 {
                                     self.gizmo.mode = mode;
@@ -818,8 +820,8 @@ impl GameEngine for SplatGame {
             }
         }
 
-        // Translate/rotate gizmo on the selected actor, drawn over the 3D
-        // view.  Its edits ride the same actor_edited path as the Details
+        // Translate/rotate/scale gizmo on the selected actor, drawn over the
+        // 3D view.  Its edits ride the same actor_edited path as the Details
         // panel's.
         if editor {
             if let Some(actor) = self
@@ -828,15 +830,18 @@ impl GameEngine for SplatGame {
             {
                 let mut position = actor.get_position();
                 let mut rotation = actor.get_rotation();
+                let mut scale = actor.get_scale();
                 if self.gizmo.ui(
                     &ctx,
                     &self.game_camera,
                     game_config,
                     &mut position,
                     &mut rotation,
+                    &mut scale,
                 ) {
                     actor.set_position(&position);
                     actor.set_rotation(&rotation);
+                    actor.set_scale(&scale);
                     actor_edited = true;
                 }
             }
