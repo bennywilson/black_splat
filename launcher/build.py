@@ -20,9 +20,11 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -186,14 +188,72 @@ def run_serve(example, out_dir, tunneled, log, on_proc=None, on_url=None, suppre
         on_proc(proc)
     if on_url:
         on_url("Local", f"http://localhost:{port}/")
+    public_seen = False
     for line in proc.stdout:
         log(line.rstrip("\n"))
-        if tunneled and on_url:
+        if tunneled and on_url and not public_seen:
             m = URL_RE.search(line)
             if m:
-                on_url("Public (HTTPS)", m.group(0))
+                public_seen = True
+                url = m.group(0)
+                host = url.removeprefix("https://")
+                log(f"waiting for {host} to resolve publicly (fresh tunnel hostnames take a few seconds) ...")
+                if wait_for_dns(host):
+                    log("DNS is live; URL is safe to open/scan.")
+                else:
+                    log("warning: hostname still not resolving after 60s -- the URL may not work yet.")
+                on_url("Public (HTTPS)", url)
     proc.wait()
     return proc.returncode
+
+
+def _dns_query_direct(hostname, server="1.1.1.1"):
+    """One A-record lookup sent straight to `server` over UDP:53, bypassing
+    the local resolver entirely. Returns True (resolves), False (NXDOMAIN /
+    no records yet), or None (couldn't ask -- network blocked the query).
+    Hand-rolled wire format because the stdlib's getaddrinfo can only use the
+    system resolver, and DoH via urllib trips over missing intermediate certs
+    on the Windows Store Python."""
+    qid = os.urandom(2)
+    # header: id, flags=0x0100 (recursion desired), 1 question, 0 answers/etc.
+    packet = qid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    for label in hostname.encode("ascii").split(b"."):
+        packet += bytes([len(label)]) + label
+    packet += b"\x00\x00\x01\x00\x01"  # root, qtype=A, qclass=IN
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(4)
+            s.sendto(packet, (server, 53))
+            resp = s.recv(512)
+    except OSError:
+        return None
+    if len(resp) < 12 or resp[:2] != qid:
+        return None
+    rcode = resp[3] & 0x0F
+    ancount = int.from_bytes(resp[6:8], "big")
+    return rcode == 0 and ancount > 0
+
+
+def wait_for_dns(hostname, timeout=60):
+    """Wait until `hostname` resolves publicly. Quick-tunnel hostnames are
+    minted seconds before use, and a resolver that looks one up too early
+    caches the miss -- observed in practice: a Fios gateway holding NXDOMAIN
+    for the zone's 30-minute negative TTL, which kills the tunnel URL on every
+    device using that router. So don't advertise a URL/QR until the name is
+    actually live. Queries 1.1.1.1 directly, which neither consults nor primes
+    the local resolver."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = _dns_query_direct(hostname)
+        if result:
+            return True
+        if result is None:
+            # Can't reach an outside resolver (e.g. UDP/53 egress blocked):
+            # we have no signal either way, so don't sit on the URL for the
+            # full timeout -- hand it over unverified.
+            return True
+        time.sleep(2)
+    return False
 
 
 def qr_svg(url):

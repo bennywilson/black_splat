@@ -39,13 +39,21 @@ def start_server(directory, port):
 
 
 def show_qr(url):
-    banner = "=" * 60
-    print(f"\n{banner}\n  Open on your phone (HTTPS -> WebGPU works):\n  {url}\n{banner}\n")
-    # The web launcher renders its own (scannable) QR image on the dashboard, so
-    # it sets LAUNCHER_QR=0 to suppress the terminal QR -- whose ANSI colour
-    # blocks would just be garbled noise in a browser <pre>.
+    # The web launcher renders its own (scannable) QR image on the dashboard --
+    # and does its own DNS-liveness wait -- so it sets LAUNCHER_QR=0 to suppress
+    # the terminal QR, whose ANSI colour blocks would just be garbled noise in a
+    # browser <pre>.
     if os.environ.get("LAUNCHER_QR", "1") == "0":
         return
+    # Don't invite a scan until the hostname is live: a resolver that looks it
+    # up too early caches the miss (some routers hold NXDOMAIN for 30 minutes).
+    from build import wait_for_dns
+    host = url.removeprefix("https://")
+    print(f"waiting for {host} to resolve publicly ...", flush=True)
+    if not wait_for_dns(host):
+        print("warning: hostname still not resolving after 60s -- it may not work yet.", flush=True)
+    banner = "=" * 60
+    print(f"\n{banner}\n  Open on your phone (HTTPS -> WebGPU works):\n  {url}\n{banner}\n")
     npx = shutil.which("npx")
     if not npx:
         print("(install Node for a scannable QR, or just type the URL above)\n")
