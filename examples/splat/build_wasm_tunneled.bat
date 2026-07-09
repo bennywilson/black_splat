@@ -9,9 +9,10 @@ if errorlevel 1 ( echo wasm-bindgen failed & pause & exit /b 1 )
 
 powershell cp index.html target/wasm32-unknown-unknown/release
 
-rem The .ply is fetched at runtime from /rust_assets/ in the browser build.
+rem The .ply and .glb are fetched at runtime from /rust_assets/ in the browser build.
 if not exist target\wasm32-unknown-unknown\release\rust_assets mkdir target\wasm32-unknown-unknown\release\rust_assets
 powershell cp game_assets/splats/*.ply target/wasm32-unknown-unknown/release/rust_assets
+powershell cp game_assets/models/*.glb target/wasm32-unknown-unknown/release/rust_assets
 
 python3 ..\serve_tunnel.py target/wasm32-unknown-unknown/release
 pause

@@ -493,12 +493,15 @@ impl AssetManager {
             {
                 let path = Path::new(&file_path);
                 let file_name = path.file_name().unwrap().to_str().unwrap();
-                log!(
-                    "Path returned {} {}",
-                    file_name,
-                    self.file_to_byte_buffer.len()
-                );
-                let byte_buffer = self.file_to_byte_buffer.get(file_name).unwrap().clone(); // cloning here.
+                // Prefer bytes baked in at build time (include_bytes! above,
+                // gated by the wasm_include_* features). Models a build didn't
+                // compile in -- e.g. ones the editor loads at runtime -- are
+                // fetched from /rust_assets/ instead, the same place the splat
+                // .ply files are served from.
+                let byte_buffer = match self.file_to_byte_buffer.get(file_name) {
+                    Some(buffer) => buffer.clone(),
+                    None => load_binary(file_path).await.unwrap(),
+                };
                 Model::from_bytes(&byte_buffer, device_resource, self, use_holes).await
             }
         };

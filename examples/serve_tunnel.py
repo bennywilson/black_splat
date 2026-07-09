@@ -10,7 +10,8 @@ real HTTPS, which satisfies the secure-context requirement.  (The 2D/3D demos
 use WebGL2 and work over plain LAN http via serve.py, so they don't need this.)
 
 Requires cloudflared (`scoop install cloudflared`).  QR rendering uses
-`npx qrcode-terminal` when Node is available; otherwise it just prints the URL.
+`npx qrcode --small` (node-qrcode) when Node is available; otherwise it just
+prints the URL.
 
 Usage: python3 serve_tunnel.py <directory> [port]
 """
@@ -44,11 +45,13 @@ def show_qr(url):
         print("(install Node for a scannable QR, or just type the URL above)\n")
         return
     try:
+        # `--small` renders the QR with half-height blocks -- about half the
+        # rows (and narrower) than the default, so it fits a normal terminal.
         if sys.platform == "win32":
             # shell=True so Windows resolves npx.cmd; quote the URL as one arg.
-            subprocess.run(f'npx --yes qrcode-terminal "{url}"', shell=True, check=False)
+            subprocess.run(f'npx --yes qrcode --small "{url}"', shell=True, check=False)
         else:
-            subprocess.run([npx, "--yes", "qrcode-terminal", url], check=False)
+            subprocess.run([npx, "--yes", "qrcode", "--small", url], check=False)
     except Exception:
         pass
 

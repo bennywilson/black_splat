@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use cgmath::InnerSpace;
 
 use black_splat::{
-    egui, config::*, engine::*, game_object::*, input::*, renderer::*, utils::*,
-    log, passes::gaussian_splat::SplatParams,
+    egui, assets::*, config::*, engine::*, fly_camera::*, game_object::*, input::*, renderer::*,
+    touch_pads::*, utils::*, log, passes::gaussian_splat::SplatParams,
 };
 
 // Splat clouds the demo preloads and cycles between with [Space].  Missing files
@@ -15,37 +15,21 @@ const SPLAT_PLY_PATHS: &[&str] = &[
     "game_assets/splats/opera.ply",
 ];
 
-const CAMERA_MOVE_RATE: f32 = 1.0;
-const CAMERA_ROTATION_RATE: f32 = 30.0;
+// Models the editor's "Add" menu can drop into the scene, as (display name,
+// path) pairs.  These are preloaded in initialize_world -- model loading is
+// async and the frame tick isn't -- so the menu can instance them synchronously.
+const MODEL_PALETTE: &[(&str, &str)] = &[
+    ("Barrel", "game_assets/models/barrel.glb"),
+    ("Shotgun", "game_assets/models/shotgun.glb"),
+];
+
+// How far in front of the camera a newly added game object is dropped.
+const ADD_OBJECT_DISTANCE: f32 = 5.0;
+
+// Keyboard/mouse fly-camera movement and look come from the shared FlyCamera and
+// the on-screen touch pads from the shared TouchPads (black_splat::fly_camera /
+// ::touch_pads), whose defaults already match this viewer's feel.
 const PARAM_RATE: f32 = 1.5;
-
-// On-screen touch pads (drawn with egui, fed by raw touches so both work at
-// once): left pad = move, right pad = look.  Sizes are fractions of the
-// shorter screen axis, in egui points, so they scale with any resolution.
-const PAD_RADIUS_FRAC: f32 = 0.16;
-const PAD_MARGIN_FRAC: f32 = 0.05;
-// Fraction of the pad radius that counts as full deflection.
-const PAD_SPAN_FRAC: f32 = 0.75;
-const PAD_DEAD_ZONE: f32 = 0.12;
-const PAD_LOOK_RATE: f32 = 70.0; // degrees/sec at full deflection
-
-// Right-click + drag look: camera degrees turned per pixel of mouse movement.
-const MOUSE_LOOK_SENS: f32 = 0.18;
-
-
-/// Deflection of one touch pad: finger offset from the pad center, saturating
-/// at `span` and zeroed inside the dead zone.
-fn pad_deflection(finger: egui::Pos2, center: egui::Pos2, span: f32) -> egui::Vec2 {
-    let mut defl = (finger - center) / span;
-    let len = defl.length();
-    if len < PAD_DEAD_ZONE {
-        return egui::Vec2::ZERO;
-    }
-    if len > 1.0 {
-        defl /= len;
-    }
-    defl
-}
 
 /// Draws the "Editor | Game" mode switch and applies clicks to `editor_mode`.
 /// Always shown (in both modes) so it's the way back from game mode -- important
@@ -86,10 +70,27 @@ enum PickerState {
 const STATUS_RED: CgVec4 = CgVec4::new(1.0, 0.25, 0.2, 1.0);
 const STATUS_WHITE: CgVec4 = CgVec4::new(1.0, 1.0, 1.0, 1.0);
 
+/// A model-backed game object the editor placed in the scene.  Owns its
+/// renderable `Actor` (transform + model) and the display name shown in the
+/// outliner.
+struct SceneObject {
+    name: String,
+    actor: Actor,
+}
+
 pub struct SplatGame {
     game_objects: Vec<GameObject>,
     game_camera: Camera,
     splat_params: SplatParams,
+    // Models the "Add" menu can instance, loaded once in initialize_world.
+    // Aligned with MODEL_PALETTE.
+    model_palette: Vec<(String, ModelHandle)>,
+    // Game objects the editor has placed, listed in the outliner.
+    scene_objects: Vec<SceneObject>,
+    // Outliner selection: index into `scene_objects`, if any.
+    selected_object: Option<usize>,
+    // Monotonic counter so added objects get unique default names.
+    next_object_num: u32,
     // Display names of the clouds that actually loaded, aligned with the
     // renderer's splat indices; `active_splat` is the one being shown.
     splat_names: Vec<String>,
@@ -103,12 +104,12 @@ pub struct SplatGame {
     // Transient bottom-center message (load errors, clamp warnings) and its
     // remaining time on screen.
     status: Option<(String, CgVec4, f32)>,
-    // The move/look pads draw once the first touch proves this is a touch
-    // device (there's no reliable "has touchscreen" query through winit).
-    touch_pads_visible: bool,
-    // True while the right button is held for mouse look.  Drives grabbing +
-    // hiding the cursor on the first frame and restoring it once on release.
-    looking: bool,
+    // On-screen move/look thumb-pads for touch.  Set to reveal on the first
+    // touch so desktop mouse users never see them.
+    touch_pads: TouchPads,
+    // Shared keyboard/mouse fly-camera controller (WASD + arrow/mouse look).
+    // Its defaults match this viewer; touch is handled separately below.
+    fly_camera: FlyCamera,
     // Editor vs game mode.  Editor: the full menu bar + debug overlay are always
     // shown.  Game: only the small mode switch remains, for an unobstructed view.
     editor_mode: bool,
@@ -152,6 +153,44 @@ impl SplatGame {
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn(move || pollster::block_on(pick));
     }
+
+    /// Drops a fresh instance of palette model `palette_index` into the scene a
+    /// few units ahead of the camera, registers it with the renderer, and
+    /// selects it in the outliner.
+    fn add_model_object(&mut self, palette_index: usize, renderer: &mut Renderer) {
+        let (model_name, model_handle) = match self.model_palette.get(palette_index) {
+            Some((name, handle)) => (name.clone(), *handle),
+            None => return,
+        };
+
+        let (_view, view_dir, _right) = self.game_camera.calculate_view_matrix();
+        let spawn_pos = self.game_camera.get_position() + view_dir * ADD_OBJECT_DISTANCE;
+
+        let mut actor = Actor::new();
+        actor.set_model(&model_handle);
+        actor.set_position(&spawn_pos);
+        renderer.add_or_update_actor(&actor);
+
+        let name = format!("{model_name} {}", self.next_object_num);
+        self.next_object_num += 1;
+        self.scene_objects.push(SceneObject { name, actor });
+        self.selected_object = Some(self.scene_objects.len() - 1);
+    }
+
+    /// Removes the scene object at `index` from both the scene list and the
+    /// renderer, keeping the outliner selection valid.
+    fn delete_scene_object(&mut self, index: usize, renderer: &mut Renderer) {
+        if index >= self.scene_objects.len() {
+            return;
+        }
+        let object = self.scene_objects.remove(index);
+        renderer.remove_actor(&object.actor);
+        self.selected_object = match self.selected_object {
+            Some(sel) if sel == index => None,
+            Some(sel) if sel > index => Some(sel - 1),
+            other => other,
+        };
+    }
 }
 
 impl GameEngine for SplatGame {
@@ -172,11 +211,20 @@ impl GameEngine for SplatGame {
             },
             splat_names: Vec::new(),
             active_splat: 0,
+            model_palette: Vec::new(),
+            scene_objects: Vec::new(),
+            selected_object: None,
+            next_object_num: 1,
             picked_ply: Arc::new(Mutex::new(None)),
             picker_state: Arc::new(Mutex::new(PickerState::Idle)),
             status: None,
-            touch_pads_visible: false,
-            looking: false,
+            touch_pads: {
+                // Desktop viewer: keep the pads hidden until a touch appears.
+                let mut pads = TouchPads::default();
+                pads.reveal_on_touch = true;
+                pads
+            },
+            fly_camera: FlyCamera::default(),
             editor_mode: true,
         }
     }
@@ -205,6 +253,13 @@ impl GameEngine for SplatGame {
         renderer.set_active_gaussian_splat(0);
         renderer.set_tonemap_enabled(true);
 
+        // Preload the models the editor's "Add" menu can instance.  Done here
+        // (async) so placing them from the frame tick is a synchronous clone.
+        for (name, path) in MODEL_PALETTE {
+            let handle = renderer.load_model(path, false).await;
+            self.model_palette.push((name.to_string(), handle));
+        }
+
         // Help is reachable from the menu bar's Help button, so drop the
         // engine's "Press [H]..." hint line.
         renderer.set_show_help_hint(false);
@@ -223,61 +278,19 @@ impl GameEngine for SplatGame {
         game_config: &Config,
     ) {
         let delta_time = game_config.delta_time;
-        let (_view, view_dir, right_dir) = self.game_camera.calculate_view_matrix();
-        let forward_dir = CgVec3::new(view_dir.x, view_dir.y, view_dir.z).normalize();
+        // Forward/right basis for the touch pads below (keyboard movement uses
+        // the fly camera directly).
+        let (forward_dir, right_dir) = self.fly_camera.basis(&self.game_camera);
 
-        // Movement (keyboard)
-        let mut move_vec = CG_VEC3_ZERO;
-        if input_manager.get_key_state("w").is_down() {
-            move_vec += forward_dir;
-        }
-        if input_manager.get_key_state("s").is_down() {
-            move_vec += -forward_dir;
-        }
-        if input_manager.get_key_state("d").is_down() {
-            move_vec += right_dir;
-        }
-        if input_manager.get_key_state("a").is_down() {
-            move_vec += -right_dir;
-        }
-        let sprint = input_manager.get_key_state("left_shift").is_down();
-
-        // Look (keyboard)
+        // Movement + look (keyboard + right-drag mouse) come from the shared fly
+        // camera.  The touch pads further add to `move_vec` / `camera_rot` before
+        // they're committed below; pitch is clamped once, after every source.
+        let mut move_vec = self.fly_camera.wasd_direction(&self.game_camera, input_manager);
         let mut camera_rot = self.game_camera.get_rotation();
-        let rot_amount = delta_time * CAMERA_ROTATION_RATE;
-        if input_manager.get_key_state("left_arrow").is_down() {
-            camera_rot.x += rot_amount;
-        }
-        if input_manager.get_key_state("right_arrow").is_down() {
-            camera_rot.x -= rot_amount;
-        }
-        if input_manager.get_key_state("up_arrow").is_down() {
-            camera_rot.y -= rot_amount;
-        }
-        if input_manager.get_key_state("down_arrow").is_down() {
-            camera_rot.y += rot_amount;
-        }
-
-        // Look (mouse): hold the right button to look.  While held the cursor
-        // is hidden and grabbed to the window so it can't slide off-screen, and
-        // the camera turns from RAW mouse motion -- position-independent, so you
-        // can sweep as far as you like without the pointer hitting an edge.
-        // Matches the touch look pad: move right = look right, move up = look up.
-        let rmb = input_manager.get_key_state("mouse_right");
-        if rmb.is_down() || rmb.just_pressed() {
-            if !self.looking {
-                self.looking = true;
-                renderer.set_cursor_visible(false);
-                renderer.set_cursor_grabbed(true);
-            }
-            let (dx, dy) = input_manager.get_mouse_raw_delta();
-            camera_rot.x -= dx as f32 * MOUSE_LOOK_SENS;
-            camera_rot.y += dy as f32 * MOUSE_LOOK_SENS;
-        } else if self.looking {
-            self.looking = false;
-            renderer.set_cursor_grabbed(false);
-            renderer.set_cursor_visible(true);
-        }
+        self.fly_camera
+            .apply_key_look(&mut camera_rot, input_manager, delta_time);
+        self.fly_camera
+            .apply_mouse_look(&mut camera_rot, input_manager, renderer);
 
         // --- GUI (egui, same on native + web) ---
         let ctx = renderer.egui_ctx().clone();
@@ -317,6 +330,14 @@ impl GameEngine for SplatGame {
         let mut do_load = false;
         let mut do_cycle = false;
         let mut params_changed = false;
+        // Editor actions collected from the menus / outliner this frame and
+        // applied after the egui pass (avoids borrowing self inside closures).
+        let mut do_save_scene = false;
+        let mut do_load_scene = false;
+        let mut add_model_index: Option<usize> = None;
+        let mut delete_object_index: Option<usize> = None;
+        let mut select_object: Option<Option<usize>> = None;
+        let mut select_splat: Option<usize> = None;
 
         // Editor vs game mode.  In editor mode the full bar is always shown --
         // the mode switch, File (open), Debug (scene cycle + future toggles),
@@ -342,7 +363,20 @@ impl GameEngine for SplatGame {
                         ui.separator();
                         ui.menu_button("File", |ui| {
                             // Buttons auto-close the menu on click.
+                            do_save_scene |= ui.button("Save Scene…").clicked();
+                            do_load_scene |= ui.button("Load Scene…").clicked();
+                            ui.separator();
                             do_load |= ui.button("Load .ply…").clicked();
+                        });
+                        ui.menu_button("Add", |ui| {
+                            if self.model_palette.is_empty() {
+                                ui.label("(no models loaded)");
+                            }
+                            for (i, (name, _)) in self.model_palette.iter().enumerate() {
+                                if ui.button(name).clicked() {
+                                    add_model_index = Some(i);
+                                }
+                            }
                         });
                         ui.menu_button("Debug", |ui| {
                             do_cycle |= ui.button("Next scene").clicked();
@@ -403,92 +437,99 @@ impl GameEngine for SplatGame {
         let bar_bottom_px = menu_bar.response.rect.bottom() * ctx.pixels_per_point();
         renderer.set_debug_text_top_offset(bar_bottom_px + 6.0);
 
-        // Touch pads.  egui's pointer only tracks one touch, so the pads read
-        // the engine's raw touch map -- move and look then work simultaneously
-        // -- and use egui purely as the painter.
-        let touch_map = input_manager.get_touch_map();
-        if !touch_map.is_empty() {
-            self.touch_pads_visible = true;
+        // Outliner: a right-anchored panel listing every game object in the
+        // scene -- the loaded splat clouds and the models the editor has placed.
+        // Editor mode only; game mode keeps the view unobstructed.  Drawn as an
+        // Area (same as the menu bar) so it sits over the 3D view.  Its widgets
+        // only set the local action flags above; they're applied after the egui
+        // pass so the closure never has to borrow `self`/`renderer` mutably.
+        const OUTLINER_WIDTH: f32 = 220.0;
+        if editor {
+            let top = menu_bar.response.rect.bottom();
+            egui::Area::new(egui::Id::new("outliner"))
+                .fixed_pos(egui::pos2(screen.right() - OUTLINER_WIDTH, top))
+                .constrain(true)
+                .show(&ctx, |ui| {
+                    egui::Frame::side_top_panel(ui.style()).show(ui, |ui| {
+                        ui.set_width(OUTLINER_WIDTH);
+                        ui.heading("Outliner");
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height((screen.bottom() - top - 40.0).max(80.0))
+                            .show(ui, |ui| {
+                                ui.set_width(OUTLINER_WIDTH);
+                                ui.label(egui::RichText::new("Splats").strong());
+                                if self.splat_names.is_empty() {
+                                    ui.label("(none)");
+                                }
+                                for (i, name) in self.splat_names.iter().enumerate() {
+                                    let is_active =
+                                        i == self.active_splat && self.selected_object.is_none();
+                                    if ui.selectable_label(is_active, name).clicked() {
+                                        select_splat = Some(i);
+                                    }
+                                }
+
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("Models").strong());
+                                if self.scene_objects.is_empty() {
+                                    ui.label("(none)");
+                                }
+                                for (i, object) in self.scene_objects.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let selected = self.selected_object == Some(i);
+                                        if ui.selectable_label(selected, &object.name).clicked() {
+                                            select_object = Some(Some(i));
+                                        }
+                                        if ui.small_button("✕").clicked() {
+                                            delete_object_index = Some(i);
+                                        }
+                                    });
+                                }
+                            });
+                    });
+                });
         }
-        if self.touch_pads_visible {
-            let ppp = ctx.pixels_per_point();
-            let min_axis = screen.width().min(screen.height());
-            let radius = min_axis * PAD_RADIUS_FRAC;
-            let margin = min_axis * PAD_MARGIN_FRAC;
-            let span = radius * PAD_SPAN_FRAC;
-            let move_center = egui::pos2(
-                screen.left() + margin + radius,
-                screen.bottom() - margin - radius,
-            );
-            let look_center = egui::pos2(
-                screen.right() - margin - radius,
-                screen.bottom() - margin - radius,
-            );
 
-            // A touch belongs to the pad it STARTED on, so a held drag can
-            // wander outside the circle without hopping pads.
-            let mut move_defl = egui::Vec2::ZERO;
-            let mut look_defl = egui::Vec2::ZERO;
-            for (_id, touch) in touch_map.iter() {
-                if !(touch.touch_state.is_down() || touch.touch_state.just_pressed()) {
-                    continue;
-                }
-                let start = egui::pos2(
-                    touch.start_pos.0 as f32 / ppp,
-                    touch.start_pos.1 as f32 / ppp,
-                );
-                let finger = egui::pos2(
-                    touch.current_pos.0 as f32 / ppp,
-                    touch.current_pos.1 as f32 / ppp,
-                );
-                if start.distance(move_center) <= radius {
-                    move_defl = pad_deflection(finger, move_center, span);
-                } else if start.distance(look_center) <= radius {
-                    look_defl = pad_deflection(finger, look_center, span);
-                }
+        // Apply the editor actions gathered from the menus / outliner.
+        if let Some(sel) = select_splat {
+            if sel < self.splat_names.len() {
+                self.active_splat = sel;
+                renderer.set_active_gaussian_splat(sel);
             }
-
-            // Left pad: drag right = strafe right, drag up = move forward.
-            // Right pad: drag right = look right, drag up = look up.
-            move_vec += right_dir * move_defl.x - forward_dir * move_defl.y;
-            camera_rot.x -= look_defl.x * PAD_LOOK_RATE * delta_time;
-            camera_rot.y += look_defl.y * PAD_LOOK_RATE * delta_time;
-
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("touch_pads"),
-            ));
-            for (center, defl) in [(move_center, move_defl), (look_center, look_defl)] {
-                painter.circle(
-                    center,
-                    radius,
-                    egui::Color32::from_rgba_unmultiplied(10, 23, 15, 110),
-                    egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(64, 160, 90, 150)),
-                );
-                painter.circle(
-                    center + defl * span,
-                    radius * 0.35,
-                    egui::Color32::from_rgba_unmultiplied(38, 115, 57, 200),
-                    egui::Stroke::new(
-                        2.0,
-                        egui::Color32::from_rgba_unmultiplied(120, 255, 145, 220),
-                    ),
-                );
-            }
+            self.selected_object = None;
         }
+        if let Some(sel) = select_object {
+            self.selected_object = sel;
+        }
+        if let Some(i) = add_model_index {
+            self.add_model_object(i, renderer);
+        }
+        if let Some(i) = delete_object_index {
+            self.delete_scene_object(i, renderer);
+        }
+        if do_save_scene {
+            self.status = Some(("Save Scene: not implemented yet".to_string(), STATUS_WHITE, 4.0));
+        }
+        if do_load_scene {
+            self.status = Some(("Load Scene: not implemented yet".to_string(), STATUS_WHITE, 4.0));
+        }
+
+        // On-screen move/look touch pads (shared TouchPads controller).  Left
+        // pad adds to movement, right pad turns the camera.
+        let pads = self.touch_pads.update(&ctx, input_manager, delta_time);
+        move_vec += right_dir * pads.move_deflection.x - forward_dir * pads.move_deflection.y;
+        camera_rot.x += pads.yaw_delta_deg;
+        camera_rot.y += pads.pitch_delta_deg;
 
         if move_vec.magnitude2() > 0.001 {
-            let speed = if sprint {
-                CAMERA_MOVE_RATE * 3.0
-            } else {
-                CAMERA_MOVE_RATE
-            };
+            let speed = self.fly_camera.move_speed(input_manager);
             let new_pos =
                 self.game_camera.get_position() + move_vec.normalize() * delta_time * speed;
             self.game_camera.set_position(&new_pos);
         }
 
-        camera_rot.y = camera_rot.y.clamp(-89.0, 89.0);
+        self.fly_camera.clamp_pitch(&mut camera_rot);
         self.game_camera.set_rotation(&camera_rot);
 
         // Cycle to the next loaded splat cloud ([Space] or the GUI button).

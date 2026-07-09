@@ -12,10 +12,12 @@ pub mod assets;
 pub mod collision;
 pub mod config;
 pub mod engine;
+pub mod fly_camera;
 pub mod game_object;
 pub mod input;
 pub mod renderer;
 pub mod resource;
+pub mod touch_pads;
 pub mod utils;
 pub mod passes {
     pub mod bullet_hole;
