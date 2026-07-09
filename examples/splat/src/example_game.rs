@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex};
 use cgmath::InnerSpace;
 
 use black_splat::{
-    egui, assets::*, config::*, editor::{self, GizmoMode, TransformGizmo}, engine::*,
+    egui, assets::*, config::*, editor::{self, TransformGizmo}, engine::*,
     fly_camera::*, game_object::*, input::*, renderer::*, touch_pads::*, utils::*, log,
     passes::gaussian_splat::SplatParams,
 };
+
+use crate::editor_config::{EditorConfig, GIZMO_ACTIONS};
 
 // Splat clouds the demo preloads and cycles between with [Space].  Missing files
 // are skipped at load, so the demo still runs with whatever is present.
@@ -119,6 +121,16 @@ pub struct SplatGame {
     name_edit_focus: bool,
     // Viewport translate/rotate/scale gizmo for the selected actor.
     gizmo: TransformGizmo,
+    // Persisted editor preferences (currently the gizmo hotkeys).  Loaded from
+    // disk at startup; re-saved whenever a binding changes.
+    editor_config: EditorConfig,
+    // Keybindings window (opened from the menu bar's Settings menu).
+    show_settings: bool,
+    // Which gizmo action (index into GIZMO_ACTIONS) is listening for its new
+    // key, if the user clicked a binding in the keybindings window.
+    rebinding: Option<usize>,
+    // Keybindings "reset to defaults" awaiting the confirmation modal.
+    confirm_reset: bool,
     // Which tab the right-hand editor panel shows; None keeps the panel
     // collapsed to just its tab strip.
     active_tab: Option<EditorTab>,
@@ -250,6 +262,10 @@ impl GameEngine for SplatGame {
             name_edit_buffer: String::new(),
             name_edit_focus: false,
             gizmo: TransformGizmo::default(),
+            editor_config: EditorConfig::load(),
+            show_settings: false,
+            rebinding: None,
+            confirm_reset: false,
             active_tab: None,
             resources_open: false,
             resources_height: 200.0,
@@ -456,6 +472,11 @@ impl GameEngine for SplatGame {
                                 params_changed = true;
                             }
                         });
+                        ui.menu_button("Settings", |ui| {
+                            if ui.button("Keybindings…").clicked() {
+                                self.show_settings = true;
+                            }
+                        });
                         // Top-level toggle (not a dropdown) for the help text.
                         if ui.button("Help").clicked() {
                             renderer.enable_help_text();
@@ -499,15 +520,16 @@ impl GameEngine for SplatGame {
                 .show(&ctx, |ui| {
                     egui::Frame::side_top_panel(ui.style()).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            for (mode, label) in [
-                                (GizmoMode::Translate, "Move"),
-                                (GizmoMode::Rotate, "Rotate"),
-                                (GizmoMode::Scale, "Scale"),
-                            ] {
-                                if ui.selectable_label(self.gizmo.mode == mode, label).clicked()
-                                {
-                                    self.gizmo.mode = mode;
+                            for (i, (mode, label)) in GIZMO_ACTIONS.iter().enumerate() {
+                                let resp =
+                                    ui.selectable_label(self.gizmo.mode == *mode, *label);
+                                if resp.clicked() {
+                                    self.gizmo.mode = *mode;
                                 }
+                                resp.on_hover_text(format!(
+                                    "Hotkey: {}",
+                                    self.editor_config.gizmo_keys[i].name()
+                                ));
                             }
                         });
                     });
@@ -816,6 +838,118 @@ impl GameEngine for SplatGame {
                     if modal.should_close() {
                         self.confirm_delete = None;
                     }
+                }
+            }
+        }
+
+        // Keybindings window (Settings > Keybindings…): one rebindable hotkey
+        // per gizmo mode, plus a reset-to-defaults that asks first.  A binding
+        // is picked by clicking it and pressing a key, captured from egui's
+        // event stream below.  Editor only; changes are saved to disk.
+        let mut rebound_this_frame = false;
+        if editor && self.show_settings {
+            let mut open = self.show_settings;
+            egui::Window::new("Keybindings")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(&ctx, |ui| {
+                    ui.label("Gizmo mode hotkeys (editor only):");
+                    ui.add_space(6.0);
+                    egui::Grid::new("keybindings_grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(12.0, 6.0))
+                        .show(ui, |ui| {
+                            for (i, (_mode, label)) in GIZMO_ACTIONS.iter().enumerate() {
+                                ui.label(*label);
+                                let listening = self.rebinding == Some(i);
+                                let text = if listening {
+                                    "press a key…".to_string()
+                                } else {
+                                    self.editor_config.gizmo_keys[i].name().to_string()
+                                };
+                                // Click to (re)bind; click again to cancel.
+                                if ui.selectable_label(listening, text).clicked() {
+                                    self.rebinding = if listening { None } else { Some(i) };
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset to Defaults").clicked() {
+                            self.confirm_reset = true;
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.label(egui::RichText::new("saved automatically").weak()),
+                        );
+                    });
+                });
+            self.show_settings = open;
+            // Closing the window abandons any half-finished rebind.
+            if !self.show_settings {
+                self.rebinding = None;
+            }
+
+            // Capture the next key press for a pending rebind (Esc cancels).
+            if let Some(slot) = self.rebinding {
+                let key = ctx.input(|input| {
+                    input.events.iter().find_map(|event| match event {
+                        egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                        _ => None,
+                    })
+                });
+                if let Some(key) = key {
+                    if key != egui::Key::Escape {
+                        self.editor_config.rebind(slot, key);
+                        self.editor_config.save();
+                        rebound_this_frame = true;
+                    }
+                    self.rebinding = None;
+                }
+            }
+        }
+
+        // Reset-to-defaults confirmation for the keybindings window.
+        if editor && self.confirm_reset {
+            let modal =
+                egui::Modal::new(egui::Id::new("confirm_reset_keybinds")).show(&ctx, |ui| {
+                    ui.label("Reset all keybindings to their defaults?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset").clicked() {
+                            self.editor_config = EditorConfig::default();
+                            self.editor_config.save();
+                            self.rebinding = None;
+                            self.confirm_reset = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_reset = false;
+                        }
+                    });
+                });
+            if modal.should_close() {
+                self.confirm_reset = false;
+            }
+        }
+
+        // Editor-only gizmo hotkeys (default W/E/R).  Read from egui so any key
+        // can be bound and typing in a field is naturally ignored; also
+        // suppressed while rebinding and during a right-drag flythrough, where
+        // W/A/S/D is driving the camera.
+        if editor
+            && self.rebinding.is_none()
+            && !rebound_this_frame
+            && !self.confirm_reset
+            && !ctx.egui_wants_keyboard_input()
+            && !input_manager.get_key_state("mouse_right").is_down()
+        {
+            for (i, (mode, _label)) in GIZMO_ACTIONS.iter().enumerate() {
+                if ctx.input(|input| input.key_pressed(self.editor_config.gizmo_keys[i])) {
+                    self.gizmo.mode = *mode;
                 }
             }
         }

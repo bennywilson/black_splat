@@ -1,5 +1,6 @@
 use black_splat::config::Config;
 
+mod editor_config;
 mod example_game;
 
 use example_game::SplatGame;
