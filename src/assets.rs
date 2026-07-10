@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path, result::Result::Ok};
 use wgpu::ShaderModule;
 
-use crate::{resource::*, log, make_handle, passes::model::*};
+use crate::{resource::*, log, make_handle, passes::model::*, utils::*};
 
 #[cfg(target_arch = "wasm32")]
 fn format_url(file_name: &str) -> reqwest::Url {
@@ -55,12 +55,52 @@ make_handle!(ShaderModule, ShaderHandle, ShaderAssetMappings);
 type ByteVec = Vec<u8>;
 make_handle!(ByteVec, ByteFileHandle, ByteMappings);
 make_handle!(Model, ModelHandle, ModelMappings);
+make_handle!(Material, MaterialHandle, MaterialMappings);
+
+/// How to build a [`Material`]: optional color/spec texture paths (a missing
+/// one falls back to the built-in 1x1 white) plus the constants each texture is
+/// multiplied by.  `spec_constant` is (rgb specular tint, a gloss 0..1).
+#[derive(Clone)]
+pub struct MaterialDesc {
+    pub color_texture: Option<String>,
+    pub spec_texture: Option<String>,
+    pub color_constant: CgVec4,
+    pub spec_constant: CgVec4,
+}
+
+impl Default for MaterialDesc {
+    fn default() -> Self {
+        MaterialDesc {
+            color_texture: None,
+            spec_texture: None,
+            color_constant: CG_VEC4_ONE,
+            spec_constant: CgVec4::new(0.0, 0.0, 0.0, 0.5),
+        }
+    }
+}
+
+/// A reusable surface description an actor can override its model's textures
+/// with: a color texture and a specular texture, each multiplied by a constant
+/// in the G-buffer shader (output = texture * constant).  The bind group is
+/// laid out identically to a model's texture bind group (0: color texture,
+/// 1: sampler, 2: second texture), so passes can bind either interchangeably.
+pub struct Material {
+    pub color_texture: TextureHandle,
+    pub spec_texture: TextureHandle,
+    pub color_constant: CgVec4,
+    pub spec_constant: CgVec4,
+    pub bind_group: wgpu::BindGroup,
+}
 
 #[allow(dead_code)]
 pub struct AssetManager {
     texture_mappings: TextureAssetMappings,
     shader_mappings: ShaderAssetMappings,
     model_mappings: ModelMappings,
+    material_mappings: MaterialMappings,
+    // Built-in 1x1 white texture backing material slots with no texture
+    // assigned (constant-only materials).  Created on first material load.
+    white_texture: Option<TextureHandle>,
 
     file_to_string_buffer: HashMap<String, String>,
     file_to_byte_buffer: HashMap<String, ByteVec>,
@@ -156,6 +196,26 @@ impl AssetManager {
         file_to_byte_buffer.insert(
             "lens_flare.png".to_string(),
             include_bytes!("../engine_assets/textures/lens_flare.png").to_vec(),
+        );
+        file_to_string_buffer.insert(
+            "gbuffer.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/gbuffer.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "light_skylight.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/light_skylight.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "light_directional.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/light_directional.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "light_point.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/light_point.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "light_spot.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/light_spot.wgsl").to_string(),
         );
 
         #[cfg(feature = "wasm_include_3d")]
@@ -277,6 +337,8 @@ impl AssetManager {
             texture_mappings: TextureAssetMappings::new(),
             shader_mappings: ShaderAssetMappings::new(),
             model_mappings: ModelMappings::new(),
+            material_mappings: MaterialMappings::new(),
+            white_texture: None,
 
             file_to_string_buffer,
             file_to_byte_buffer,
@@ -556,5 +618,169 @@ impl AssetManager {
             .collect();
         resources.sort_by(|a, b| a.0.cmp(&b.0));
         resources
+    }
+
+    /// The built-in 1x1 white texture (created on first use); backs material
+    /// slots that have no texture assigned, so constants pass through as-is.
+    async fn white_texture(
+        &mut self,
+        device_resources: &DeviceResources<'_>,
+    ) -> TextureHandle {
+        if let Some(handle) = self.white_texture {
+            return handle;
+        }
+        let texture = Texture::from_rgba(
+            &[255, 255, 255, 255],
+            true,
+            1,
+            1,
+            device_resources,
+            Some("white 1x1"),
+        )
+        .unwrap();
+        let mappings = &mut self.texture_mappings;
+        if !mappings.next_handle.is_valid() {
+            mappings.next_handle.index = 0;
+        }
+        let handle = mappings.next_handle;
+        mappings.next_handle.index += 1;
+        mappings.handles_to_assets.insert(handle, texture);
+        mappings
+            .names_to_handles
+            .insert("<white>".to_string(), handle);
+        self.white_texture = Some(handle);
+        handle
+    }
+
+    /// Registers a named material, loading its textures (see [`MaterialDesc`]).
+    /// Materials are keyed by name; loading a name again returns the existing
+    /// handle.  The bind group mirrors a model's texture bind group layout
+    /// (0: color texture, 1: sampler, 2: spec texture), so passes can bind a
+    /// material in place of the model's own textures.
+    pub async fn load_material(
+        &mut self,
+        name: &str,
+        desc: &MaterialDesc,
+        device_resources: &DeviceResources<'_>,
+    ) -> MaterialHandle {
+        if let Some(handle) = self.material_mappings.names_to_handles.get(name) {
+            return *handle;
+        }
+        log!("AssetManager loading material {name}");
+
+        let white = self.white_texture(device_resources).await;
+        let color_texture = match &desc.color_texture {
+            Some(path) => self.load_texture(path, device_resources).await,
+            None => white,
+        };
+        let spec_texture = match &desc.spec_texture {
+            Some(path) => self.load_texture(path, device_resources).await,
+            None => white,
+        };
+
+        let device = &device_resources.device;
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("Material::bind_group_layout"),
+        });
+        let color = self.get_texture(&color_texture);
+        let spec = self.get_texture(&spec_texture);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&color.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&color.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&spec.view),
+                },
+            ],
+            label: Some(&format!("Material::{name}")),
+        });
+
+        let material = Material {
+            color_texture,
+            spec_texture,
+            color_constant: desc.color_constant,
+            spec_constant: desc.spec_constant,
+            bind_group,
+        };
+
+        let mappings = &mut self.material_mappings;
+        if !mappings.next_handle.is_valid() {
+            mappings.next_handle.index = 0;
+        }
+        let new_handle = mappings.next_handle;
+        mappings.next_handle.index += 1;
+        mappings.handles_to_assets.insert(new_handle, material);
+        mappings
+            .names_to_handles
+            .insert(name.to_string(), new_handle);
+        new_handle
+    }
+
+    pub fn get_material(&self, handle: &MaterialHandle) -> Option<&Material> {
+        self.material_mappings.handles_to_assets.get(handle)
+    }
+
+    /// Every loaded material as (name, handle), sorted by name -- feeds the
+    /// editor's material dropdown.
+    pub fn get_material_resources(&self) -> Vec<(String, MaterialHandle)> {
+        let mut resources: Vec<(String, MaterialHandle)> = self
+            .material_mappings
+            .get_names_to_handles()
+            .iter()
+            .map(|(name, handle)| (name.clone(), *handle))
+            .collect();
+        resources.sort_by(|a, b| a.0.cmp(&b.0));
+        resources
+    }
+
+    /// Simultaneous access to the model map (mutable, for per-frame uniform
+    /// allocation) and the material map (read-only) -- the G-buffer pass needs
+    /// both while recording draws.
+    pub fn get_models_and_materials(
+        &mut self,
+    ) -> (
+        &mut HashMap<ModelHandle, Model>,
+        &HashMap<MaterialHandle, Material>,
+    ) {
+        (
+            &mut self.model_mappings.handles_to_assets,
+            &self.material_mappings.handles_to_assets,
+        )
     }
 }

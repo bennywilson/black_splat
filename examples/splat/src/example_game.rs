@@ -27,6 +27,11 @@ const PRELOADED_MODELS: &[&str] = &[
 // How far in front of the camera a newly added game object is dropped.
 const ADD_OBJECT_DISTANCE: f32 = 5.0;
 
+// Default skylight hemisphere colors: cool sky above, warm bounce below.
+// Used for the auto-added skylight in new scenes and Add > Light > Skylight.
+const SKYLIGHT_TOP: CgVec3 = CgVec3::new(0.55, 0.65, 0.85);
+const SKYLIGHT_BOTTOM: CgVec3 = CgVec3::new(0.28, 0.24, 0.2);
+
 // Keyboard/mouse fly-camera movement and look come from the shared FlyCamera and
 // the on-screen touch pads from the shared TouchPads (black_splat::fly_camera /
 // ::touch_pads), whose defaults already match this viewer's feel.
@@ -229,8 +234,27 @@ struct LightDto {
     #[serde(rename = "type", default)]
     light_type: u32, // LightType choice index
     color: [f32; 3],
+    // Skylight bottom-hemisphere color (`color` is the top).  Defaulted so
+    // scenes saved before lighting landed still load.
+    #[serde(default = "default_light_color2")]
+    color2: [f32; 3],
     intensity: f32,
+    #[serde(default = "default_light_range")]
+    range: f32,
+    #[serde(default = "default_light_spot_angle")]
+    spot_angle: f32,
     casts_shadow: bool,
+}
+
+// Serde defaults for lights in pre-lighting scene files (match Light::new).
+fn default_light_color2() -> [f32; 3] {
+    [0.25, 0.22, 0.2]
+}
+fn default_light_range() -> f32 {
+    10.0
+}
+fn default_light_spot_angle() -> f32 {
+    30.0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -297,13 +321,25 @@ impl SplatParamsDto {
 }
 
 /// The scene the editor opens when the user hasn't saved a startup scene of
-/// their own: just the church cloud, camera left at the config's start pose.
+/// their own: the church cloud plus the default skylight, camera left at the
+/// config's start pose.
 fn default_startup_scene() -> SceneFile {
     SceneFile {
         version: SCENE_FORMAT_VERSION,
         camera: None,
         actors: Vec::new(),
-        lights: Vec::new(),
+        lights: vec![LightDto {
+            name: "Skylight".to_string(),
+            position: [0.0, 5.0, 0.0],
+            rotation: ident_quat(),
+            light_type: LightType::Skylight.choice_index() as u32,
+            color: [SKYLIGHT_TOP.x, SKYLIGHT_TOP.y, SKYLIGHT_TOP.z],
+            color2: [SKYLIGHT_BOTTOM.x, SKYLIGHT_BOTTOM.y, SKYLIGHT_BOTTOM.z],
+            intensity: 1.0,
+            range: default_light_range(),
+            spot_angle: default_light_spot_angle(),
+            casts_shadow: false,
+        }],
         particles: Vec::new(),
         splats: vec![SplatDto {
             name: "church".to_string(),
@@ -408,6 +444,9 @@ fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>) {
         }
         if ui.button("Spot").clicked() {
             *add = Some(AddKind::Light(LightType::Spot));
+        }
+        if ui.button("Skylight").clicked() {
+            *add = Some(AddKind::Light(LightType::Skylight));
         }
     });
     ui.menu_button("Particle System", |ui| {
@@ -806,13 +845,32 @@ impl SplatGame {
         self.select_after_add(Selection::Actor(self.scene_actors.len() - 1));
     }
 
-    /// Drops a new light of the given type into the scene ahead of the camera.
-    fn add_light(&mut self, light_type: LightType) {
+    /// Drops a new light of the given type into the scene ahead of the camera
+    /// and mirrors it into the renderer's light map.
+    fn add_light(&mut self, light_type: LightType, renderer: &mut Renderer) {
         let mut light = Light::new();
         light.set_light_type(light_type);
         light.set_position(&self.spawn_point());
+        if light_type == LightType::Skylight {
+            // Hemisphere defaults: cool sky above, warm bounce below.
+            light.set_color(SKYLIGHT_TOP);
+            light.set_color2(SKYLIGHT_BOTTOM);
+        }
+        renderer.add_or_update_light(&light);
         self.scene_lights.push(light);
         self.select_after_add(Selection::Light(self.scene_lights.len() - 1));
+    }
+
+    /// The skylight every new scene starts with (deletable like any light).
+    fn add_default_skylight(&mut self, renderer: &mut Renderer) {
+        let mut light = Light::new();
+        light.set_name("Skylight");
+        light.set_light_type(LightType::Skylight);
+        light.set_position(&CgVec3::new(0.0, 5.0, 0.0));
+        light.set_color(SKYLIGHT_TOP);
+        light.set_color2(SKYLIGHT_BOTTOM);
+        renderer.add_or_update_light(&light);
+        self.scene_lights.push(light);
     }
 
     /// Spawns a particle system from a preset (see PARTICLE_PRESETS) at the given
@@ -882,7 +940,8 @@ impl SplatGame {
                 if i >= self.scene_lights.len() {
                     return;
                 }
-                self.scene_lights.remove(i);
+                let light = self.scene_lights.remove(i);
+                renderer.remove_light(&light);
             }
             Selection::Particle(i) => {
                 if i >= self.scene_particles.len() {
@@ -966,8 +1025,12 @@ impl SplatGame {
             let radius = 7.0;
 
             // Direction arrow for directional/spot lights, camera-scaled so it
-            // stays a constant on-screen size.
-            if !matches!(light.get_light_type(), LightType::Point) {
+            // stays a constant on-screen size.  Point lights and skylights are
+            // directionless.
+            if matches!(
+                light.get_light_type(),
+                LightType::Directional | LightType::Spot
+            ) {
                 let dist = (position - self.game_camera.get_position())
                     .magnitude()
                     .max(0.01);
@@ -1118,7 +1181,10 @@ impl SplatGame {
                     rotation: quat_arr(l.get_rotation()),
                     light_type: l.get_light_type().choice_index() as u32,
                     color: vec3_arr(l.get_color()),
+                    color2: vec3_arr(l.get_color2()),
                     intensity: l.get_intensity(),
+                    range: l.get_range(),
+                    spot_angle: l.get_spot_angle(),
                     casts_shadow: l.casts_shadow(),
                 })
                 .collect(),
@@ -1218,6 +1284,7 @@ impl SplatGame {
             renderer.remove_particle_actor(&particle.handle);
         }
         self.scene_lights.clear();
+        renderer.clear_lights();
         self.scene_splats.clear();
         renderer.clear_gaussian_splats();
         self.active_splat = 0;
@@ -1266,8 +1333,12 @@ impl SplatGame {
             light.set_rotation(&arr_quat(dto.rotation));
             light.set_light_type(LightType::from_choice_index(dto.light_type as usize));
             light.set_color(arr_vec3(dto.color));
+            light.set_color2(arr_vec3(dto.color2));
             light.set_intensity(dto.intensity);
+            light.set_range(dto.range);
+            light.set_spot_angle(dto.spot_angle);
             light.set_casts_shadow(dto.casts_shadow);
+            renderer.add_or_update_light(&light);
             self.scene_lights.push(light);
         }
 
@@ -1453,6 +1524,30 @@ impl GameEngine for SplatGame {
             renderer.load_model(path, false).await;
         }
 
+        // Starter materials for the Details panel's Material dropdown
+        // (constant-only: no texture means the built-in white, so the
+        // constants pass straight through).  Assigning one to an actor
+        // overrides its model's textures in the world G-buffer pass.
+        renderer.load_material("Matte", &MaterialDesc::default()).await;
+        renderer
+            .load_material(
+                "Plastic",
+                &MaterialDesc {
+                    spec_constant: CgVec4::new(0.5, 0.5, 0.5, 0.7),
+                    ..Default::default()
+                },
+            )
+            .await;
+        renderer
+            .load_material(
+                "Chrome",
+                &MaterialDesc {
+                    spec_constant: CgVec4::new(1.0, 1.0, 1.0, 0.9),
+                    ..Default::default()
+                },
+            )
+            .await;
+
         // Preload each particle preset's texture so "Add > Particle System" can
         // spawn one synchronously from the (non-async) frame tick.
         for preset in PARTICLE_PRESETS {
@@ -1608,6 +1703,9 @@ impl GameEngine for SplatGame {
             .into_iter()
             .map(|(path, handle)| (resource_display_name(&path), handle))
             .collect();
+        // Loaded materials for the Details panel's Material dropdown.
+        let material_resources: Vec<(String, MaterialHandle)> =
+            renderer.get_material_resources();
 
         // Editor vs game mode.  In editor mode the full bar is always shown --
         // the mode switch, File (open), Debug (scene cycle + future toggles),
@@ -1944,6 +2042,7 @@ impl GameEngine for SplatGame {
                                                         ("Directional", LightType::Directional),
                                                         ("Point", LightType::Point),
                                                         ("Spot", LightType::Spot),
+                                                        ("Skylight", LightType::Skylight),
                                                     ] {
                                                         if ui.button(label).clicked() {
                                                             do_add = Some(AddKind::Light(ty));
@@ -1995,6 +2094,7 @@ impl GameEngine for SplatGame {
                                                     ui,
                                                     actor,
                                                     &model_resources,
+                                                    &material_resources,
                                                     self.selected_resource,
                                                 );
                                             }
@@ -2005,6 +2105,7 @@ impl GameEngine for SplatGame {
                                                     ui,
                                                     light,
                                                     &model_resources,
+                                                    &material_resources,
                                                     self.selected_resource,
                                                 );
                                             }
@@ -2017,6 +2118,7 @@ impl GameEngine for SplatGame {
                                                     ui,
                                                     particle,
                                                     &model_resources,
+                                                    &material_resources,
                                                     self.selected_resource,
                                                 );
                                             }
@@ -2032,6 +2134,7 @@ impl GameEngine for SplatGame {
                                                     ui,
                                                     splat,
                                                     &model_resources,
+                                                    &material_resources,
                                                     self.selected_resource,
                                                 );
                                             }
@@ -2537,7 +2640,7 @@ impl GameEngine for SplatGame {
         if let Some(kind) = do_add {
             match kind {
                 AddKind::Actor => self.add_actor(renderer),
-                AddKind::Light(light_type) => self.add_light(light_type),
+                AddKind::Light(light_type) => self.add_light(light_type, renderer),
                 AddKind::Particle(preset) => self.add_particle(preset, renderer),
                 // Splats come from a file, so "Add > Gaussian Splat" opens the
                 // same .ply picker as the load button.
@@ -2560,18 +2663,24 @@ impl GameEngine for SplatGame {
                         renderer.update_particle_transform(&p.handle, &p.position, &Some(p.scale));
                     }
                 }
+                Some(Selection::Light(i)) => {
+                    if let Some(light) = self.scene_lights.get(i) {
+                        renderer.add_or_update_light(light);
+                    }
+                }
                 Some(Selection::Splat(i)) => {
                     if let Some(splat) = self.scene_splats.get(i) {
                         renderer.set_gaussian_splat_params(&splat.params);
                         renderer.set_gaussian_splat_transform(&splat.transform);
                     }
                 }
-                // Lights are editor-only for now -- nothing to push.
                 _ => {}
             }
         }
         if do_new_scene {
             self.clear_scene(renderer);
+            // Every new scene starts with a skylight (deletable like any light).
+            self.add_default_skylight(renderer);
             self.status = Some(("New scene".to_string(), STATUS_WHITE, 3.0));
         }
         if do_set_startup {

@@ -336,6 +336,9 @@ pub struct Actor {
     custom_pass_handle: Option<usize>,
 
     model_handle: ModelHandle,
+    // Optional material override: when valid, the world G-buffer pass binds
+    // this material's textures/constants instead of the model's own textures.
+    material_handle: MaterialHandle,
 }
 
 // Editor markup: the fields the editor's Details panel shows and how each is
@@ -347,6 +350,7 @@ crate::editor_properties!(Actor {
     scale: vec3("Scale"),
     layer: choice("Scene Layer"),
     model_handle: model("Model"),
+    material_handle: material("Material"),
 });
 
 impl Default for Actor {
@@ -372,6 +376,7 @@ impl Actor {
             layer: SceneLayer::World,
             custom_pass_handle: None,
             model_handle: ModelHandle::make_invalid(),
+            material_handle: MaterialHandle::make_invalid(),
         }
     }
 
@@ -415,6 +420,14 @@ impl Actor {
         self.model_handle
     }
 
+    pub fn set_material(&mut self, new_material: &MaterialHandle) {
+        self.material_handle = *new_material;
+    }
+
+    pub fn get_material(&self) -> MaterialHandle {
+        self.material_handle
+    }
+
     pub fn set_layer(
         &mut self,
         new_layer: &SceneLayer,
@@ -449,22 +462,27 @@ impl Actor {
 static mut NEXT_LIGHT_ID: u32 = 0;
 
 /// The kind of light, selectable in the editor.  Directional and spot lights
-/// use the light's rotation as their direction; point lights are omnidirectional.
+/// use the light's rotation as their direction; point lights are
+/// omnidirectional.  A skylight is an ambient hemisphere: it lights every
+/// surface by blending its top color (`color`) and bottom color (`color2`)
+/// on the world normal's up-ness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LightType {
     Directional,
     Point,
     Spot,
+    Skylight,
 }
 
 impl crate::editor::EditorChoice for LightType {
-    const NAMES: &'static [&'static str] = &["Directional", "Point", "Spot"];
+    const NAMES: &'static [&'static str] = &["Directional", "Point", "Spot", "Skylight"];
 
     fn choice_index(&self) -> usize {
         match self {
             LightType::Directional => 0,
             LightType::Point => 1,
             LightType::Spot => 2,
+            LightType::Skylight => 3,
         }
     }
 
@@ -472,14 +490,17 @@ impl crate::editor::EditorChoice for LightType {
         match index {
             0 => LightType::Directional,
             2 => LightType::Spot,
+            3 => LightType::Skylight,
             _ => LightType::Point,
         }
     }
 }
 
-/// A scene light.  Purely editor data for now -- nothing samples it yet -- but
-/// it carries everything a lighting pass would need (type, color, intensity,
-/// shadow flag) plus a transform for its in-world editor icon and gizmo.
+/// A scene light, sampled by the deferred lighting pass (see
+/// `passes::deferred::LightingPass`).  `color2` is only used by skylights (the
+/// bottom hemisphere color); `range` only by point/spot lights; `spot_angle`
+/// (the cone's half-angle, degrees) only by spot lights.  No shadows yet --
+/// `casts_shadow` is carried for a future shadow pass.
 #[derive(Debug, Clone)]
 pub struct Light {
     pub id: u32,
@@ -488,7 +509,10 @@ pub struct Light {
     rotation: CgQuat,
     light_type: LightType,
     color: CgVec3,
+    color2: CgVec3,
     intensity: f32,
+    range: f32,
+    spot_angle: f32,
     casts_shadow: bool,
 }
 
@@ -499,7 +523,10 @@ crate::editor_properties!(Light {
     rotation: rotation("Rotation"),
     light_type: choice("Type"),
     color: color("Color"),
+    color2: color("Bottom Color"),
     intensity: float("Intensity"),
+    range: float("Range"),
+    spot_angle: float("Spot Angle"),
     casts_shadow: bool("Casts Shadow"),
 });
 
@@ -523,7 +550,10 @@ impl Light {
             rotation: CG_QUAT_IDENT,
             light_type: LightType::Point,
             color: CG_VEC3_ONE,
+            color2: CgVec3::new(0.25, 0.22, 0.2),
             intensity: 1.0,
+            range: 10.0,
+            spot_angle: 30.0,
             casts_shadow: true,
         }
     }
@@ -568,12 +598,45 @@ impl Light {
         self.color
     }
 
+    /// The skylight's bottom-hemisphere color (`color` is the top).
+    pub fn set_color2(&mut self, color: CgVec3) {
+        self.color2 = color;
+    }
+
+    pub fn get_color2(&self) -> CgVec3 {
+        self.color2
+    }
+
     pub fn set_intensity(&mut self, intensity: f32) {
         self.intensity = intensity;
     }
 
     pub fn get_intensity(&self) -> f32 {
         self.intensity
+    }
+
+    /// Point/spot falloff distance: no light beyond this range.
+    pub fn set_range(&mut self, range: f32) {
+        self.range = range;
+    }
+
+    pub fn get_range(&self) -> f32 {
+        self.range
+    }
+
+    /// Spot cone half-angle in degrees.
+    pub fn set_spot_angle(&mut self, degrees: f32) {
+        self.spot_angle = degrees;
+    }
+
+    pub fn get_spot_angle(&self) -> f32 {
+        self.spot_angle
+    }
+
+    /// The direction the light points (its rotated +Z axis), used by
+    /// directional and spot lights and the editor's icon arrow.
+    pub fn get_direction(&self) -> CgVec3 {
+        self.rotation * CgVec3::new(0.0, 0.0, 1.0)
     }
 
     pub fn set_casts_shadow(&mut self, casts_shadow: bool) {

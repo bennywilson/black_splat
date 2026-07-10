@@ -24,6 +24,7 @@ pub mod touch_pads;
 pub mod utils;
 pub mod passes {
     pub mod bullet_hole;
+    pub mod deferred;
     pub mod gaussian_splat;
     pub mod line;
     pub mod model;

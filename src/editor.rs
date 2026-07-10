@@ -6,7 +6,7 @@
 
 use cgmath::{InnerSpace, Rotation3};
 
-use crate::assets::ModelHandle;
+use crate::assets::{MaterialHandle, ModelHandle};
 use crate::config::Config;
 use crate::game_object::Camera;
 use crate::utils::{CgQuat, CgVec3, CgVec4};
@@ -34,6 +34,8 @@ pub trait PropertyVisitor {
     ) -> bool;
     /// A reference to a loaded model resource.
     fn edit_model(&mut self, name: &str, value: &mut ModelHandle) -> bool;
+    /// A reference to a loaded material resource.
+    fn edit_material(&mut self, name: &str, value: &mut MaterialHandle) -> bool;
 }
 
 /// Implemented (via `editor_properties!`) by types the editor can inspect.
@@ -116,6 +118,9 @@ macro_rules! editor_property {
     ($self:ident, $visitor:ident, $field:ident, model, $label:literal) => {
         $visitor.edit_model($label, &mut $self.$field)
     };
+    ($self:ident, $visitor:ident, $field:ident, material, $label:literal) => {
+        $visitor.edit_material($label, &mut $self.$field)
+    };
     ($self:ident, $visitor:ident, $field:ident, choice, $label:literal) => {{
         let mut index = $crate::editor::choice_index(&$self.$field);
         let names = $crate::editor::choice_names(&$self.$field);
@@ -129,19 +134,22 @@ macro_rules! editor_property {
 }
 
 /// Draws `object`'s marked-up properties into `ui` and returns true if any
-/// changed this frame.  `model_resources` are the (display name, handle) pairs
-/// offered by `model(...)` property dropdowns; `selected_resource` is the one
-/// currently picked in the editor's resource browser, if any, which the
-/// dropdown offers to apply with one click.
+/// changed this frame.  `model_resources` / `material_resources` are the
+/// (display name, handle) pairs offered by `model(...)` / `material(...)`
+/// property dropdowns; `selected_resource` is the model currently picked in
+/// the editor's resource browser, if any, which the model dropdown offers to
+/// apply with one click.
 pub fn draw_properties(
     ui: &mut egui::Ui,
     object: &mut dyn EditorInspect,
     model_resources: &[(String, ModelHandle)],
+    material_resources: &[(String, MaterialHandle)],
     selected_resource: Option<ModelHandle>,
 ) -> bool {
     object.inspect_properties(&mut EguiPropertyEditor {
         ui,
         model_resources,
+        material_resources,
         selected_resource,
     })
 }
@@ -150,6 +158,7 @@ pub fn draw_properties(
 struct EguiPropertyEditor<'a> {
     ui: &'a mut egui::Ui,
     model_resources: &'a [(String, ModelHandle)],
+    material_resources: &'a [(String, MaterialHandle)],
     selected_resource: Option<ModelHandle>,
 }
 
@@ -294,6 +303,33 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
                 }
             }
         });
+        changed
+    }
+
+    fn edit_material(&mut self, name: &str, value: &mut MaterialHandle) -> bool {
+        let Self {
+            ui,
+            material_resources,
+            ..
+        } = self;
+        let mut changed = false;
+        ui.label(name);
+        let selected = material_resources
+            .iter()
+            .find(|(_, handle)| handle == value)
+            .map_or("(none)", |(res_name, _)| res_name.as_str());
+        egui::ComboBox::from_id_salt(name)
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                changed |= ui
+                    .selectable_value(value, MaterialHandle::make_invalid(), "(none)")
+                    .changed();
+                for (res_name, res_handle) in material_resources.iter() {
+                    changed |= ui
+                        .selectable_value(value, *res_handle, res_name.as_str())
+                        .changed();
+                }
+            });
         changed
     }
 }

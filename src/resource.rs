@@ -237,6 +237,30 @@ impl Texture {
         width: u32,
         height: u32,
     ) -> Result<Self> {
+        // Always render the offscreen scene into an sRGB target so alpha
+        // blending happens in linear space (the hardware decodes/encodes).
+        // On native the surface is already sRGB so this is a no-op; on web
+        // Chrome's canvas is non-sRGB `Bgra8Unorm`, and without this the
+        // scene would blend in gamma space -- making stacked transparent
+        // splats composite far too dark.  The postprocess pass converts back
+        // to the (possibly non-sRGB) surface on present.
+        Self::new_render_texture_with_format(
+            device,
+            surface_config.format.add_srgb_suffix(),
+            width,
+            height,
+        )
+    }
+
+    /// A render target in an explicit format -- used for the G-buffer's
+    /// normal/specular attachments, which store data (not color) and so must
+    /// not be sRGB-encoded.
+    pub fn new_render_texture_with_format(
+        device: &Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Target"),
             size: wgpu::Extent3d {
@@ -247,14 +271,7 @@ impl Texture {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Always render the offscreen scene into an sRGB target so alpha
-            // blending happens in linear space (the hardware decodes/encodes).
-            // On native the surface is already sRGB so this is a no-op; on web
-            // Chrome's canvas is non-sRGB `Bgra8Unorm`, and without this the
-            // scene would blend in gamma space -- making stacked transparent
-            // splats composite far too dark.  The postprocess pass converts back
-            // to the (possibly non-sRGB) surface on present.
-            format: surface_config.format.add_srgb_suffix(),
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -457,6 +474,12 @@ pub struct RenderContext<'ctx, 'dev> {
     pub config: &'ctx crate::config::Config,
 }
 
+/// Formats of the G-buffer's normal and specular attachments.  Normals are
+/// packed `n * 0.5 + 0.5`; specular is (rgb tint, a gloss).  Rgba8Unorm keeps
+/// both renderable on every backend (no float-target extensions needed).
+pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub const GBUFFER_SPEC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
 #[allow(dead_code)]
 pub struct DeviceResources<'a> {
     pub surface: wgpu::Surface<'a>,
@@ -468,9 +491,33 @@ pub struct DeviceResources<'a> {
     pub instance_buffer: wgpu::Buffer,
     pub brush: TextBrush<FontRef<'a>>,
     pub render_textures: Vec<Texture>, // [0] is color, [1] is depth
+    // Deferred world G-buffer: [0] albedo (sRGB), [1] world normal, [2] specular.
+    // The world pass writes them; the lighting pass reads them (with the depth
+    // in render_textures[1]) and composites into render_textures[0].
+    pub gbuffer_textures: Vec<Texture>,
 }
 
 impl<'a> DeviceResources<'a> {
+    fn make_gbuffer_textures(
+        device: &Device,
+        surface_config: &SurfaceConfiguration,
+        width: u32,
+        height: u32,
+    ) -> Vec<Texture> {
+        vec![
+            Texture::new_render_texture(device, surface_config, width, height).unwrap(),
+            Texture::new_render_texture_with_format(
+                device,
+                GBUFFER_NORMAL_FORMAT,
+                width,
+                height,
+            )
+            .unwrap(),
+            Texture::new_render_texture_with_format(device, GBUFFER_SPEC_FORMAT, width, height)
+                .unwrap(),
+        ]
+    }
+
     pub fn resize(&mut self, game_config: &Config) {
         assert!(game_config.window_width > 0 && game_config.window_height > 0);
 
@@ -487,6 +534,8 @@ impl<'a> DeviceResources<'a> {
             Texture::new_depth_texture(&self.device, &self.surface_config, rw, rh).unwrap();
         self.render_textures[2] =
             Texture::new_render_texture(&self.device, &self.surface_config, rw, rh).unwrap();
+        self.gbuffer_textures =
+            Self::make_gbuffer_textures(&self.device, &self.surface_config, rw, rh);
     }
 
     pub async fn new(window: Arc<winit::window::Window>, game_config: &Config) -> Self {
@@ -595,6 +644,8 @@ impl<'a> DeviceResources<'a> {
             Texture::new_render_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(render_texture);
 
+        let gbuffer_textures = Self::make_gbuffer_textures(&device, &surface_config, rw, rh);
+
         log!("  Creating Font");
         let brush =
             BrushBuilder::using_font_bytes(include_bytes!("../engine_assets/fonts/bold.ttf"))
@@ -616,6 +667,7 @@ impl<'a> DeviceResources<'a> {
             instance_buffer,
             brush,
             render_textures,
+            gbuffer_textures,
         }
     }
 }

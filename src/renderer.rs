@@ -10,7 +10,7 @@ use crate::{
     utils::*,
     log,
     passes::{
-        bullet_hole::*, gaussian_splat::*, line::*, model::*,
+        bullet_hole::*, deferred::*, gaussian_splat::*, line::*, model::*,
         postprocess::*, sprite::*, sunbeam::*,
     },
     PERF_SCOPE,
@@ -25,6 +25,11 @@ pub struct Renderer<'a> {
     postprocess_pass: PostprocessPass,
     model_pass: ModelPass,
     model_with_holes_pass: ModelPass,
+    // Deferred world rendering: the G-buffer pass draws the World-layer actors
+    // (color/normal/specular), then the lighting pass accumulates light_map's
+    // lights onto the scene color target.
+    gbuffer_pass: GBufferPass,
+    lighting_pass: LightingPass,
     line_pass: LinePass,
     sunbeam_pass: SunbeamPass,
     // Built lazily on first load_gaussian_splat() call: its pipeline binds storage
@@ -56,6 +61,9 @@ pub struct Renderer<'a> {
 
     asset_manager: AssetManager,
     actor_map: HashMap<u32, Actor>,
+    // Scene lights mirrored from the game/editor (see add_or_update_light),
+    // consumed by the deferred lighting pass each frame.
+    light_map: HashMap<u32, Light>,
 
     particle_map: HashMap<ParticleHandle, ParticleActor>,
     next_particle_id: ParticleHandle,
@@ -136,6 +144,9 @@ impl<'a> Renderer<'a> {
         )
         .await;
 
+        let gbuffer_pass = GBufferPass::new(&device_resources, &mut asset_manager).await;
+        let lighting_pass = LightingPass::new(&device_resources, &mut asset_manager).await;
+
         let debug_lines = Vec::<Line>::new();
 
         let egui_ctx = egui::Context::default();
@@ -151,6 +162,8 @@ impl<'a> Renderer<'a> {
             custom_sprite_passes: vec![],
             model_pass,
             model_with_holes_pass,
+            gbuffer_pass,
+            lighting_pass,
             postprocess_pass,
             line_pass,
             sunbeam_pass,
@@ -170,6 +183,7 @@ impl<'a> Renderer<'a> {
 
             asset_manager,
             actor_map: HashMap::<u32, Actor>::new(),
+            light_map: HashMap::<u32, Light>::new(),
             particle_map: HashMap::<ParticleHandle, ParticleActor>::new(),
             next_particle_id: INVALID_PARTICLE_HANDLE,
             active_particles: 0,
@@ -572,9 +586,15 @@ impl<'a> Renderer<'a> {
             self.bullet_hole_actor_index = None;
         }
         {
-            PERF_SCOPE!("World Opaque");
-            self.model_pass
-                .render(&mut ctx, &SceneLayer::World, None, &self.actor_map);
+            // Deferred world: actors into the G-buffer, then one fullscreen
+            // pass per light composites them (and the clear color) onto the
+            // scene target.  Everything below renders forward on top.
+            PERF_SCOPE!("World GBuffer");
+            self.gbuffer_pass.render(&mut ctx, &self.actor_map);
+        }
+        {
+            PERF_SCOPE!("Deferred Lighting");
+            self.lighting_pass.render(&mut ctx, &self.light_map);
         }
         {
             PERF_SCOPE!("World With Holes");
@@ -730,6 +750,7 @@ impl<'a> Renderer<'a> {
         self.device_resources.resize(game_config);
         self.postprocess_pass
             .resize(&mut self.device_resources, &self.asset_manager);
+        self.lighting_pass.resize(&self.device_resources);
         self.sunbeam_pass.resize(&mut self.device_resources, &self.asset_manager)
     }
 
@@ -743,6 +764,21 @@ impl<'a> Renderer<'a> {
 
     pub fn remove_actor(&mut self, actor: &Actor) {
         self.actor_map.remove(&actor.id);
+    }
+
+    /// Mirrors a scene light into the renderer so the deferred lighting pass
+    /// samples it.  Call again after edits (same id updates in place).
+    pub fn add_or_update_light(&mut self, light: &Light) {
+        self.light_map.insert(light.id, light.clone());
+    }
+
+    pub fn remove_light(&mut self, light: &Light) {
+        self.light_map.remove(&light.id);
+    }
+
+    /// Removes every light (editor "New Scene" / scene load).
+    pub fn clear_lights(&mut self) {
+        self.light_map.clear();
     }
 
     pub async fn add_particle_actor(
@@ -847,6 +883,20 @@ impl<'a> Renderer<'a> {
     /// editor's resource list and model dropdowns.
     pub fn get_model_resources(&self) -> Vec<(String, ModelHandle)> {
         self.asset_manager.get_model_resources()
+    }
+
+    /// Registers a named material (textures + color/spec constants) actors can
+    /// reference; loading the same name again returns the existing handle.
+    pub async fn load_material(&mut self, name: &str, desc: &MaterialDesc) -> MaterialHandle {
+        self.asset_manager
+            .load_material(name, desc, &self.device_resources)
+            .await
+    }
+
+    /// Every loaded material as (name, handle), sorted by name -- feeds the
+    /// editor's material dropdown.
+    pub fn get_material_resources(&self) -> Vec<(String, MaterialHandle)> {
+        self.asset_manager.get_material_resources()
     }
 
     /// Loads a splat .ply and appends it as a selectable cloud.  Returns true if

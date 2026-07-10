@@ -21,6 +21,9 @@ pub struct ModelUniform {
     pub model_color: [f32; 4],
     pub custom_data_1: [f32; 4],
     pub sun_color: [f32; 4],
+    // Material specular constant: rgb tint, a gloss (0..1).  Appended last so
+    // shaders declaring the older, shorter struct still bind this buffer.
+    pub spec_color: [f32; 4],
 }
 pub const MAX_UNIFORMS: usize = 100;
 
