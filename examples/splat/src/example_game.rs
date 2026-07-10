@@ -2,9 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use cgmath::InnerSpace;
 
+use serde::{Deserialize, Serialize};
+
 use black_splat::{
-    egui, assets::*, config::*, editor::{self, TransformGizmo}, engine::*,
-    fly_camera::*, game_object::*, input::*, renderer::*, touch_pads::*, utils::*, log,
+    egui, assets::*, config::*, editor::{self, EditorChoice, TransformGizmo}, engine::*,
+    fly_camera::*, game_object::*, input::*, renderer::*, resource::SceneLayer, touch_pads::*,
+    utils::*, log,
     passes::gaussian_splat::SplatParams,
 };
 
@@ -12,11 +15,7 @@ use crate::editor_config::{EditorConfig, GIZMO_ACTIONS};
 
 // Splat clouds the demo preloads and cycles between with [Space].  Missing files
 // are skipped at load, so the demo still runs with whatever is present.
-const SPLAT_PLY_PATHS: &[&str] = &[
-    "game_assets/splats/church.ply",
-    "game_assets/splats/cabin.ply",
-    "game_assets/splats/opera.ply",
-];
+const SPLAT_PLY_PATHS: &[&str] = &["game_assets/splats/church.ply"];
 
 // Model resources preloaded for the editor (the Resources tab and the Details
 // panel's model dropdown).  Loaded in initialize_world -- model loading is
@@ -66,6 +65,7 @@ fn resource_display_name(path: &str) -> String {
 enum EditorTab {
     Scene,
     Details,
+    Settings,
 }
 
 /// The currently selected scene object.  The three lists (actors, lights,
@@ -76,6 +76,7 @@ enum Selection {
     Actor(usize),
     Light(usize),
     Particle(usize),
+    Splat(usize),
 }
 
 /// What the "Add" menu asked to create this frame (applied after the egui pass).
@@ -84,6 +85,131 @@ enum AddKind {
     Actor,
     Light(LightType),
     Particle(usize), // index into PARTICLE_PRESETS
+    Splat,           // opens the .ply picker
+}
+
+/// A loaded splat cloud as a scene object: a display name plus its own render
+/// params (shown in the Details panel when selected).  Index-aligned with the
+/// renderer's splat clouds.
+struct SceneSplat {
+    name: String,
+    params: SplatParams,
+    // World transform (editor gizmo): lets a cloud be dragged/rotated/scaled.
+    transform: ActorTransform,
+}
+
+/// Render params a freshly loaded splat cloud starts with (tuned for this
+/// viewer's clouds; each splat can then be tweaked in Details).
+fn default_splat_params() -> SplatParams {
+    SplatParams {
+        falloff: 4.65,
+        scale: 3.0,
+        contrast: 1.0,
+        max_sh_degree: 2.0,
+        overall_scale: 1.0,
+    }
+}
+
+// ---- Scene save/load (JSON) -------------------------------------------------
+// A flexible, human-readable snapshot of the editable scene.  Kept deliberately
+// decoupled from the engine types (plain arrays + names/indices) so the format
+// can evolve independently; bump SCENE_FORMAT_VERSION on breaking changes.
+
+const SCENE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct SceneFile {
+    version: u32,
+    camera: CameraDto,
+    #[serde(default)]
+    actors: Vec<ActorDto>,
+    #[serde(default)]
+    lights: Vec<LightDto>,
+    #[serde(default)]
+    particles: Vec<ParticleDto>,
+    #[serde(default)]
+    splats: Vec<SplatDto>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CameraDto {
+    position: [f32; 3],
+    rotation: [f32; 3],
+}
+
+#[derive(Serialize, Deserialize)]
+struct ActorDto {
+    name: String,
+    position: [f32; 3],
+    rotation: [f32; 4], // quaternion x, y, z, w
+    scale: [f32; 3],
+    #[serde(default)]
+    model: Option<String>, // resource display name, or none for an empty actor
+    #[serde(default)]
+    layer: u32, // SceneLayer choice index
+}
+
+#[derive(Serialize, Deserialize)]
+struct LightDto {
+    name: String,
+    position: [f32; 3],
+    rotation: [f32; 4],
+    #[serde(rename = "type", default)]
+    light_type: u32, // LightType choice index
+    color: [f32; 3],
+    intensity: f32,
+    casts_shadow: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ParticleDto {
+    name: String,
+    preset: String, // PARTICLE_PRESETS name
+    position: [f32; 3],
+    scale: [f32; 3],
+}
+
+#[derive(Serialize, Deserialize)]
+struct SplatDto {
+    name: String,
+    params: SplatParamsDto,
+    #[serde(default)]
+    position: [f32; 3],
+    #[serde(default = "ident_quat")]
+    rotation: [f32; 4],
+    #[serde(default = "ones3")]
+    scale: [f32; 3],
+}
+
+fn ident_quat() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+fn ones3() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+
+#[derive(Serialize, Deserialize)]
+struct SplatParamsDto {
+    falloff: f32,
+    scale: f32,
+    contrast: f32,
+    overall_scale: f32,
+    max_sh_degree: f32,
+}
+
+// Plain-array <-> cgmath conversions for the DTOs above.
+fn vec3_arr(v: CgVec3) -> [f32; 3] {
+    [v.x, v.y, v.z]
+}
+fn arr_vec3(a: [f32; 3]) -> CgVec3 {
+    CgVec3::new(a[0], a[1], a[2])
+}
+fn quat_arr(q: CgQuat) -> [f32; 4] {
+    [q.v.x, q.v.y, q.v.z, q.s]
+}
+fn arr_quat(a: [f32; 4]) -> CgQuat {
+    // cgmath's Quaternion::new is (w, xi, yj, zk); the array is (x, y, z, w).
+    CgQuat::new(a[3], a[0], a[1], a[2])
 }
 
 /// Built-in particle-system presets the Add menu offers.  Each preset's texture
@@ -172,6 +298,10 @@ fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>) {
             }
         }
     });
+    ui.separator();
+    if ui.button("Gaussian Splat…").clicked() {
+        *add = Some(AddKind::Splat);
+    }
 }
 
 /// A particle system placed in the scene.  The live emitter lives in the
@@ -181,6 +311,9 @@ fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>) {
 struct SceneParticle {
     name: String,
     handle: ParticleHandle,
+    // Which preset (PARTICLE_PRESETS) this was spawned from, so it can be
+    // recreated on scene load.
+    preset: String,
     position: CgVec3,
     scale: CgVec3,
 }
@@ -191,6 +324,28 @@ impl editor::EditorInspect for SceneParticle {
         changed |= visitor.edit_text("Name", &mut self.name);
         changed |= visitor.edit_vec3("Position", &mut self.position);
         changed |= visitor.edit_vec3("Scale", &mut self.scale);
+        changed
+    }
+}
+
+impl editor::EditorInspect for SceneSplat {
+    fn inspect_properties(&mut self, visitor: &mut dyn editor::PropertyVisitor) -> bool {
+        let mut changed = false;
+        // Transform (also draggable via the viewport gizmo).
+        changed |= visitor.edit_vec3("Position", &mut self.transform.position);
+        changed |= visitor.edit_rotation("Rotation", &mut self.transform.rotation);
+        // Uniform scale only (non-uniform cloud scale is only approximate).
+        let mut uniform = self.transform.scale.x;
+        if visitor.edit_float("Scale", &mut uniform) {
+            self.transform.scale = CgVec3::new(uniform, uniform, uniform);
+            changed = true;
+        }
+        // Render params.
+        changed |= visitor.edit_float("Falloff", &mut self.params.falloff);
+        changed |= visitor.edit_float("Splat Scale", &mut self.params.scale);
+        changed |= visitor.edit_float("Contrast", &mut self.params.contrast);
+        changed |= visitor.edit_float("Overall Scale", &mut self.params.overall_scale);
+        changed |= visitor.edit_float("SH Degree", &mut self.params.max_sh_degree);
         changed
     }
 }
@@ -310,7 +465,6 @@ const STATUS_WHITE: CgVec4 = CgVec4::new(1.0, 1.0, 1.0, 1.0);
 pub struct SplatGame {
     game_objects: Vec<GameObject>,
     game_camera: Camera,
-    splat_params: SplatParams,
     // Actors the editor has placed, listed in the Scene tab.  An actor
     // carries its own display name (see Actor's editor markup).
     scene_actors: Vec<Actor>,
@@ -345,7 +499,7 @@ pub struct SplatGame {
     // Persisted editor preferences (currently the gizmo hotkeys).  Loaded from
     // disk at startup; re-saved whenever a binding changes.
     editor_config: EditorConfig,
-    // Keybindings window (opened from the menu bar's Settings menu).
+    // Keybindings window (opened from the right-hand Settings tab).
     show_settings: bool,
     // Which gizmo action (index into GIZMO_ACTIONS) is listening for its new
     // key, if the user clicked a binding in the keybindings window.
@@ -361,9 +515,11 @@ pub struct SplatGame {
     resources_height: f32,
     // Monotonic counter so added objects get unique default names.
     next_object_num: u32,
-    // Display names of the clouds that actually loaded, aligned with the
-    // renderer's splat indices; `active_splat` is the one being shown.
-    splat_names: Vec<String>,
+    // Splat clouds that loaded, each carrying its own render params, aligned with
+    // the renderer's splat indices.  Selecting one (in the outliner or by picking
+    // empty space) shows its params in Details; `active_splat` is the one being
+    // shown (only one renders at a time).
+    scene_splats: Vec<SceneSplat>,
     active_splat: usize,
     // "Load .ply" plumbing.  The file dialog must run asynchronously (a browser
     // file input can't block the frame loop), so it drops its result here and
@@ -371,6 +527,9 @@ pub struct SplatGame {
     // stacking dialogs and reports read progress.
     picked_ply: Arc<Mutex<Option<(String, Vec<u8>)>>>,
     picker_state: Arc<Mutex<PickerState>>,
+    // "Load Scene" plumbing: the picked JSON file's bytes land here for a later
+    // tick to parse (the file dialog runs async, like the .ply picker).
+    picked_scene: Arc<Mutex<Option<Vec<u8>>>>,
     // Transient bottom-center message (load errors, clamp warnings) and its
     // remaining time on screen.
     status: Option<(String, CgVec4, f32)>,
@@ -430,10 +589,50 @@ impl SplatGame {
         self.game_camera.get_position() + view_dir * ADD_OBJECT_DISTANCE
     }
 
-    /// Selects `sel` and flips to the Details tab so it can be edited right away.
-    fn select_and_show_details(&mut self, sel: Selection) {
+    /// Selects a freshly added object, staying on whatever tab is open -- adding
+    /// from the Scene tab keeps you there, with the new object shown selected in
+    /// the outliner (and its gizmo/icon in the viewport).
+    fn select_after_add(&mut self, sel: Selection) {
         self.selected = Some(sel);
-        self.active_tab = Some(EditorTab::Details);
+    }
+
+    /// World position and an approximate radius of the selected object, used to
+    /// frame it (the [F] hotkey).  None if nothing is selected.
+    fn selected_focus(&self) -> Option<(CgVec3, f32)> {
+        fn radius_of(scale: CgVec3) -> f32 {
+            scale.x.abs().max(scale.y.abs()).max(scale.z.abs()).max(0.5)
+        }
+        match self.selected? {
+            Selection::Actor(i) => self
+                .scene_actors
+                .get(i)
+                .map(|a| (a.get_position(), radius_of(a.get_scale()))),
+            Selection::Light(i) => self.scene_lights.get(i).map(|l| (l.get_position(), 0.6)),
+            Selection::Particle(i) => self
+                .scene_particles
+                .get(i)
+                .map(|p| (p.position, radius_of(p.scale))),
+            // Frame a splat cloud at its transform origin (its true extent isn't
+            // known here, so use a generous default radius).
+            Selection::Splat(i) => self
+                .scene_splats
+                .get(i)
+                .map(|s| (s.transform.position, 4.0)),
+        }
+    }
+
+    /// Frames the selected object: dollies the camera along its current view
+    /// direction so the object sits centered at a comfortable distance, keeping
+    /// the current orientation.  No-op if nothing is selected.
+    fn frame_selected(&mut self) {
+        let Some((target, radius)) = self.selected_focus() else {
+            return;
+        };
+        let (_view, view_dir, _right) = self.game_camera.calculate_view_matrix();
+        let dir = view_dir.normalize();
+        // Pull back far enough for the object's radius to fit, with some margin.
+        let distance = (radius * 3.5 + 1.0).max(2.0);
+        self.game_camera.set_position(&(target - dir * distance));
     }
 
     /// Drops a fresh empty Actor into the scene ahead of the camera and selects
@@ -446,7 +645,7 @@ impl SplatGame {
 
         self.next_object_num += 1;
         self.scene_actors.push(actor);
-        self.select_and_show_details(Selection::Actor(self.scene_actors.len() - 1));
+        self.select_after_add(Selection::Actor(self.scene_actors.len() - 1));
     }
 
     /// Drops a new light of the given type into the scene ahead of the camera.
@@ -455,15 +654,20 @@ impl SplatGame {
         light.set_light_type(light_type);
         light.set_position(&self.spawn_point());
         self.scene_lights.push(light);
-        self.select_and_show_details(Selection::Light(self.scene_lights.len() - 1));
+        self.select_after_add(Selection::Light(self.scene_lights.len() - 1));
     }
 
-    /// Spawns a particle system from the given preset (see PARTICLE_PRESETS)
-    /// ahead of the camera, using the preloaded texture so no async is needed.
-    fn add_particle(&mut self, preset: usize, renderer: &mut Renderer) {
-        let Some(preset_name) = PARTICLE_PRESETS.get(preset) else {
-            return;
-        };
+    /// Spawns a particle system from a preset (see PARTICLE_PRESETS) at the given
+    /// transform, recording it as a scene object.  Uses the preloaded texture, so
+    /// no async is needed.  Returns false if that texture wasn't preloaded.
+    fn spawn_particle(
+        &mut self,
+        preset_name: &str,
+        name: String,
+        position: CgVec3,
+        scale: CgVec3,
+        renderer: &mut Renderer,
+    ) -> bool {
         let params = preset_particle_params(preset_name);
         let Some((_, texture)) = self
             .particle_textures
@@ -475,21 +679,34 @@ impl SplatGame {
                 STATUS_RED,
                 5.0,
             ));
-            return;
+            return false;
         };
         let texture = *texture;
-        let spawn_pos = self.spawn_point();
-        let transform = ActorTransform::from_position(spawn_pos);
+        let mut transform = ActorTransform::from_position(position);
+        transform.scale = scale;
         let handle = renderer.spawn_particle_actor(&transform, &params, &texture, true);
-
-        self.next_object_num += 1;
         self.scene_particles.push(SceneParticle {
-            name: format!("{preset_name} {}", self.next_object_num),
+            name,
             handle,
-            position: spawn_pos,
-            scale: CG_VEC3_ONE,
+            preset: preset_name.to_string(),
+            position,
+            scale,
         });
-        self.select_and_show_details(Selection::Particle(self.scene_particles.len() - 1));
+        true
+    }
+
+    /// Spawns a preset particle system ahead of the camera and selects it (Add
+    /// menu).
+    fn add_particle(&mut self, preset: usize, renderer: &mut Renderer) {
+        let Some(preset_name) = PARTICLE_PRESETS.get(preset).copied() else {
+            return;
+        };
+        self.next_object_num += 1;
+        let name = format!("{preset_name} {}", self.next_object_num);
+        let spawn_pos = self.spawn_point();
+        if self.spawn_particle(preset_name, name, spawn_pos, CG_VEC3_ONE, renderer) {
+            self.select_after_add(Selection::Particle(self.scene_particles.len() - 1));
+        }
     }
 
     /// Removes the selected object from its list and the renderer, keeping the
@@ -516,8 +733,22 @@ impl SplatGame {
                 let particle = self.scene_particles.remove(i);
                 renderer.remove_particle_actor(&particle.handle);
             }
+            // Splats have no delete button in the outliner, so this is never
+            // reached; unloading a cloud from the renderer isn't supported yet.
+            Selection::Splat(_) => return,
         }
         self.selected = selection_after_delete(self.selected, sel);
+    }
+
+    /// Makes splat `i` the rendered cloud and pushes its params to the renderer.
+    /// Selecting or cycling splats routes through here (only one renders).
+    fn activate_splat(&mut self, i: usize, renderer: &mut Renderer) {
+        if let Some(splat) = self.scene_splats.get(i) {
+            self.active_splat = i;
+            renderer.set_active_gaussian_splat(i);
+            renderer.set_gaussian_splat_params(&splat.params);
+            renderer.set_gaussian_splat_transform(&splat.transform);
+        }
     }
 
     /// Draws editor billboard icons for every light over the 3D view, and
@@ -616,6 +847,300 @@ impl SplatGame {
         }
         clicked
     }
+
+    /// Picks the front-most actor or particle whose on-screen footprint contains
+    /// `pointer` (viewport click-to-select).  Lights are picked via their icons
+    /// and splats as a fallback -- both handled by the caller -- so this only
+    /// covers the placed 3D objects.  None if the click missed them all.
+    fn pick_object(
+        &self,
+        ctx: &egui::Context,
+        config: &Config,
+        pointer: egui::Pos2,
+    ) -> Option<Selection> {
+        let (view, _dir, right) = self.game_camera.calculate_view_matrix();
+        let proj = cgmath::perspective(
+            cgmath::Deg(config.fov),
+            config.window_width as f32 / config.window_height as f32,
+            0.1,
+            10000.0,
+        );
+        let view_proj = proj * view;
+        let screen = ctx.content_rect();
+        let cam_pos = self.game_camera.get_position();
+        let project = |world: CgVec3| -> Option<egui::Pos2> {
+            let clip = view_proj * CgVec4::new(world.x, world.y, world.z, 1.0);
+            if clip.w < 0.01 {
+                return None; // Behind the camera.
+            }
+            Some(egui::pos2(
+                screen.left() + (clip.x / clip.w + 1.0) * 0.5 * screen.width(),
+                screen.top() + (1.0 - clip.y / clip.w) * 0.5 * screen.height(),
+            ))
+        };
+        // Minimum tap radius in points, so small/distant objects stay pickable
+        // (also finger-friendly on touch).
+        const MIN_PICK_PX: f32 = 16.0;
+        // On-screen radius of a world sphere of `radius` at `center`: project a
+        // point one radius to the side and measure the pixel gap.
+        let screen_radius = |center: CgVec3, c_screen: egui::Pos2, radius: f32| -> f32 {
+            project(center + right * radius)
+                .map_or(MIN_PICK_PX, |edge| edge.distance(c_screen))
+                .max(MIN_PICK_PX)
+        };
+        fn radius_of(scale: CgVec3) -> f32 {
+            scale.x.abs().max(scale.y.abs()).max(scale.z.abs()).max(0.5)
+        }
+
+        // Actors and particles as (selection, center, radius); the front-most
+        // (nearest camera) whose disc contains the pointer wins.
+        let candidates = self
+            .scene_actors
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (Selection::Actor(i), a.get_position(), radius_of(a.get_scale())))
+            .chain(
+                self.scene_particles
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (Selection::Particle(i), p.position, radius_of(p.scale))),
+            );
+        let mut best: Option<(Selection, f32)> = None;
+        for (sel, center, radius) in candidates {
+            let Some(c_screen) = project(center) else {
+                continue;
+            };
+            if pointer.distance(c_screen) <= screen_radius(center, c_screen, radius) {
+                let dist = (center - cam_pos).magnitude();
+                if best.map_or(true, |(_, d)| dist < d) {
+                    best = Some((sel, dist));
+                }
+            }
+        }
+        best.map(|(sel, _)| sel)
+    }
+
+    /// Snapshots the editable scene into the serializable form (see SceneFile).
+    /// `model_resources` maps model handles to the resource names stored in the
+    /// file (resolved back on load).
+    fn build_scene_file(&self, model_resources: &[(String, ModelHandle)]) -> SceneFile {
+        let model_name = |handle: ModelHandle| -> Option<String> {
+            model_resources
+                .iter()
+                .find(|(_, h)| *h == handle)
+                .map(|(name, _)| name.clone())
+        };
+        SceneFile {
+            version: SCENE_FORMAT_VERSION,
+            camera: CameraDto {
+                position: vec3_arr(self.game_camera.get_position()),
+                rotation: vec3_arr(self.game_camera.get_rotation()),
+            },
+            actors: self
+                .scene_actors
+                .iter()
+                .map(|a| ActorDto {
+                    name: a.get_name().to_string(),
+                    position: vec3_arr(a.get_position()),
+                    rotation: quat_arr(a.get_rotation()),
+                    scale: vec3_arr(a.get_scale()),
+                    model: model_name(a.get_model()),
+                    layer: a.get_layer().0.choice_index() as u32,
+                })
+                .collect(),
+            lights: self
+                .scene_lights
+                .iter()
+                .map(|l| LightDto {
+                    name: l.get_name().to_string(),
+                    position: vec3_arr(l.get_position()),
+                    rotation: quat_arr(l.get_rotation()),
+                    light_type: l.get_light_type().choice_index() as u32,
+                    color: vec3_arr(l.get_color()),
+                    intensity: l.get_intensity(),
+                    casts_shadow: l.casts_shadow(),
+                })
+                .collect(),
+            particles: self
+                .scene_particles
+                .iter()
+                .map(|p| ParticleDto {
+                    name: p.name.clone(),
+                    preset: p.preset.clone(),
+                    position: vec3_arr(p.position),
+                    scale: vec3_arr(p.scale),
+                })
+                .collect(),
+            splats: self
+                .scene_splats
+                .iter()
+                .map(|s| SplatDto {
+                    name: s.name.clone(),
+                    params: SplatParamsDto {
+                        falloff: s.params.falloff,
+                        scale: s.params.scale,
+                        contrast: s.params.contrast,
+                        overall_scale: s.params.overall_scale,
+                        max_sh_degree: s.params.max_sh_degree,
+                    },
+                    position: vec3_arr(s.transform.position),
+                    rotation: quat_arr(s.transform.rotation),
+                    scale: vec3_arr(s.transform.scale),
+                })
+                .collect(),
+        }
+    }
+
+    /// Serializes the scene to pretty JSON and writes it to a file the user
+    /// picks (async dialog; on wasm this downloads the file).
+    fn save_scene(&self, model_resources: &[(String, ModelHandle)]) {
+        let scene = self.build_scene_file(model_resources);
+        let json = match serde_json::to_string_pretty(&scene) {
+            Ok(json) => json,
+            Err(_) => return,
+        };
+        let task = async move {
+            let dialog = rfd::AsyncFileDialog::new().set_file_name("scene.json");
+            #[cfg(not(target_arch = "wasm32"))]
+            let dialog = dialog.add_filter("Scene", &["json"]);
+            if let Some(file) = dialog.save_file().await {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = std::fs::write(file.path(), json.as_bytes());
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = file.write(json.as_bytes()).await;
+                }
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(task);
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || pollster::block_on(task));
+    }
+
+    /// Opens the async file dialog to pick a scene .json; its bytes land in
+    /// `picked_scene` for a later tick to parse.
+    fn open_scene_picker(&self) {
+        let picked = self.picked_scene.clone();
+        let task = async move {
+            let dialog = rfd::AsyncFileDialog::new();
+            #[cfg(not(target_arch = "wasm32"))]
+            let dialog = dialog.add_filter("Scene", &["json"]);
+            if let Some(file) = dialog.pick_file().await {
+                let bytes = file.read().await;
+                *picked.lock().unwrap() = Some(bytes);
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(task);
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || pollster::block_on(task));
+    }
+
+    /// Replaces the current editable scene (actors / lights / particles) with the
+    /// one parsed from `bytes`, restores the camera, and applies saved splat
+    /// params to matching loaded clouds.  Splat clouds themselves aren't
+    /// recreated -- the .ply data isn't in the scene file.  Returns a short
+    /// summary on success.
+    fn load_scene_from_bytes(
+        &mut self,
+        bytes: &[u8],
+        model_resources: &[(String, ModelHandle)],
+        renderer: &mut Renderer,
+    ) -> Result<String, String> {
+        let scene: SceneFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+
+        // Clear the current editable scene from the renderer and our lists.
+        for actor in self.scene_actors.drain(..) {
+            renderer.remove_actor(&actor);
+        }
+        for particle in self.scene_particles.drain(..) {
+            renderer.remove_particle_actor(&particle.handle);
+        }
+        self.scene_lights.clear();
+        self.selected = None;
+        self.confirm_delete = None;
+        self.name_edit = None;
+
+        let model_handle = |name: &str| -> ModelHandle {
+            model_resources
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or_else(ModelHandle::make_invalid, |(_, h)| *h)
+        };
+        for dto in &scene.actors {
+            let mut actor = Actor::new();
+            actor.set_name(&dto.name);
+            actor.set_position(&arr_vec3(dto.position));
+            actor.set_rotation(&arr_quat(dto.rotation));
+            actor.set_scale(&arr_vec3(dto.scale));
+            if let Some(model) = &dto.model {
+                actor.set_model(&model_handle(model));
+            }
+            actor.set_layer(&SceneLayer::from_choice_index(dto.layer as usize), &None);
+            renderer.add_or_update_actor(&actor);
+            self.scene_actors.push(actor);
+        }
+
+        for dto in &scene.lights {
+            let mut light = Light::new();
+            light.set_name(&dto.name);
+            light.set_position(&arr_vec3(dto.position));
+            light.set_rotation(&arr_quat(dto.rotation));
+            light.set_light_type(LightType::from_choice_index(dto.light_type as usize));
+            light.set_color(arr_vec3(dto.color));
+            light.set_intensity(dto.intensity);
+            light.set_casts_shadow(dto.casts_shadow);
+            self.scene_lights.push(light);
+        }
+
+        for dto in &scene.particles {
+            self.spawn_particle(
+                &dto.preset,
+                dto.name.clone(),
+                arr_vec3(dto.position),
+                arr_vec3(dto.scale),
+                renderer,
+            );
+        }
+
+        // Apply saved params + transform to any loaded cloud with a matching name.
+        for dto in &scene.splats {
+            if let Some(splat) = self.scene_splats.iter_mut().find(|s| s.name == dto.name) {
+                splat.params = SplatParams {
+                    falloff: dto.params.falloff,
+                    scale: dto.params.scale,
+                    contrast: dto.params.contrast,
+                    max_sh_degree: dto.params.max_sh_degree,
+                    overall_scale: dto.params.overall_scale,
+                };
+                // Uniform scale only: use the first component for all axes.
+                let u = dto.scale[0];
+                splat.transform = ActorTransform::new(
+                    arr_vec3(dto.position),
+                    arr_quat(dto.rotation),
+                    CgVec3::new(u, u, u),
+                );
+            }
+        }
+        if !self.scene_splats.is_empty() {
+            let active = self.active_splat.min(self.scene_splats.len() - 1);
+            self.activate_splat(active, renderer);
+        }
+
+        self.game_camera.set_position(&arr_vec3(scene.camera.position));
+        self.game_camera.set_rotation(&arr_vec3(scene.camera.rotation));
+        renderer.set_camera(&self.game_camera);
+
+        Ok(format!(
+            "{} actors, {} lights, {} particles",
+            self.scene_actors.len(),
+            self.scene_lights.len(),
+            self.scene_particles.len(),
+        ))
+    }
 }
 
 impl GameEngine for SplatGame {
@@ -627,14 +1152,7 @@ impl GameEngine for SplatGame {
         Self {
             game_objects: Vec::new(),
             game_camera,
-            splat_params: SplatParams {
-                falloff: 4.65,
-                scale: 3.0,
-                contrast: 1.0,
-                max_sh_degree: 2.0,
-                overall_scale: 1.0,
-            },
-            splat_names: Vec::new(),
+            scene_splats: Vec::new(),
             active_splat: 0,
             scene_actors: Vec::new(),
             scene_lights: Vec::new(),
@@ -657,6 +1175,7 @@ impl GameEngine for SplatGame {
             next_object_num: 1,
             picked_ply: Arc::new(Mutex::new(None)),
             picker_state: Arc::new(Mutex::new(PickerState::Idle)),
+            picked_scene: Arc::new(Mutex::new(None)),
             status: None,
             touch_pads: {
                 // Desktop viewer: keep the pads hidden until a touch appears.
@@ -677,20 +1196,29 @@ impl GameEngine for SplatGame {
         log!("SplatGame::initialize_world()");
         game_config.clear_color = CgVec4::new(0.02, 0.02, 0.03, 1.0);
 
-        // Preload every available cloud; record the names that loaded so the
-        // cycle hotkey and HUD only reference real ones.
+        // Preload every available cloud; record the ones that loaded (each with
+        // its own default params) so the cycle hotkey and HUD only reference real
+        // ones.
         for path in SPLAT_PLY_PATHS {
-            if renderer.load_gaussian_splat(path, &self.splat_params).await {
+            if renderer.load_gaussian_splat(path, &default_splat_params()).await {
                 let name = path
                     .rsplit(['/', '\\'])
                     .next()
                     .unwrap_or(path)
                     .trim_end_matches(".ply")
                     .to_string();
-                self.splat_names.push(name);
+                self.scene_splats.push(SceneSplat {
+                    name,
+                    params: default_splat_params(),
+                    transform: ActorTransform::from_position(CG_VEC3_ZERO),
+                });
             }
         }
         renderer.set_active_gaussian_splat(0);
+        if let Some(splat) = self.scene_splats.first() {
+            renderer.set_gaussian_splat_params(&splat.params);
+            renderer.set_gaussian_splat_transform(&splat.transform);
+        }
         renderer.set_tonemap_enabled(true);
 
         // Preload the editor's model resources (Resources tab / the Details
@@ -771,16 +1299,14 @@ impl GameEngine for SplatGame {
 
         // Scene status shown on the right of the menu bar.
         let active_scene = self
-            .splat_names
+            .scene_splats
             .get(self.active_splat)
-            .cloned()
+            .map(|s| s.name.clone())
             .unwrap_or_else(|| "none".to_string());
-        let scene_total = self.splat_names.len().max(1);
+        let scene_total = self.scene_splats.len().max(1);
         let splat_count = renderer.active_gaussian_splat_count();
 
         let mut do_load = false;
-        let mut do_cycle = false;
-        let mut params_changed = false;
         // Editor actions collected from the menus / Scene tab this frame and
         // applied after the egui pass (avoids borrowing self inside closures).
         let mut do_save_scene = false;
@@ -788,7 +1314,6 @@ impl GameEngine for SplatGame {
         let mut do_add: Option<AddKind> = None;
         let mut delete_object: Option<Selection> = None;
         let mut select_object: Option<Selection> = None;
-        let mut select_splat: Option<usize> = None;
         // Local rename accumulators (one per outliner section), applied after the
         // egui pass so the lists aren't mutably borrowed while iterating.
         let mut rename_actors: Vec<(usize, String)> = Vec::new();
@@ -839,47 +1364,9 @@ impl GameEngine for SplatGame {
                         ui.menu_button("Add", |ui| {
                             add_menu_ui(ui, &mut do_add);
                         });
-                        ui.menu_button("Debug", |ui| {
-                            do_cycle |= ui.button("Next scene").clicked();
-                        });
-                        ui.menu_button("Splat", |ui| {
-                            // Sliders keep the menu open while dragged.
-                            ui.set_min_width(240.0);
-                            ui.spacing_mut().slider_width = 150.0;
-                            let p = &mut self.splat_params;
-                            params_changed |= ui
-                                .add(egui::Slider::new(&mut p.falloff, 0.01..=20.0).text("falloff"))
-                                .changed();
-                            params_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut p.scale, 0.1..=20.0).text("splat scale"),
-                                )
-                                .changed();
-                            params_changed |= ui
-                                .add(egui::Slider::new(&mut p.contrast, 0.1..=5.0).text("contrast"))
-                                .changed();
-                            params_changed |= ui
-                                .add(
-                                    egui::Slider::new(&mut p.overall_scale, 0.1..=10.0)
-                                        .text("overall scale"),
-                                )
-                                .changed();
-                            // The splat record carries 8 "rest" coefficients (degrees
-                            // 1+2), so 2 is the highest degree that changes anything.
-                            let mut sh = p.max_sh_degree as u32;
-                            if ui
-                                .add(egui::Slider::new(&mut sh, 0..=2).text("SH degree"))
-                                .changed()
-                            {
-                                p.max_sh_degree = sh as f32;
-                                params_changed = true;
-                            }
-                        });
-                        ui.menu_button("Settings", |ui| {
-                            if ui.button("Keybindings…").clicked() {
-                                self.show_settings = true;
-                            }
-                        });
+                        // Splat params live in the Details panel and camera /
+                        // keybindings in the right-hand Settings tab, so the old
+                        // Debug / Splat / Camera / Settings menus are gone.
                         // Top-level toggle (not a dropdown) for the help text.
                         if ui.button("Help").clicked() {
                             renderer.enable_help_text();
@@ -1011,11 +1498,11 @@ impl GameEngine for SplatGame {
                                         }
                                         let ui = &mut columns[1];
                                         ui.label(egui::RichText::new("Splats").strong());
-                                        if self.splat_names.is_empty() {
+                                        if self.scene_splats.is_empty() {
                                             ui.label("(none)");
                                         }
-                                        for name in &self.splat_names {
-                                            ui.label(name.as_str());
+                                        for splat in &self.scene_splats {
+                                            ui.label(splat.name.as_str());
                                         }
                                     });
                                 });
@@ -1058,6 +1545,7 @@ impl GameEngine for SplatGame {
                             for (tab, label) in [
                                 (EditorTab::Scene, "Scene"),
                                 (EditorTab::Details, "Details"),
+                                (EditorTab::Settings, "Settings"),
                             ] {
                                 let is_active = self.active_tab == Some(tab);
                                 if ui.selectable_label(is_active, label).clicked() {
@@ -1096,14 +1584,21 @@ impl GameEngine for SplatGame {
                                                 do_load = true;
                                             }
                                         });
-                                        if self.splat_names.is_empty() {
+                                        if self.scene_splats.is_empty() {
                                             ui.label("(none)");
                                         }
-                                        for (i, name) in self.splat_names.iter().enumerate() {
-                                            let is_active = i == self.active_splat
-                                                && self.selected.is_none();
-                                            if ui.selectable_label(is_active, name).clicked() {
-                                                select_splat = Some(i);
+                                        // Clicking a splat selects it (its params
+                                        // appear in Details) and makes it the
+                                        // rendered cloud.  The "●" marks whichever
+                                        // is currently rendered (only one shows).
+                                        for (i, splat) in self.scene_splats.iter().enumerate() {
+                                            let is_selected =
+                                                self.selected == Some(Selection::Splat(i));
+                                            let marker =
+                                                if i == self.active_splat { "● " } else { "    " };
+                                            let label = format!("{marker}{}", splat.name);
+                                            if ui.selectable_label(is_selected, label).clicked() {
+                                                select_object = Some(Selection::Splat(i));
                                             }
                                         }
 
@@ -1204,11 +1699,51 @@ impl GameEngine for SplatGame {
                                                 );
                                             }
                                         }
+                                        Some(Selection::Splat(i)) => {
+                                            if let Some(splat) = self.scene_splats.get_mut(i) {
+                                                ui.label(
+                                                    egui::RichText::new(splat.name.as_str())
+                                                        .strong(),
+                                                );
+                                                ui.separator();
+                                                selection_edited |= editor::draw_properties(
+                                                    ui,
+                                                    splat,
+                                                    &model_resources,
+                                                    self.selected_resource,
+                                                );
+                                            }
+                                        }
                                         None => {
                                             ui.label("Nothing selected.");
                                             ui.label("Pick something in the Scene tab.");
                                         }
                                     },
+                                    EditorTab::Settings => {
+                                        ui.label(egui::RichText::new("Camera").strong());
+                                        ui.spacing_mut().slider_width = 150.0;
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.fly_camera.move_rate,
+                                                0.2..=50.0,
+                                            )
+                                            .logarithmic(true)
+                                            .text("speed"),
+                                        );
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.fly_camera.shift_move_multiplier,
+                                                1.0..=10.0,
+                                            )
+                                            .text("sprint ×"),
+                                        );
+
+                                        ui.add_space(12.0);
+                                        ui.label(egui::RichText::new("Editor").strong());
+                                        if ui.button("Keybindings…").clicked() {
+                                            self.show_settings = true;
+                                        }
+                                    }
                                 }
                             });
                     });
@@ -1222,6 +1757,7 @@ impl GameEngine for SplatGame {
                 Selection::Actor(i) => self.scene_actors.get(i).map(|a| a.get_name().to_string()),
                 Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_name().to_string()),
                 Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.name.clone()),
+                Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.name.clone()),
             };
             match name {
                 None => self.confirm_delete = None, // Stale selection.
@@ -1365,17 +1901,22 @@ impl GameEngine for SplatGame {
             }
         }
 
-        // In-world editor icons for lights (clicking one selects it).
-        if editor {
-            if let Some(i) = self.draw_light_icons(&ctx, game_config) {
-                select_object = Some(Selection::Light(i));
-            }
+        // In-world editor icons for lights (clicking one selects it).  Kept for
+        // the pick block below, which only runs when a light icon didn't take
+        // the click.
+        let clicked_light = if editor {
+            self.draw_light_icons(&ctx, game_config)
+        } else {
+            None
+        };
+        if let Some(i) = clicked_light {
+            select_object = Some(Selection::Light(i));
         }
 
         // Translate/rotate/scale gizmo on the selected object, drawn over the 3D
         // view.  Its edits ride the same `selection_edited` path as Details.
         // Lights have no scale (only translate/rotate apply); particles use
-        // translate/scale (rotation is ignored).
+        // translate/scale (rotation is ignored); splats have no gizmo.
         if editor {
             if let Some(sel) = self.selected {
                 let current = match sel {
@@ -1391,6 +1932,12 @@ impl GameEngine for SplatGame {
                         .scene_particles
                         .get(i)
                         .map(|p| (p.position, CG_QUAT_IDENT, p.scale)),
+                    // Splats use uniform scale only (non-uniform cloud scale is
+                    // only approximate), so feed a uniform scale to the gizmo.
+                    Selection::Splat(i) => self.scene_splats.get(i).map(|s| {
+                        let u = s.transform.scale.x;
+                        (s.transform.position, s.transform.rotation, CgVec3::new(u, u, u))
+                    }),
                 };
                 if let Some((mut position, mut rotation, mut scale)) = current {
                     if self.gizmo.ui(
@@ -1421,6 +1968,25 @@ impl GameEngine for SplatGame {
                                     p.scale = scale;
                                 }
                             }
+                            Selection::Splat(i) => {
+                                if let Some(s) = self.scene_splats.get_mut(i) {
+                                    s.transform.position = position;
+                                    s.transform.rotation = rotation;
+                                    // Uniform scale only: collapse the gizmo's
+                                    // per-axis result to the axis that moved most
+                                    // (the center handle moves them equally), and
+                                    // apply it to all three.
+                                    let prev = s.transform.scale.x;
+                                    let mut u = prev;
+                                    for a in [scale.x, scale.y, scale.z] {
+                                        if (a - prev).abs() > (u - prev).abs() {
+                                            u = a;
+                                        }
+                                    }
+                                    let u = u.max(0.001);
+                                    s.transform.scale = CgVec3::new(u, u, u);
+                                }
+                            }
                         }
                         selection_edited = true;
                     }
@@ -1428,16 +1994,31 @@ impl GameEngine for SplatGame {
             }
         }
 
-        // Apply the editor actions gathered from the menus / Scene tab.
-        if let Some(sel) = select_splat {
-            if sel < self.splat_names.len() {
-                self.active_splat = sel;
-                renderer.set_active_gaussian_splat(sel);
+        // Viewport click-to-select: after the gizmo (so grabbing a handle wins)
+        // and only when a light icon didn't take the click.  Picks the front-most
+        // actor/particle under the pointer; failing that, the active splat -- so
+        // splats are only pickable when no 3D object was.
+        if editor && clicked_light.is_none() && !self.gizmo.is_active() {
+            let (pointer, pressed) =
+                ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_pressed()));
+            if pressed && !ctx.egui_wants_pointer_input() {
+                if let Some(p) = pointer {
+                    if let Some(sel) = self.pick_object(&ctx, game_config, p) {
+                        select_object = Some(sel);
+                    } else if !self.scene_splats.is_empty() {
+                        select_object = Some(Selection::Splat(self.active_splat));
+                    }
+                }
             }
-            self.selected = None;
         }
+
+        // Apply the editor actions gathered from the menus / Scene tab.
         if let Some(sel) = select_object {
             self.selected = Some(sel);
+            // Selecting a splat also makes it the rendered cloud.
+            if let Selection::Splat(i) = sel {
+                self.activate_splat(i, renderer);
+            }
         }
         // Apply outliner renames (accumulated per section during the pass).
         for (i, new_name) in rename_actors {
@@ -1460,6 +2041,9 @@ impl GameEngine for SplatGame {
                 AddKind::Actor => self.add_actor(renderer),
                 AddKind::Light(light_type) => self.add_light(light_type),
                 AddKind::Particle(preset) => self.add_particle(preset, renderer),
+                // Splats come from a file, so "Add > Gaussian Splat" opens the
+                // same .ply picker as the load button.
+                AddKind::Splat => do_load = true,
             }
         }
         if let Some(sel) = delete_object {
@@ -1478,15 +2062,30 @@ impl GameEngine for SplatGame {
                         renderer.update_particle_transform(&p.handle, &p.position, &Some(p.scale));
                     }
                 }
+                Some(Selection::Splat(i)) => {
+                    if let Some(splat) = self.scene_splats.get(i) {
+                        renderer.set_gaussian_splat_params(&splat.params);
+                        renderer.set_gaussian_splat_transform(&splat.transform);
+                    }
+                }
                 // Lights are editor-only for now -- nothing to push.
                 _ => {}
             }
         }
         if do_save_scene {
-            self.status = Some(("Save Scene: not implemented yet".to_string(), STATUS_WHITE, 4.0));
+            self.save_scene(&model_resources);
         }
         if do_load_scene {
-            self.status = Some(("Load Scene: not implemented yet".to_string(), STATUS_WHITE, 4.0));
+            self.open_scene_picker();
+        }
+        // Apply a loaded scene once its file has been read (async, like the .ply).
+        let scene_bytes = self.picked_scene.lock().unwrap().take();
+        if let Some(bytes) = scene_bytes {
+            self.status = Some(match self.load_scene_from_bytes(&bytes, &model_resources, renderer)
+            {
+                Ok(summary) => (format!("Loaded scene: {summary}"), STATUS_WHITE, 5.0),
+                Err(reason) => (format!("Couldn't load scene: {reason}"), STATUS_RED, 10.0),
+            });
         }
 
         // On-screen move/look touch pads (shared TouchPads controller).  Left
@@ -1506,12 +2105,26 @@ impl GameEngine for SplatGame {
         self.fly_camera.clamp_pitch(&mut camera_rot);
         self.game_camera.set_rotation(&camera_rot);
 
-        // Cycle to the next loaded splat cloud ([Space] or the GUI button).
-        if (do_cycle || input_manager.get_key_state("space").just_pressed())
-            && !self.splat_names.is_empty()
+        // Frame the selected object ([F]).  Runs after the rotation is committed
+        // so it dollies along the final view direction; editor only, and ignored
+        // while typing in a field or rebinding a key.
+        if editor
+            && self.rebinding.is_none()
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(egui::Key::F))
         {
-            self.active_splat = (self.active_splat + 1) % self.splat_names.len();
-            renderer.set_active_gaussian_splat(self.active_splat);
+            self.frame_selected();
+        }
+
+        // Cycle to the next loaded splat cloud ([Space]), applying its params.
+        // If a splat is the current selection, keep the selection on the newly
+        // shown cloud so Details follows it.
+        if input_manager.get_key_state("space").just_pressed() && !self.scene_splats.is_empty() {
+            let next = (self.active_splat + 1) % self.scene_splats.len();
+            self.activate_splat(next, renderer);
+            if matches!(self.selected, Some(Selection::Splat(_))) {
+                self.selected = Some(Selection::Splat(next));
+            }
         }
 
         // Load a user .ply ([L] or the GUI button): opens the async file picker,
@@ -1522,11 +2135,16 @@ impl GameEngine for SplatGame {
         let picked = self.picked_ply.lock().unwrap().take();
         if let Some((file_name, bytes)) = picked {
             let name = file_name.trim_end_matches(".ply").to_string();
-            match renderer.load_gaussian_splat_from_bytes(&bytes, &name, &self.splat_params) {
+            match renderer.load_gaussian_splat_from_bytes(&bytes, &name, &default_splat_params()) {
                 Ok(info) => {
-                    self.splat_names.push(name.clone());
-                    self.active_splat = self.splat_names.len() - 1;
-                    renderer.set_active_gaussian_splat(self.active_splat);
+                    self.scene_splats.push(SceneSplat {
+                        name: name.clone(),
+                        params: default_splat_params(),
+                        transform: ActorTransform::from_position(CG_VEC3_ZERO),
+                    });
+                    let idx = self.scene_splats.len() - 1;
+                    self.activate_splat(idx, renderer);
+                    self.selected = Some(Selection::Splat(idx));
                     self.status = info.clamped_from.map(|original| {
                         (
                             format!(
@@ -1568,73 +2186,77 @@ impl GameEngine for SplatGame {
             },
         }
 
-        // Splat param adjustments (keyboard mirrors of the sliders)
+        // Splat param adjustments: keyboard nudges for the active cloud's params
+        // (a quick alternative to the Details panel drags).
         let adj = delta_time * PARAM_RATE;
-        let p = &mut self.splat_params;
-        let mut changed = params_changed;
+        if let Some(splat) = self.scene_splats.get_mut(self.active_splat) {
+            let p = &mut splat.params;
+            let mut changed = false;
 
-        if input_manager.get_key_state("1").is_down() {
-            p.falloff = (p.falloff - adj).max(0.01);
-            changed = true;
-        }
-        if input_manager.get_key_state("2").is_down() {
-            p.falloff = (p.falloff + adj).min(20.0);
-            changed = true;
-        }
-        if input_manager.get_key_state("3").is_down() {
-            p.scale = (p.scale - adj).max(0.1);
-            changed = true;
-        }
-        if input_manager.get_key_state("4").is_down() {
-            p.scale = (p.scale + adj).min(20.0);
-            changed = true;
-        }
-        if input_manager.get_key_state("5").is_down() {
-            p.contrast = (p.contrast - adj).max(0.1);
-            changed = true;
-        }
-        if input_manager.get_key_state("6").is_down() {
-            p.contrast = (p.contrast + adj).min(5.0);
-            changed = true;
-        }
-        if input_manager.get_key_state("7").is_down() {
-            p.overall_scale = (p.overall_scale - adj).max(0.1);
-            changed = true;
-        }
-        if input_manager.get_key_state("8").is_down() {
-            p.overall_scale = (p.overall_scale + adj).min(10.0);
-            changed = true;
-        }
-        if input_manager.get_key_state("9").just_pressed() {
-            // The splat record carries 8 "rest" coefficients (degrees 1+2), so 2
-            // is the highest degree that changes anything.
-            p.max_sh_degree = match p.max_sh_degree as u32 {
-                0 => 1.0,
-                1 => 2.0,
-                _ => 0.0,
-            };
-            changed = true;
-        }
+            if input_manager.get_key_state("1").is_down() {
+                p.falloff = (p.falloff - adj).max(0.01);
+                changed = true;
+            }
+            if input_manager.get_key_state("2").is_down() {
+                p.falloff = (p.falloff + adj).min(20.0);
+                changed = true;
+            }
+            if input_manager.get_key_state("3").is_down() {
+                p.scale = (p.scale - adj).max(0.1);
+                changed = true;
+            }
+            if input_manager.get_key_state("4").is_down() {
+                p.scale = (p.scale + adj).min(20.0);
+                changed = true;
+            }
+            if input_manager.get_key_state("5").is_down() {
+                p.contrast = (p.contrast - adj).max(0.1);
+                changed = true;
+            }
+            if input_manager.get_key_state("6").is_down() {
+                p.contrast = (p.contrast + adj).min(5.0);
+                changed = true;
+            }
+            if input_manager.get_key_state("7").is_down() {
+                p.overall_scale = (p.overall_scale - adj).max(0.1);
+                changed = true;
+            }
+            if input_manager.get_key_state("8").is_down() {
+                p.overall_scale = (p.overall_scale + adj).min(10.0);
+                changed = true;
+            }
+            if input_manager.get_key_state("9").just_pressed() {
+                // The splat record carries 8 "rest" coefficients (degrees 1+2), so
+                // 2 is the highest degree that changes anything.
+                p.max_sh_degree = match p.max_sh_degree as u32 {
+                    0 => 1.0,
+                    1 => 2.0,
+                    _ => 0.0,
+                };
+                changed = true;
+            }
 
-        if changed {
-            renderer.set_gaussian_splat_params(p);
+            if changed {
+                renderer.set_gaussian_splat_params(p);
+            }
         }
 
         let pos = self.game_camera.get_position();
         let rot = self.game_camera.get_rotation();
         let active_name = self
-            .splat_names
+            .scene_splats
             .get(self.active_splat)
-            .map_or("none", |s| s.as_str());
+            .map_or("none", |s| s.name.as_str());
         let splat_count = renderer.active_gaussian_splat_count();
         renderer.set_debug_game_msg(&format!(
             "Move: [W][A][S][D]   [Shift] sprint   Look: [Arrow Keys]\n\
              Touch: left pad = move,  right pad = look\n\n\
              [Space]     Next scene  {} ({}/{})   {} splats\n\
-             [L]         Load your own .ply",
+             [L]         Load your own .ply\n\
+             [F]         Frame the selected object",
             active_name,
             self.active_splat + 1,
-            self.splat_names.len().max(1),
+            self.scene_splats.len().max(1),
             splat_count,
         ));
         renderer.set_debug_topright_msg(&format!(

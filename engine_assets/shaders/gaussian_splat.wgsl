@@ -8,6 +8,9 @@ struct GlobalConstants {
     splat_params: vec4<f32>,
     // x: max sh degree, y: overall scale, z/w: unused
     splat_params_2: vec4<f32>,
+    // Cloud world transform (editor gizmo): translate/rotate/scale of the whole
+    // cloud.  Identity leaves the cloud where its data puts it.
+    model: mat4x4<f32>,
 };
 
 struct Splat {
@@ -109,9 +112,30 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
         return output;
     }
 
+    // Cloud world transform: split the model matrix into its rotation and a
+    // (uniform) scale so the per-splat billboard rotates and grows with the
+    // cloud.  Non-uniform cloud scale is approximated by the average column
+    // length for the billboard size, while positions still use the full matrix.
+    let mcol0 = u.model[0].xyz;
+    let mcol1 = u.model[1].xyz;
+    let mcol2 = u.model[2].xyz;
+    let cloud_sx = length(mcol0);
+    let cloud_sy = length(mcol1);
+    let cloud_sz = length(mcol2);
+    let cloud_scale = (cloud_sx + cloud_sy + cloud_sz) / 3.0;
+    let cloud_rot = mat3x3<f32>(
+        mcol0 / max(cloud_sx, 0.000001),
+        mcol1 / max(cloud_sy, 0.000001),
+        mcol2 / max(cloud_sz, 0.000001),
+    );
+
     // Note: Dynamic indexing into an array requires a var instead of let on naga/Vulkan
     var axes = quat_axes(g_splats[splat_id].rotation);
-    let splat_pos = g_splats[splat_id].position.xyz * overall_scale;
+    axes[0] = cloud_rot * axes[0];
+    axes[1] = cloud_rot * axes[1];
+    axes[2] = cloud_rot * axes[2];
+    let local_pos = g_splats[splat_id].position.xyz * overall_scale;
+    let splat_pos = (u.model * vec4<f32>(local_pos, 1.0)).xyz;
     let splat_scale = g_splats[splat_id].scale_opacity.xyz;
     let splat_opacity = g_splats[splat_id].scale_opacity.w;
 
@@ -150,7 +174,7 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
     let offset_y = corner.y * long_scale;
 
     let vertex_offset = cam_right * offset_x + long_axis * offset_y;
-    let world_pos = splat_pos + vertex_offset * u.splat_params.y * overall_scale;
+    let world_pos = splat_pos + vertex_offset * u.splat_params.y * overall_scale * cloud_scale;
     let clip_pos = u.view_proj * vec4<f32>(world_pos, 1.0);
 
     output.position = clip_pos;

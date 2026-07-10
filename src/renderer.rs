@@ -911,6 +911,21 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Sets the world transform of the active splat cloud (editor gizmo drag).
+    pub fn set_gaussian_splat_transform(&mut self, transform: &ActorTransform) {
+        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+            let rotation: cgmath::Matrix3<f32> = transform.rotation.into();
+            let matrix = cgmath::Matrix4::from_translation(transform.position)
+                * cgmath::Matrix4::from(rotation)
+                * cgmath::Matrix4::from_nonuniform_scale(
+                    transform.scale.x,
+                    transform.scale.y,
+                    transform.scale.z,
+                );
+            splat_pass.set_transform(matrix);
+        }
+    }
+
     pub fn set_camera(&mut self, camera: &Camera) {
         self.game_camera = camera.clone();
     }

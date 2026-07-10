@@ -560,12 +560,24 @@ impl Light {
         self.light_type
     }
 
+    pub fn set_color(&mut self, color: CgVec3) {
+        self.color = color;
+    }
+
     pub fn get_color(&self) -> CgVec3 {
         self.color
     }
 
+    pub fn set_intensity(&mut self, intensity: f32) {
+        self.intensity = intensity;
+    }
+
     pub fn get_intensity(&self) -> f32 {
         self.intensity
+    }
+
+    pub fn set_casts_shadow(&mut self, casts_shadow: bool) {
+        self.casts_shadow = casts_shadow;
     }
 
     pub fn casts_shadow(&self) -> bool {

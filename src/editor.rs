@@ -186,7 +186,7 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
         self.ui
             .add(
                 egui::DragValue::new(value)
-                    .speed(0.02)
+                    .speed(0.05)
                     .range(0.0..=f32::MAX)
                     .max_decimals(3),
             )
@@ -320,6 +320,12 @@ const GIZMO_COLORS: [egui::Color32; 3] = [
 const GIZMO_HIGHLIGHT: egui::Color32 = egui::Color32::from_rgb(255, 220, 60);
 // How close (in points) the pointer must be to a handle to grab it.
 const GIZMO_HIT_RADIUS: f32 = 12.0;
+// A larger grab radius around each axis' tip (arrowhead / scale box), so the
+// ends of the handles are big, forgiving tap targets on touch.
+const GIZMO_TIP_HIT_RADIUS: f32 = 24.0;
+// Radius (in points) of the filled knob drawn at each translate arrow tip; a
+// visible mark for the enlarged tip tap target above.
+const GIZMO_TIP_KNOB_RADIUS: f32 = 6.0;
 // On-screen gizmo size: world size = distance to camera * this.
 const GIZMO_SCALE: f32 = 0.2;
 // Side (in points) of the square tips on the scale handles.
@@ -355,6 +361,12 @@ impl Default for TransformGizmo {
 }
 
 impl TransformGizmo {
+    /// True while a handle is being dragged.  Lets the caller suppress
+    /// viewport click-to-select when a drag started on the gizmo this frame.
+    pub fn is_active(&self) -> bool {
+        self.drag_axis.is_some()
+    }
+
     /// Draws the gizmo at `position` and applies any drag to
     /// `position`/`rotation`/`scale` (depending on mode).  Returns true if it
     /// changed them this frame.
@@ -456,13 +468,17 @@ impl TransformGizmo {
                     let Some(tip) = project(*position + *dir * world_size) else {
                         continue;
                     };
-                    let hover_dist = pointer
-                        .map_or(f32::MAX, |p| distance_to_segment(p, center, tip));
-                    if can_grab && hover_dist < GIZMO_HIT_RADIUS {
+                    // Grab along the whole shaft, but with a much larger radius
+                    // right at the tip so the arrowhead is an easy touch target.
+                    let hit = pointer.map_or(false, |p| {
+                        distance_to_segment(p, center, tip) < GIZMO_HIT_RADIUS
+                            || p.distance(tip) < GIZMO_TIP_HIT_RADIUS
+                    });
+                    if can_grab && hit {
                         self.drag_axis = Some(axis);
                     }
                     let active = self.drag_axis == Some(axis);
-                    let hovered = !any_down && !over_ui && hover_dist < GIZMO_HIT_RADIUS;
+                    let hovered = !any_down && !over_ui && hit;
                     if active && down {
                         // Pointer movement along the axis' screen direction,
                         // converted back to world units.
@@ -474,17 +490,25 @@ impl TransformGizmo {
                             changed = true;
                         }
                     }
+                    let color = if active || hovered {
+                        GIZMO_HIGHLIGHT
+                    } else {
+                        GIZMO_COLORS[axis]
+                    };
                     painter.arrow(
                         center,
                         tip - center,
-                        egui::Stroke::new(
-                            if active { 4.5 } else { 3.0 },
-                            if active || hovered {
-                                GIZMO_HIGHLIGHT
-                            } else {
-                                GIZMO_COLORS[axis]
-                            },
-                        ),
+                        egui::Stroke::new(if active { 4.5 } else { 3.0 }, color),
+                    );
+                    // Knob at the tip: a visible mark for the enlarged tap target.
+                    painter.circle_filled(
+                        tip,
+                        if active || hovered {
+                            GIZMO_TIP_KNOB_RADIUS + 1.5
+                        } else {
+                            GIZMO_TIP_KNOB_RADIUS
+                        },
+                        color,
                     );
                 }
                 GizmoMode::Rotate => {
@@ -552,15 +576,19 @@ impl TransformGizmo {
                     let Some(tip) = project(*position + *dir * world_size) else {
                         continue;
                     };
-                    let hover_dist = pointer
-                        .map_or(f32::MAX, |p| distance_to_segment(p, center, tip));
+                    // Grab along the shaft, with a bigger radius at the box tip
+                    // so it's an easy touch target.
+                    let hit = pointer.map_or(false, |p| {
+                        distance_to_segment(p, center, tip) < GIZMO_HIT_RADIUS
+                            || p.distance(tip) < GIZMO_TIP_HIT_RADIUS
+                    });
                     // is_none() keeps a center grab (checked above) from being
                     // stolen by the axis lines that pass through it.
-                    if can_grab && self.drag_axis.is_none() && hover_dist < GIZMO_HIT_RADIUS {
+                    if can_grab && self.drag_axis.is_none() && hit {
                         self.drag_axis = Some(axis);
                     }
                     let active = self.drag_axis == Some(axis);
-                    let hovered = !any_down && !over_ui && hover_dist < GIZMO_HIT_RADIUS;
+                    let hovered = !any_down && !over_ui && hit;
                     if active && down {
                         // Pointer movement along the axis' screen direction as
                         // a fraction of the gizmo length, applied

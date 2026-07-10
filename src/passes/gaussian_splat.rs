@@ -41,6 +41,7 @@ pub struct SplatUniform {
     pub camera_pos: [f32; 4],
     pub splat_params: [f32; 4],   // falloff, scale, contrast, num_splats
     pub splat_params_2: [f32; 4], // max_sh_degree, overall_scale, _, _
+    pub model: [[f32; 4]; 4],     // cloud world transform (editor gizmo)
 }
 
 /// Matches `SortGlobals` in gaussian_splat_radix.wgsl.
@@ -84,6 +85,17 @@ impl Default for SplatParams {
         }
     }
 }
+
+// Editor markup: the splat rendering knobs shown in the editor's Details panel
+// when a splat is selected (see crate::editor).  SH degree is an integer 0..2
+// stored as a float; edited as a drag value like the rest.
+crate::editor_properties!(SplatParams {
+    falloff: float("Falloff"),
+    scale: float("Splat Scale"),
+    contrast: float("Contrast"),
+    overall_scale: float("Overall Scale"),
+    max_sh_degree: float("SH Degree"),
+});
 
 /// Number of 8-bit digit passes for a 32-bit radix sort.
 const RADIX_PASSES: u32 = 4;
@@ -429,6 +441,9 @@ pub struct GaussianSplatPass {
     models: Vec<SplatModel>,
     active_model: usize,
     params: SplatParams,
+    // World transform applied to the active cloud (editor gizmo); identity by
+    // default.  Folded into the depth-sort key and the vertex/cull math.
+    model_transform: cgmath::Matrix4<f32>,
 }
 
 impl GaussianSplatPass {
@@ -661,11 +676,17 @@ impl GaussianSplatPass {
             models: Vec::new(),
             active_model: 0,
             params: SplatParams::default(),
+            model_transform: cgmath::Matrix4::from_scale(1.0),
         }
     }
 
     pub fn set_params(&mut self, params: &SplatParams) {
         self.params = *params;
+    }
+
+    /// Sets the world transform applied to the active cloud (editor gizmo).
+    pub fn set_transform(&mut self, transform: cgmath::Matrix4<f32>) {
+        self.model_transform = transform;
     }
 
     /// Number of splat clouds currently loaded.
@@ -938,20 +959,35 @@ impl GaussianSplatPass {
         );
         let view_proj = proj_matrix * view_matrix;
 
-        // Skip the sort and draw entirely if the splat cloud is off-screen.
-        if !sphere_in_frustum(view_proj, model.bounding_center, model.bounding_radius) {
+        // The cloud's world transform (editor gizmo) offsets every splat, so the
+        // frustum cull, depth-sort key and vertex shader all work through it.
+        let model_mat = self.model_transform;
+        let os = self.params.overall_scale;
+
+        // Skip the sort and draw entirely if the (transformed) cloud is off-screen.
+        let bc = model.bounding_center;
+        let world_center =
+            model_mat * cgmath::Vector4::new(bc[0] * os, bc[1] * os, bc[2] * os, 1.0);
+        let col_len = |c: cgmath::Vector4<f32>| (c.x * c.x + c.y * c.y + c.z * c.z).sqrt();
+        let max_scale = col_len(model_mat.x)
+            .max(col_len(model_mat.y))
+            .max(col_len(model_mat.z));
+        let world_radius = model.bounding_radius * os * max_scale;
+        if !sphere_in_frustum(
+            view_proj,
+            [world_center.x, world_center.y, world_center.z],
+            world_radius,
+        ) {
             return;
         }
 
-        // Depth ordering depends only on the view matrix's third (Z) row, so we
-        // only re-run the GPU sort when that row changes -- a static camera reuses
-        // the previously sorted index buffer.
-        let zc = [
-            view_matrix.x.z,
-            view_matrix.y.z,
-            view_matrix.z.z,
-            view_matrix.w.z,
-        ];
+        // Depth ordering is keyed by the view-space depth of the transformed
+        // splat -- the third row of (view * model).  It depends only on that
+        // row's direction part, so we only re-run the GPU sort when the camera
+        // rotates or the cloud is rotated/scaled (pure translation of either
+        // shifts all depths equally and preserves order).
+        let vm = view_matrix * model_mat;
+        let zc = [vm.x.z, vm.y.z, vm.z.z, vm.w.z];
         // Sort order depends only on the view DIRECTION (zc[0..3]); zc[3] is the
         // translation, which shifts every splat's depth equally and so never
         // changes their order.  So only re-sort when the camera rotates -- pure
@@ -993,6 +1029,7 @@ impl GaussianSplatPass {
             0.0,
             0.0,
         ];
+        self.uniform.model = model_mat.into();
         device_resources.queue.write_buffer(
             &self.uniform_buffer,
             0,

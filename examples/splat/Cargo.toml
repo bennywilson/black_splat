@@ -11,6 +11,9 @@ pollster = "0.3"
 # Native + browser file-open dialog for the "load your own .ply" button.  On
 # wasm it wraps an HTML file input, so the picked file never leaves the device.
 rfd = "0.14"
+# Scene save/load (JSON).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 black_splat = { path = "../../" }
 
