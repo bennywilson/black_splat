@@ -702,6 +702,13 @@ impl GaussianSplatPass {
         }
     }
 
+    /// Unloads every cloud (their GPU buffers drop with them).  Nothing renders
+    /// until the next `load`/`load_from_bytes`.  Used by the editor's New Scene.
+    pub fn clear_models(&mut self) {
+        self.models.clear();
+        self.active_model = 0;
+    }
+
     /// Number of gaussian splats in the currently active cloud (0 if none).
     pub fn active_splat_count(&self) -> u32 {
         self.models.get(self.active_model).map_or(0, |m| m.num_splats)

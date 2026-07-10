@@ -898,6 +898,14 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Unloads every splat cloud (editor "New Scene").  Nothing renders until
+    /// the next load.
+    pub fn clear_gaussian_splats(&mut self) {
+        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+            splat_pass.clear_models();
+        }
+    }
+
     /// Number of gaussian splats in the currently active cloud (0 if none).
     pub fn active_gaussian_splat_count(&self) -> u32 {
         self.gaussian_splat_pass

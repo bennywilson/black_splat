@@ -23,7 +23,12 @@ fs_extra = "1.2"
 glob = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4.42"
+# Untyped JS interop for the File System Access API save dialog (the typed
+# web-sys bindings for it sit behind the unstable-APIs cfg flag).
+js-sys = "0.3"
 # The engine's log! macro expands to web_sys::console at the call site.
-# Window/Navigator are for the touch-device check (GUI sizing).
-web-sys =  { version = "0.3.69", features = ["Window", "Navigator"] }
+# Window/Navigator are for the touch-device check (GUI sizing); Storage is the
+# localStorage that persists the startup scene.
+web-sys =  { version = "0.3.69", features = ["Window", "Navigator", "Storage"] }

@@ -127,6 +127,72 @@ impl EditorConfig {
     pub fn save(&self) {}
 }
 
+// --- Startup scene -----------------------------------------------------------
+// The scene JSON loaded when the editor starts, stored as a sibling file of the
+// keybindings (`startup_scene.json`).  Same persistence rules as the rest of
+// the config: native reads/writes the per-user file, web keeps the built-in
+// default (no filesystem).
+
+/// The user's saved startup scene JSON, if any.  `None` means "use the built-in
+/// default scene".
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_startup_scene() -> Option<String> {
+    let path = config_file_path()?.with_file_name("startup_scene.json");
+    std::fs::read_to_string(path).ok()
+}
+
+/// Saves `json` as the startup scene.  Best-effort, like [`EditorConfig::save`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_startup_scene(json: &str) {
+    let Some(path) = config_file_path() else {
+        return;
+    };
+    let path = path.with_file_name("startup_scene.json");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, json);
+}
+
+/// Removes the saved startup scene, reverting to the built-in default.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_startup_scene() {
+    if let Some(path) = config_file_path() {
+        let _ = std::fs::remove_file(path.with_file_name("startup_scene.json"));
+    }
+}
+
+// On the web the scene JSON persists in localStorage: the browser's small
+// per-site key-value store (a few MB, kept on the user's disk, scoped to this
+// origin).  Content, not a path -- browsers don't expose file paths at all --
+// so the picker-chosen file's text is what's stored.
+#[cfg(target_arch = "wasm32")]
+const STARTUP_SCENE_KEY: &str = "black_splat_startup_scene";
+
+#[cfg(target_arch = "wasm32")]
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_startup_scene() -> Option<String> {
+    local_storage()?.get_item(STARTUP_SCENE_KEY).ok().flatten()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn save_startup_scene(json: &str) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STARTUP_SCENE_KEY, json);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn clear_startup_scene() {
+    if let Some(storage) = local_storage() {
+        let _ = storage.remove_item(STARTUP_SCENE_KEY);
+    }
+}
+
 /// The per-user config file: `<config dir>/black_splat/editor_config.txt`,
 /// where the config dir is the platform's standard location (`%APPDATA%` on
 /// Windows, `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or

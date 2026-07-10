@@ -11,11 +11,10 @@ use black_splat::{
     passes::gaussian_splat::SplatParams,
 };
 
-use crate::editor_config::{EditorConfig, GIZMO_ACTIONS};
+use crate::editor_config::{self, EditorConfig, GIZMO_ACTIONS};
 
-// Splat clouds the demo preloads and cycles between with [Space].  Missing files
-// are skipped at load, so the demo still runs with whatever is present.
-const SPLAT_PLY_PATHS: &[&str] = &["game_assets/splats/church.ply"];
+// No clouds are hardcoded: startup opens the user's saved startup scene, or
+// `default_startup_scene()` (the church) if none is saved yet.
 
 // Model resources preloaded for the editor (the Resources tab and the Details
 // panel's model dropdown).  Loaded in initialize_world -- model loading is
@@ -51,6 +50,73 @@ fn draw_mode_switch(ui: &mut egui::Ui, editor_mode: &mut bool) {
 #[cfg(target_arch = "wasm32")]
 fn is_touch_device() -> bool {
     web_sys::window().is_some_and(|w| w.navigator().max_touch_points() > 0)
+}
+
+/// Saves `json` through the browser's File System Access API
+/// (`window.showSaveFilePicker`) -- a real save dialog, writing wherever the
+/// user points it.  Chrome/Edge support it; Firefox/Safari don't.
+///
+/// Returns `Err(())` only when the API is unavailable, so the caller can fall
+/// back to a download.  A user cancel resolves `Ok` -- the dialog was shown and
+/// answered, nothing left to do.
+///
+/// Called through `js_sys::Reflect` because web-sys gates its typed bindings
+/// for this API behind the unstable-APIs cfg flag.
+#[cfg(target_arch = "wasm32")]
+async fn save_with_fs_access_api(json: &str) -> Result<(), ()> {
+    use wasm_bindgen::{JsCast, JsValue};
+
+    let window = web_sys::window().ok_or(())?;
+    let picker = js_sys::Reflect::get(&window, &JsValue::from_str("showSaveFilePicker"))
+        .map_err(|_| ())?;
+    let picker: js_sys::Function = picker.dyn_into().map_err(|_| ())?;
+
+    // One await step: call `method` on `target` and wait out the promise.
+    async fn call_async(
+        target: &JsValue,
+        method: &js_sys::Function,
+        arg: Option<&JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        let promise = match arg {
+            Some(arg) => method.call1(target, arg)?,
+            None => method.call0(target)?,
+        };
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(promise)).await
+    }
+    let method_of = |target: &JsValue, name: &str| -> Option<js_sys::Function> {
+        js_sys::Reflect::get(target, &JsValue::from_str(name))
+            .ok()?
+            .dyn_into()
+            .ok()
+    };
+
+    // showSaveFilePicker({ suggestedName: "scene.json" }) -> FileSystemFileHandle.
+    // A rejected promise here is the user cancelling: report success (handled).
+    let options = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("suggestedName"),
+        &JsValue::from_str("scene.json"),
+    );
+    let window: JsValue = window.into();
+    let Ok(handle) = call_async(&window, &picker, Some(&options.into())).await else {
+        return Ok(());
+    };
+
+    // handle.createWritable() -> stream; stream.write(text); stream.close().
+    let Some(create_writable) = method_of(&handle, "createWritable") else {
+        return Ok(());
+    };
+    let Ok(stream) = call_async(&handle, &create_writable, None).await else {
+        return Ok(());
+    };
+    if let Some(write) = method_of(&stream, "write") {
+        let _ = call_async(&stream, &write, Some(&JsValue::from_str(json))).await;
+    }
+    if let Some(close) = method_of(&stream, "close") {
+        let _ = call_async(&stream, &close, None).await;
+    }
+    Ok(())
 }
 
 // "game_assets/models/barrel.glb" -> "barrel" for resource lists.
@@ -93,6 +159,9 @@ enum AddKind {
 /// renderer's splat clouds.
 struct SceneSplat {
     name: String,
+    // Where the .ply came from (stored in saved scenes so they can reload it).
+    // Empty when there is no re-readable source (browser file picks).
+    path: String,
     params: SplatParams,
     // World transform (editor gizmo): lets a cloud be dragged/rotated/scaled.
     transform: ActorTransform,
@@ -120,7 +189,10 @@ const SCENE_FORMAT_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize)]
 struct SceneFile {
     version: u32,
-    camera: CameraDto,
+    // Absent in e.g. the built-in startup scene, which keeps the config's
+    // start camera.
+    #[serde(default)]
+    camera: Option<CameraDto>,
     #[serde(default)]
     actors: Vec<ActorDto>,
     #[serde(default)]
@@ -169,9 +241,14 @@ struct ParticleDto {
     scale: [f32; 3],
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SplatDto {
     name: String,
+    // Where the .ply came from, so loading the scene can reload the cloud.
+    // Empty for clouds picked via the browser file dialog (no re-readable
+    // path exists); those can't be restored by a scene load.
+    #[serde(default)]
+    path: String,
     params: SplatParamsDto,
     #[serde(default)]
     position: [f32; 3],
@@ -188,13 +265,55 @@ fn ones3() -> [f32; 3] {
     [1.0, 1.0, 1.0]
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SplatParamsDto {
     falloff: f32,
     scale: f32,
     contrast: f32,
     overall_scale: f32,
     max_sh_degree: f32,
+}
+
+impl SplatParamsDto {
+    fn from_params(p: &SplatParams) -> Self {
+        SplatParamsDto {
+            falloff: p.falloff,
+            scale: p.scale,
+            contrast: p.contrast,
+            overall_scale: p.overall_scale,
+            max_sh_degree: p.max_sh_degree,
+        }
+    }
+
+    fn to_params(&self) -> SplatParams {
+        SplatParams {
+            falloff: self.falloff,
+            scale: self.scale,
+            contrast: self.contrast,
+            max_sh_degree: self.max_sh_degree,
+            overall_scale: self.overall_scale,
+        }
+    }
+}
+
+/// The scene the editor opens when the user hasn't saved a startup scene of
+/// their own: just the church cloud, camera left at the config's start pose.
+fn default_startup_scene() -> SceneFile {
+    SceneFile {
+        version: SCENE_FORMAT_VERSION,
+        camera: None,
+        actors: Vec::new(),
+        lights: Vec::new(),
+        particles: Vec::new(),
+        splats: vec![SplatDto {
+            name: "church".to_string(),
+            path: "game_assets/splats/church.ply".to_string(),
+            params: SplatParamsDto::from_params(&default_splat_params()),
+            position: [0.0; 3],
+            rotation: ident_quat(),
+            scale: ones3(),
+        }],
+    }
 }
 
 // Plain-array <-> cgmath conversions for the DTOs above.
@@ -371,8 +490,10 @@ fn selection_after_delete(selected: Option<Selection>, deleted: Selection) -> Op
 }
 
 /// Draws one outliner list section (header + rows) for objects of one kind.
-/// Rows support click-to-select, double-click-to-rename and a delete button;
-/// picks are reported through the `*_out` accumulators (applied after the pass).
+/// `add_ui` renders the section's add control (a "+" button/menu) beside the
+/// header.  Rows support click-to-select, double-click-to-rename and a delete
+/// button; picks are reported through the `*_out` accumulators (applied after
+/// the pass).
 #[allow(clippy::too_many_arguments)]
 fn draw_outliner_section(
     ui: &mut egui::Ui,
@@ -380,15 +501,20 @@ fn draw_outliner_section(
     make_sel: fn(usize) -> Selection,
     names: &[String],
     selected: Option<Selection>,
+    multi: &[Selection],
     name_edit: &mut Option<Selection>,
     name_edit_buffer: &mut String,
     name_edit_focus: &mut bool,
-    select_out: &mut Option<Selection>,
+    select_out: &mut Option<(Selection, bool)>,
     rename_out: &mut Vec<(usize, String)>,
     delete_out: &mut Option<Selection>,
+    add_ui: impl FnOnce(&mut egui::Ui),
 ) {
     ui.add_space(8.0);
-    ui.label(egui::RichText::new(header).strong());
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(header).strong());
+        add_ui(ui);
+    });
     if names.is_empty() {
         ui.label("(none)");
     }
@@ -412,9 +538,13 @@ fn draw_outliner_section(
                     *name_edit = None;
                 }
             } else {
-                let label_resp = ui.selectable_label(selected == Some(this), name.as_str());
+                let highlighted = selected == Some(this) || multi.contains(&this);
+                let label_resp = ui.selectable_label(highlighted, name.as_str());
                 if label_resp.clicked() {
-                    *select_out = Some(this);
+                    // Ctrl+click joins/leaves the multi-selection.
+                    let additive =
+                        ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                    *select_out = Some((this, additive));
                 }
                 if label_resp.double_clicked() {
                     *name_edit = Some(this);
@@ -479,8 +609,22 @@ pub struct SplatGame {
     particle_textures: Vec<(String, TextureHandle)>,
     // Scene-tab selection (actor / light / particle), if any.
     selected: Option<Selection>,
+    // Ctrl+click multi-selection, in click order (`selected` is its last
+    // entry).  With exactly two actors selected, right-click offers snapping
+    // the second to the first.
+    multi_selected: Vec<Selection>,
+    // Viewport context menu (right-click without dragging), at screen pos.
+    context_menu: Option<egui::Pos2>,
+    // Mouse travel while the right button is held, to tell a right-click
+    // (context menu) from a right-drag (camera look).
+    rmb_drag_accum: f32,
     // Object awaiting delete confirmation (the Scene tab's ✕ button).
     confirm_delete: Option<Selection>,
+    // File > New Scene awaiting its confirmation modal (it wipes unsaved work).
+    confirm_new_scene: bool,
+    // Whether a user-saved startup scene exists (drives the Settings tab UI;
+    // cached so native doesn't stat the config file every frame).
+    has_custom_startup: bool,
     // Model highlighted in the resources browser, offered to the Details
     // panel's Model row as a one-click assignment.
     selected_resource: Option<ModelHandle>,
@@ -523,13 +667,21 @@ pub struct SplatGame {
     active_splat: usize,
     // "Load .ply" plumbing.  The file dialog must run asynchronously (a browser
     // file input can't block the frame loop), so it drops its result here and
-    // tick_frame picks it up.  `picker_state` keeps a held key / double tap from
-    // stacking dialogs and reports read progress.
-    picked_ply: Arc<Mutex<Option<(String, Vec<u8>)>>>,
+    // tick_frame picks it up: (file name, source path if one exists -- native
+    // only, browsers don't expose one -- and the bytes).  `picker_state` keeps a
+    // held key / double tap from stacking dialogs and reports read progress.
+    picked_ply: Arc<Mutex<Option<(String, Option<String>, Vec<u8>)>>>,
     picker_state: Arc<Mutex<PickerState>>,
     // "Load Scene" plumbing: the picked JSON file's bytes land here for a later
     // tick to parse (the file dialog runs async, like the .ply picker).
     picked_scene: Arc<Mutex<Option<Vec<u8>>>>,
+    // Settings > "Choose start-up scene…" plumbing: the picked file's bytes are
+    // validated and persisted as the startup scene on a later tick.
+    picked_startup: Arc<Mutex<Option<Vec<u8>>>>,
+    // Splat clouds a scene load requested: their .ply bytes are fetched on a
+    // background task (native thread / wasm fetch) and applied here in a later
+    // tick, since cloud creation must happen on the render thread.
+    pending_splats: Arc<Mutex<Vec<(SplatDto, Vec<u8>)>>>,
     // Transient bottom-center message (load errors, clamp warnings) and its
     // remaining time on screen.
     status: Option<(String, CgVec4, f32)>,
@@ -569,9 +721,15 @@ impl SplatGame {
         let pick = async move {
             if let Some(file) = dialog.pick_file().await {
                 let name = file.file_name();
+                // Remember where the file lives when the platform can tell us
+                // (native), so saved scenes can reload the cloud by path.
+                #[cfg(not(target_arch = "wasm32"))]
+                let path = Some(file.path().to_string_lossy().to_string());
+                #[cfg(target_arch = "wasm32")]
+                let path = None;
                 *picker_state.lock().unwrap() = PickerState::Reading(name.clone());
                 let bytes = file.read().await;
-                *picked.lock().unwrap() = Some((name, bytes));
+                *picked.lock().unwrap() = Some((name, path, bytes));
             }
             *picker_state.lock().unwrap() = PickerState::Idle;
         };
@@ -738,6 +896,9 @@ impl SplatGame {
             Selection::Splat(_) => return,
         }
         self.selected = selection_after_delete(self.selected, sel);
+        // Deleting shifts indices; drop the multi-selection rather than remap.
+        self.multi_selected.clear();
+        self.context_menu = None;
     }
 
     /// Makes splat `i` the rendered cloud and pushes its params to the renderer.
@@ -932,10 +1093,10 @@ impl SplatGame {
         };
         SceneFile {
             version: SCENE_FORMAT_VERSION,
-            camera: CameraDto {
+            camera: Some(CameraDto {
                 position: vec3_arr(self.game_camera.get_position()),
                 rotation: vec3_arr(self.game_camera.get_rotation()),
-            },
+            }),
             actors: self
                 .scene_actors
                 .iter()
@@ -976,13 +1137,8 @@ impl SplatGame {
                 .iter()
                 .map(|s| SplatDto {
                     name: s.name.clone(),
-                    params: SplatParamsDto {
-                        falloff: s.params.falloff,
-                        scale: s.params.scale,
-                        contrast: s.params.contrast,
-                        overall_scale: s.params.overall_scale,
-                        max_sh_degree: s.params.max_sh_degree,
-                    },
+                    path: s.path.clone(),
+                    params: SplatParamsDto::from_params(&s.params),
                     position: vec3_arr(s.transform.position),
                     rotation: quat_arr(s.transform.rotation),
                     scale: vec3_arr(s.transform.scale),
@@ -992,45 +1148,57 @@ impl SplatGame {
     }
 
     /// Serializes the scene to pretty JSON and writes it to a file the user
-    /// picks (async dialog; on wasm this downloads the file).
+    /// picks.  Native shows the OS save dialog.  On the web, browsers with the
+    /// File System Access API (Chrome/Edge) get a real save dialog too; the rest
+    /// (Firefox/Safari) fall back to a download.  Either way everything happens
+    /// locally -- the file never leaves the machine.
     fn save_scene(&self, model_resources: &[(String, ModelHandle)]) {
         let scene = self.build_scene_file(model_resources);
         let json = match serde_json::to_string_pretty(&scene) {
             Ok(json) => json,
             Err(_) => return,
         };
-        let task = async move {
-            let dialog = rfd::AsyncFileDialog::new().set_file_name("scene.json");
-            #[cfg(not(target_arch = "wasm32"))]
-            let dialog = dialog.add_filter("Scene", &["json"]);
-            if let Some(file) = dialog.save_file().await {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let task = async move {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_file_name("scene.json")
+                    .add_filter("Scene", &["json"]);
+                if let Some(file) = dialog.save_file().await {
                     let _ = std::fs::write(file.path(), json.as_bytes());
                 }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let _ = file.write(json.as_bytes()).await;
+            };
+            std::thread::spawn(move || pollster::block_on(task));
+        }
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            match save_with_fs_access_api(&json).await {
+                // Saved through the real dialog, or the user cancelled it --
+                // either way, done.
+                Ok(()) => {}
+                // No File System Access API in this browser: fall back to the
+                // classic download (lands in the Downloads folder).
+                Err(()) => {
+                    let dialog = rfd::AsyncFileDialog::new().set_file_name("scene.json");
+                    if let Some(file) = dialog.save_file().await {
+                        let _ = file.write(json.as_bytes()).await;
+                    }
                 }
             }
-        };
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(task);
-        #[cfg(not(target_arch = "wasm32"))]
-        std::thread::spawn(move || pollster::block_on(task));
+        });
     }
 
     /// Opens the async file dialog to pick a scene .json; its bytes land in
-    /// `picked_scene` for a later tick to parse.
-    fn open_scene_picker(&self) {
-        let picked = self.picked_scene.clone();
+    /// `destination` for a later tick to handle.  Used by both File > Load
+    /// Scene (`picked_scene`) and the startup-scene setting (`picked_startup`).
+    fn open_scene_picker_into(destination: Arc<Mutex<Option<Vec<u8>>>>) {
         let task = async move {
             let dialog = rfd::AsyncFileDialog::new();
             #[cfg(not(target_arch = "wasm32"))]
             let dialog = dialog.add_filter("Scene", &["json"]);
             if let Some(file) = dialog.pick_file().await {
                 let bytes = file.read().await;
-                *picked.lock().unwrap() = Some(bytes);
+                *destination.lock().unwrap() = Some(bytes);
             }
         };
         #[cfg(target_arch = "wasm32")]
@@ -1039,20 +1207,10 @@ impl SplatGame {
         std::thread::spawn(move || pollster::block_on(task));
     }
 
-    /// Replaces the current editable scene (actors / lights / particles) with the
-    /// one parsed from `bytes`, restores the camera, and applies saved splat
-    /// params to matching loaded clouds.  Splat clouds themselves aren't
-    /// recreated -- the .ply data isn't in the scene file.  Returns a short
-    /// summary on success.
-    fn load_scene_from_bytes(
-        &mut self,
-        bytes: &[u8],
-        model_resources: &[(String, ModelHandle)],
-        renderer: &mut Renderer,
-    ) -> Result<String, String> {
-        let scene: SceneFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-
-        // Clear the current editable scene from the renderer and our lists.
+    /// Empties the scene: actors, lights, particles and splat clouds all removed
+    /// from the lists and the renderer (File > New Scene, and the first step of
+    /// a scene load).
+    fn clear_scene(&mut self, renderer: &mut Renderer) {
         for actor in self.scene_actors.drain(..) {
             renderer.remove_actor(&actor);
         }
@@ -1060,10 +1218,27 @@ impl SplatGame {
             renderer.remove_particle_actor(&particle.handle);
         }
         self.scene_lights.clear();
+        self.scene_splats.clear();
+        renderer.clear_gaussian_splats();
+        self.active_splat = 0;
+        self.pending_splats.lock().unwrap().clear();
         self.selected = None;
+        self.multi_selected.clear();
+        self.context_menu = None;
         self.confirm_delete = None;
         self.name_edit = None;
+    }
 
+    /// Rebuilds the editable scene objects (actors / lights / particles +
+    /// camera) from a parsed scene.  Splat clouds are NOT loaded here -- their
+    /// .ply reads are async; see `queue_splat_load` / `initialize_world`.
+    /// Assumes the scene was already cleared.
+    fn apply_scene_objects(
+        &mut self,
+        scene: &SceneFile,
+        model_resources: &[(String, ModelHandle)],
+        renderer: &mut Renderer,
+    ) {
         let model_handle = |name: &str| -> ModelHandle {
             model_resources
                 .iter()
@@ -1106,40 +1281,108 @@ impl SplatGame {
             );
         }
 
-        // Apply saved params + transform to any loaded cloud with a matching name.
-        for dto in &scene.splats {
-            if let Some(splat) = self.scene_splats.iter_mut().find(|s| s.name == dto.name) {
-                splat.params = SplatParams {
-                    falloff: dto.params.falloff,
-                    scale: dto.params.scale,
-                    contrast: dto.params.contrast,
-                    max_sh_degree: dto.params.max_sh_degree,
-                    overall_scale: dto.params.overall_scale,
-                };
-                // Uniform scale only: use the first component for all axes.
-                let u = dto.scale[0];
-                splat.transform = ActorTransform::new(
-                    arr_vec3(dto.position),
-                    arr_quat(dto.rotation),
-                    CgVec3::new(u, u, u),
-                );
+        if let Some(camera) = &scene.camera {
+            self.game_camera.set_position(&arr_vec3(camera.position));
+            self.game_camera.set_rotation(&arr_vec3(camera.rotation));
+            renderer.set_camera(&self.game_camera);
+        }
+    }
+
+    /// The world transform a splat DTO describes (scale collapsed to uniform).
+    fn splat_dto_transform(dto: &SplatDto) -> ActorTransform {
+        let u = dto.scale[0];
+        ActorTransform::new(
+            arr_vec3(dto.position),
+            arr_quat(dto.rotation),
+            CgVec3::new(u, u, u),
+        )
+    }
+
+    /// Fetches a scene splat's .ply bytes on a background task (native thread /
+    /// wasm fetch) and queues them for `drain_pending_splats` to upload.
+    fn queue_splat_load(&self, dto: SplatDto) {
+        let pending = self.pending_splats.clone();
+        let task = async move {
+            match load_binary(&dto.path).await {
+                Ok(bytes) => pending.lock().unwrap().push((dto, bytes)),
+                Err(e) => log!("Couldn't read splat '{}': {e}", dto.path),
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(task);
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || pollster::block_on(task));
+    }
+
+    /// Uploads any splat .ply bytes that arrived from `queue_splat_load`.  The
+    /// first cloud to arrive becomes the rendered one.
+    fn drain_pending_splats(&mut self, renderer: &mut Renderer) {
+        loop {
+            // Take one entry per iteration (not holding the lock across the
+            // GPU upload).
+            let entry = self.pending_splats.lock().unwrap().pop();
+            let Some((dto, bytes)) = entry else {
+                return;
+            };
+            let params = dto.params.to_params();
+            match renderer.load_gaussian_splat_from_bytes(&bytes, &dto.name, &params) {
+                Ok(_info) => {
+                    self.scene_splats.push(SceneSplat {
+                        name: dto.name.clone(),
+                        path: dto.path.clone(),
+                        params,
+                        transform: Self::splat_dto_transform(&dto),
+                    });
+                    if self.scene_splats.len() == 1 {
+                        self.activate_splat(0, renderer);
+                    }
+                }
+                Err(reason) => {
+                    self.status = Some((
+                        format!("Couldn't load splat {}: {reason}", dto.name),
+                        STATUS_RED,
+                        10.0,
+                    ));
+                }
             }
         }
-        if !self.scene_splats.is_empty() {
-            let active = self.active_splat.min(self.scene_splats.len() - 1);
-            self.activate_splat(active, renderer);
+    }
+
+    /// Replaces the whole scene with the one parsed from `bytes`: objects and
+    /// camera immediately, splat clouds via background .ply loads (they appear
+    /// as their files arrive).  Returns a short summary on success.
+    fn load_scene_from_bytes(
+        &mut self,
+        bytes: &[u8],
+        model_resources: &[(String, ModelHandle)],
+        renderer: &mut Renderer,
+    ) -> Result<String, String> {
+        let scene: SceneFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+
+        self.clear_scene(renderer);
+        self.apply_scene_objects(&scene, model_resources, renderer);
+
+        let mut skipped_splats = 0;
+        for dto in &scene.splats {
+            if dto.path.is_empty() {
+                // A cloud picked through a browser dialog: no re-readable path.
+                skipped_splats += 1;
+                continue;
+            }
+            self.queue_splat_load(dto.clone());
         }
 
-        self.game_camera.set_position(&arr_vec3(scene.camera.position));
-        self.game_camera.set_rotation(&arr_vec3(scene.camera.rotation));
-        renderer.set_camera(&self.game_camera);
-
-        Ok(format!(
-            "{} actors, {} lights, {} particles",
+        let mut summary = format!(
+            "{} actors, {} lights, {} particles, {} splats",
             self.scene_actors.len(),
             self.scene_lights.len(),
             self.scene_particles.len(),
-        ))
+            scene.splats.len() - skipped_splats,
+        );
+        if skipped_splats > 0 {
+            summary.push_str(&format!(" ({skipped_splats} splats had no path; re-load their .ply manually)"));
+        }
+        Ok(summary)
     }
 }
 
@@ -1159,7 +1402,12 @@ impl GameEngine for SplatGame {
             scene_particles: Vec::new(),
             particle_textures: Vec::new(),
             selected: None,
+            multi_selected: Vec::new(),
+            context_menu: None,
+            rmb_drag_accum: 0.0,
             confirm_delete: None,
+            confirm_new_scene: false,
+            has_custom_startup: editor_config::load_startup_scene().is_some(),
             selected_resource: None,
             name_edit: None,
             name_edit_buffer: String::new(),
@@ -1176,6 +1424,8 @@ impl GameEngine for SplatGame {
             picked_ply: Arc::new(Mutex::new(None)),
             picker_state: Arc::new(Mutex::new(PickerState::Idle)),
             picked_scene: Arc::new(Mutex::new(None)),
+            picked_startup: Arc::new(Mutex::new(None)),
+            pending_splats: Arc::new(Mutex::new(Vec::new())),
             status: None,
             touch_pads: {
                 // Desktop viewer: keep the pads hidden until a touch appears.
@@ -1195,30 +1445,6 @@ impl GameEngine for SplatGame {
     ) {
         log!("SplatGame::initialize_world()");
         game_config.clear_color = CgVec4::new(0.02, 0.02, 0.03, 1.0);
-
-        // Preload every available cloud; record the ones that loaded (each with
-        // its own default params) so the cycle hotkey and HUD only reference real
-        // ones.
-        for path in SPLAT_PLY_PATHS {
-            if renderer.load_gaussian_splat(path, &default_splat_params()).await {
-                let name = path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(path)
-                    .trim_end_matches(".ply")
-                    .to_string();
-                self.scene_splats.push(SceneSplat {
-                    name,
-                    params: default_splat_params(),
-                    transform: ActorTransform::from_position(CG_VEC3_ZERO),
-                });
-            }
-        }
-        renderer.set_active_gaussian_splat(0);
-        if let Some(splat) = self.scene_splats.first() {
-            renderer.set_gaussian_splat_params(&splat.params);
-            renderer.set_gaussian_splat_transform(&splat.transform);
-        }
         renderer.set_tonemap_enabled(true);
 
         // Preload the editor's model resources (Resources tab / the Details
@@ -1240,6 +1466,42 @@ impl GameEngine for SplatGame {
             }
             let handle = renderer.preload_texture(&texture_file).await;
             self.particle_textures.push((texture_file, handle));
+        }
+
+        // Open the startup scene: the user's saved one, or the built-in default
+        // (the church) otherwise.  Since we're async here, splat clouds load
+        // directly instead of through the pending queue.
+        let scene = editor_config::load_startup_scene()
+            .and_then(|json| match serde_json::from_str::<SceneFile>(&json) {
+                Ok(scene) => Some(scene),
+                Err(e) => {
+                    log!("Bad startup scene ({e}); using the default");
+                    None
+                }
+            })
+            .unwrap_or_else(default_startup_scene);
+        for dto in &scene.splats {
+            if dto.path.is_empty() {
+                continue; // No re-readable source (was a browser file pick).
+            }
+            let params = dto.params.to_params();
+            if renderer.load_gaussian_splat(&dto.path, &params).await {
+                self.scene_splats.push(SceneSplat {
+                    name: dto.name.clone(),
+                    path: dto.path.clone(),
+                    params,
+                    transform: Self::splat_dto_transform(dto),
+                });
+            }
+        }
+        let model_resources: Vec<(String, ModelHandle)> = renderer
+            .get_model_resources()
+            .into_iter()
+            .map(|(path, handle)| (resource_display_name(&path), handle))
+            .collect();
+        self.apply_scene_objects(&scene, &model_resources, renderer);
+        if !self.scene_splats.is_empty() {
+            self.activate_splat(0, renderer);
         }
 
         // Help is reachable from the menu bar's Help button, so drop the
@@ -1267,7 +1529,16 @@ impl GameEngine for SplatGame {
         // Movement + look (keyboard + right-drag mouse) come from the shared fly
         // camera.  The touch pads further add to `move_vec` / `camera_rot` before
         // they're committed below; pitch is clamped once, after every source.
-        let mut move_vec = self.fly_camera.wasd_direction(&self.game_camera, input_manager);
+        // In editor mode WASD only moves while the right mouse button is held
+        // (Unreal-style flythrough): W/E/R are also the gizmo hotkeys, and the
+        // held button is what disambiguates.  Game mode moves freely.
+        let flythrough =
+            !self.editor_mode || input_manager.get_key_state("mouse_right").is_down();
+        let mut move_vec = if flythrough {
+            self.fly_camera.wasd_direction(&self.game_camera, input_manager)
+        } else {
+            CG_VEC3_ZERO
+        };
         let mut camera_rot = self.game_camera.get_rotation();
         self.fly_camera
             .apply_key_look(&mut camera_rot, input_manager, delta_time);
@@ -1311,9 +1582,15 @@ impl GameEngine for SplatGame {
         // applied after the egui pass (avoids borrowing self inside closures).
         let mut do_save_scene = false;
         let mut do_load_scene = false;
+        let mut do_new_scene = false;
+        let mut do_set_startup = false;
+        let mut do_clear_startup = false;
+        let mut do_pick_startup = false;
         let mut do_add: Option<AddKind> = None;
         let mut delete_object: Option<Selection> = None;
-        let mut select_object: Option<Selection> = None;
+        // A selection made this frame; the bool is "additive" (ctrl held), which
+        // toggles membership in the multi-selection instead of replacing it.
+        let mut select_object: Option<(Selection, bool)> = None;
         // Local rename accumulators (one per outliner section), applied after the
         // egui pass so the lists aren't mutably borrowed while iterating.
         let mut rename_actors: Vec<(usize, String)> = Vec::new();
@@ -1356,6 +1633,12 @@ impl GameEngine for SplatGame {
                         ui.separator();
                         ui.menu_button("File", |ui| {
                             // Buttons auto-close the menu on click.
+                            if ui.button("New Scene").clicked() {
+                                // Asks first (the modal below): it wipes
+                                // everything, including unsaved work.
+                                self.confirm_new_scene = true;
+                            }
+                            ui.separator();
                             do_save_scene |= ui.button("Save Scene…").clicked();
                             do_load_scene |= ui.button("Load Scene…").clicked();
                             ui.separator();
@@ -1598,17 +1881,16 @@ impl GameEngine for SplatGame {
                                                 if i == self.active_splat { "● " } else { "    " };
                                             let label = format!("{marker}{}", splat.name);
                                             if ui.selectable_label(is_selected, label).clicked() {
-                                                select_object = Some(Selection::Splat(i));
+                                                select_object =
+                                                    Some((Selection::Splat(i), false));
                                             }
                                         }
 
-                                        // Unified "Add" menu (actor / light / particle).
-                                        ui.add_space(8.0);
-                                        ui.menu_button("➕ Add", |ui| add_menu_ui(ui, &mut do_add));
-
-                                        // One outliner section per object kind.  Names are
-                                        // collected first so the lists aren't borrowed while
-                                        // the section mutates self.name_edit etc.
+                                        // One outliner section per object kind,
+                                        // each with its own "+" add control.
+                                        // Names are collected first so the lists
+                                        // aren't borrowed while the section
+                                        // mutates self.name_edit etc.
                                         let actor_names: Vec<String> = self
                                             .scene_actors
                                             .iter()
@@ -1620,12 +1902,22 @@ impl GameEngine for SplatGame {
                                             Selection::Actor,
                                             &actor_names,
                                             self.selected,
+                                            &self.multi_selected,
                                             &mut self.name_edit,
                                             &mut self.name_edit_buffer,
                                             &mut self.name_edit_focus,
                                             &mut select_object,
                                             &mut rename_actors,
                                             &mut self.confirm_delete,
+                                            |ui| {
+                                                if ui
+                                                    .small_button("+")
+                                                    .on_hover_text("Add an actor")
+                                                    .clicked()
+                                                {
+                                                    do_add = Some(AddKind::Actor);
+                                                }
+                                            },
                                         );
 
                                         let light_names: Vec<String> = self
@@ -1639,12 +1931,28 @@ impl GameEngine for SplatGame {
                                             Selection::Light,
                                             &light_names,
                                             self.selected,
+                                            &self.multi_selected,
                                             &mut self.name_edit,
                                             &mut self.name_edit_buffer,
                                             &mut self.name_edit_focus,
                                             &mut select_object,
                                             &mut rename_lights,
                                             &mut self.confirm_delete,
+                                            |ui| {
+                                                ui.menu_button("+", |ui| {
+                                                    for (label, ty) in [
+                                                        ("Directional", LightType::Directional),
+                                                        ("Point", LightType::Point),
+                                                        ("Spot", LightType::Spot),
+                                                    ] {
+                                                        if ui.button(label).clicked() {
+                                                            do_add = Some(AddKind::Light(ty));
+                                                        }
+                                                    }
+                                                })
+                                                .response
+                                                .on_hover_text("Add a light");
+                                            },
                                         );
 
                                         let particle_names: Vec<String> = self
@@ -1658,12 +1966,26 @@ impl GameEngine for SplatGame {
                                             Selection::Particle,
                                             &particle_names,
                                             self.selected,
+                                            &self.multi_selected,
                                             &mut self.name_edit,
                                             &mut self.name_edit_buffer,
                                             &mut self.name_edit_focus,
                                             &mut select_object,
                                             &mut rename_particles,
                                             &mut self.confirm_delete,
+                                            |ui| {
+                                                ui.menu_button("+", |ui| {
+                                                    for (i, preset) in
+                                                        PARTICLE_PRESETS.iter().enumerate()
+                                                    {
+                                                        if ui.button(*preset).clicked() {
+                                                            do_add = Some(AddKind::Particle(i));
+                                                        }
+                                                    }
+                                                })
+                                                .response
+                                                .on_hover_text("Add a particle system");
+                                            },
                                         );
                                     }
                                     EditorTab::Details => match self.selected {
@@ -1743,6 +2065,47 @@ impl GameEngine for SplatGame {
                                         if ui.button("Keybindings…").clicked() {
                                             self.show_settings = true;
                                         }
+
+                                        // What loads when the editor opens: the
+                                        // built-in default (church) until the
+                                        // user saves their own.
+                                        ui.add_space(12.0);
+                                        ui.label(
+                                            egui::RichText::new("Start-up Scene").strong(),
+                                        );
+                                        ui.label(if self.has_custom_startup {
+                                            "Current: your saved scene"
+                                        } else {
+                                            "Current: default (church)"
+                                        });
+                                        if ui
+                                            .button("Choose start-up scene…")
+                                            .on_hover_text(
+                                                "Pick a scene .json to open on \
+                                                 every launch",
+                                            )
+                                            .clicked()
+                                        {
+                                            do_pick_startup = true;
+                                        }
+                                        if ui
+                                            .button("Use current scene as start-up")
+                                            .on_hover_text(
+                                                "Opens this scene on every launch",
+                                            )
+                                            .clicked()
+                                        {
+                                            do_set_startup = true;
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.has_custom_startup,
+                                                egui::Button::new("Reset to default"),
+                                            )
+                                            .clicked()
+                                        {
+                                            do_clear_startup = true;
+                                        }
                                     }
                                 }
                             });
@@ -1786,6 +2149,26 @@ impl GameEngine for SplatGame {
                         self.confirm_delete = None;
                     }
                 }
+            }
+        }
+
+        // New Scene confirmation: it empties everything, unsaved work included.
+        if self.confirm_new_scene {
+            let modal = egui::Modal::new(egui::Id::new("confirm_new_scene")).show(&ctx, |ui| {
+                ui.label("Start a new scene?  Unsaved changes will be lost.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("New Scene").clicked() {
+                        do_new_scene = true;
+                        self.confirm_new_scene = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_new_scene = false;
+                    }
+                });
+            });
+            if modal.should_close() {
+                self.confirm_new_scene = false;
             }
         }
 
@@ -1910,7 +2293,7 @@ impl GameEngine for SplatGame {
             None
         };
         if let Some(i) = clicked_light {
-            select_object = Some(Selection::Light(i));
+            select_object = Some((Selection::Light(i), false));
         }
 
         // Translate/rotate/scale gizmo on the selected object, drawn over the 3D
@@ -1997,27 +2380,142 @@ impl GameEngine for SplatGame {
         // Viewport click-to-select: after the gizmo (so grabbing a handle wins)
         // and only when a light icon didn't take the click.  Picks the front-most
         // actor/particle under the pointer; failing that, the active splat -- so
-        // splats are only pickable when no 3D object was.
+        // splats are only pickable when no 3D object was.  Ctrl+click adds to /
+        // removes from the multi-selection (and never falls through to the
+        // splat, so a missed ctrl+click doesn't wipe the set).
         if editor && clicked_light.is_none() && !self.gizmo.is_active() {
-            let (pointer, pressed) =
-                ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_pressed()));
+            let (pointer, pressed, additive) = ctx.input(|i| {
+                (
+                    i.pointer.interact_pos(),
+                    i.pointer.primary_pressed(),
+                    i.modifiers.ctrl || i.modifiers.command,
+                )
+            });
             if pressed && !ctx.egui_wants_pointer_input() {
                 if let Some(p) = pointer {
                     if let Some(sel) = self.pick_object(&ctx, game_config, p) {
-                        select_object = Some(sel);
-                    } else if !self.scene_splats.is_empty() {
-                        select_object = Some(Selection::Splat(self.active_splat));
+                        select_object = Some((sel, additive));
+                    } else if !additive && !self.scene_splats.is_empty() {
+                        select_object = Some((Selection::Splat(self.active_splat), false));
+                    }
+                }
+            }
+        }
+
+        // Right-click (a click, not a look-drag) opens the context menu when
+        // exactly two actors are multi-selected.  Drag distance is accumulated
+        // from raw mouse motion because the cursor is grabbed while looking.
+        {
+            let rmb = input_manager.get_key_state("mouse_right");
+            if rmb.just_pressed() {
+                self.rmb_drag_accum = 0.0;
+            }
+            if rmb.is_down() {
+                let (dx, dy) = input_manager.get_mouse_raw_delta();
+                self.rmb_drag_accum += dx.abs() as f32 + dy.abs() as f32;
+            }
+            let released = ctx
+                .input(|i| i.pointer.button_released(egui::PointerButton::Secondary));
+            if editor
+                && released
+                && self.rmb_drag_accum < 6.0
+                && !ctx.egui_wants_pointer_input()
+                && matches!(
+                    self.multi_selected.as_slice(),
+                    [Selection::Actor(_), Selection::Actor(_)]
+                )
+            {
+                if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                    self.context_menu = Some(p);
+                }
+            }
+        }
+
+        // The context menu itself: currently one action, snapping the second
+        // selected actor onto the first.
+        let mut do_snap: Option<(usize, usize)> = None; // (target, source)
+        if editor {
+            if let Some(menu_pos) = self.context_menu {
+                let pair = match self.multi_selected.as_slice() {
+                    [Selection::Actor(first), Selection::Actor(second)] => self
+                        .scene_actors
+                        .get(*first)
+                        .zip(self.scene_actors.get(*second))
+                        .map(|(a, b)| {
+                            (*first, *second, a.get_name().to_string(), b.get_name().to_string())
+                        }),
+                    _ => None,
+                };
+                match pair {
+                    None => self.context_menu = None, // Selection changed under it.
+                    Some((first, second, first_name, second_name)) => {
+                        let menu = egui::Area::new(egui::Id::new("viewport_context_menu"))
+                            .fixed_pos(menu_pos)
+                            .constrain(true)
+                            .show(&ctx, |ui| {
+                                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                                    if ui
+                                        .button(format!(
+                                            "Snap \"{second_name}\" to \"{first_name}\""
+                                        ))
+                                        .clicked()
+                                    {
+                                        do_snap = Some((second, first));
+                                        self.context_menu = None;
+                                    }
+                                });
+                            });
+                        // Click anywhere else or Escape dismisses.
+                        let (clicked, pointer, escape) = ctx.input(|i| {
+                            (
+                                i.pointer.any_pressed(),
+                                i.pointer.interact_pos(),
+                                i.key_pressed(egui::Key::Escape),
+                            )
+                        });
+                        let outside = clicked
+                            && pointer
+                                .is_none_or(|p| !menu.response.rect.expand(4.0).contains(p));
+                        if outside || escape {
+                            self.context_menu = None;
+                        }
                     }
                 }
             }
         }
 
         // Apply the editor actions gathered from the menus / Scene tab.
-        if let Some(sel) = select_object {
-            self.selected = Some(sel);
+        if let Some((sel, additive)) = select_object {
+            if additive {
+                // Ctrl+click toggles membership; the newest pick becomes the
+                // primary selection (gizmo/Details target).
+                if let Some(at) = self.multi_selected.iter().position(|s| *s == sel) {
+                    self.multi_selected.remove(at);
+                    self.selected = self.multi_selected.last().copied();
+                } else {
+                    self.multi_selected.push(sel);
+                    self.selected = Some(sel);
+                }
+            } else {
+                self.multi_selected.clear();
+                self.multi_selected.push(sel);
+                self.selected = Some(sel);
+                self.context_menu = None;
+            }
             // Selecting a splat also makes it the rendered cloud.
             if let Selection::Splat(i) = sel {
                 self.activate_splat(i, renderer);
+            }
+        }
+        // Snap from the context menu: move the target actor onto the source.
+        if let Some((target, source)) = do_snap {
+            if target != source {
+                if let Some(pos) = self.scene_actors.get(source).map(|a| a.get_position()) {
+                    if let Some(actor) = self.scene_actors.get_mut(target) {
+                        actor.set_position(&pos);
+                        renderer.add_or_update_actor(actor);
+                    }
+                }
             }
         }
         // Apply outliner renames (accumulated per section during the pass).
@@ -2072,11 +2570,46 @@ impl GameEngine for SplatGame {
                 _ => {}
             }
         }
+        if do_new_scene {
+            self.clear_scene(renderer);
+            self.status = Some(("New scene".to_string(), STATUS_WHITE, 3.0));
+        }
+        if do_set_startup {
+            // Snapshot the current scene as the startup scene.  Clouds picked
+            // through a browser dialog have no re-readable path and won't
+            // reload; everything else restores on the next launch.
+            if let Ok(json) = serde_json::to_string_pretty(&self.build_scene_file(&model_resources))
+            {
+                editor_config::save_startup_scene(&json);
+                self.has_custom_startup = editor_config::load_startup_scene().is_some();
+                self.status = Some(if self.has_custom_startup {
+                    ("Start-up scene saved".to_string(), STATUS_WHITE, 4.0)
+                } else {
+                    (
+                        "Couldn't save the start-up scene".to_string(),
+                        STATUS_RED,
+                        6.0,
+                    )
+                });
+            }
+        }
+        if do_clear_startup {
+            editor_config::clear_startup_scene();
+            self.has_custom_startup = false;
+            self.status = Some((
+                "Start-up scene reset to default".to_string(),
+                STATUS_WHITE,
+                4.0,
+            ));
+        }
         if do_save_scene {
             self.save_scene(&model_resources);
         }
         if do_load_scene {
-            self.open_scene_picker();
+            Self::open_scene_picker_into(self.picked_scene.clone());
+        }
+        if do_pick_startup {
+            Self::open_scene_picker_into(self.picked_startup.clone());
         }
         // Apply a loaded scene once its file has been read (async, like the .ply).
         let scene_bytes = self.picked_scene.lock().unwrap().take();
@@ -2087,6 +2620,33 @@ impl GameEngine for SplatGame {
                 Err(reason) => (format!("Couldn't load scene: {reason}"), STATUS_RED, 10.0),
             });
         }
+        // Persist a picked startup scene once its file has been read.  Validated
+        // first so a bad pick can't brick the next launch.
+        let startup_bytes = self.picked_startup.lock().unwrap().take();
+        if let Some(bytes) = startup_bytes {
+            let valid = std::str::from_utf8(&bytes)
+                .ok()
+                .filter(|text| serde_json::from_str::<SceneFile>(text).is_ok())
+                .map(|text| text.to_string());
+            self.status = Some(match valid {
+                Some(json) => {
+                    editor_config::save_startup_scene(&json);
+                    self.has_custom_startup = editor_config::load_startup_scene().is_some();
+                    (
+                        "Start-up scene set (loads on next launch)".to_string(),
+                        STATUS_WHITE,
+                        5.0,
+                    )
+                }
+                None => (
+                    "That file isn't a valid scene .json".to_string(),
+                    STATUS_RED,
+                    8.0,
+                ),
+            });
+        }
+        // Upload splat clouds whose .ply bytes arrived from a scene load.
+        self.drain_pending_splats(renderer);
 
         // On-screen move/look touch pads (shared TouchPads controller).  Left
         // pad adds to movement, right pad turns the camera.
@@ -2133,12 +2693,15 @@ impl GameEngine for SplatGame {
             self.open_ply_picker();
         }
         let picked = self.picked_ply.lock().unwrap().take();
-        if let Some((file_name, bytes)) = picked {
+        if let Some((file_name, path, bytes)) = picked {
             let name = file_name.trim_end_matches(".ply").to_string();
             match renderer.load_gaussian_splat_from_bytes(&bytes, &name, &default_splat_params()) {
                 Ok(info) => {
                     self.scene_splats.push(SceneSplat {
                         name: name.clone(),
+                        // Native picks give a re-readable path (stored in saved
+                        // scenes); browser picks don't.
+                        path: path.unwrap_or_default(),
                         params: default_splat_params(),
                         transform: ActorTransform::from_position(CG_VEC3_ZERO),
                     });
@@ -2249,7 +2812,7 @@ impl GameEngine for SplatGame {
             .map_or("none", |s| s.name.as_str());
         let splat_count = renderer.active_gaussian_splat_count();
         renderer.set_debug_game_msg(&format!(
-            "Move: [W][A][S][D]   [Shift] sprint   Look: [Arrow Keys]\n\
+            "Move: [W][A][S][D] (editor: hold right mouse)   [Shift] sprint   Look: [Arrow Keys]\n\
              Touch: left pad = move,  right pad = look\n\n\
              [Space]     Next scene  {} ({}/{})   {} splats\n\
              [L]         Load your own .ply\n\
