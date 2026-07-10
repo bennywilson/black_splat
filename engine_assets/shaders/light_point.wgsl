@@ -1,6 +1,7 @@
-// Deferred point light: omnidirectional Lambert diffuse + Blinn-Phong
-// specular with a smooth quadratic falloff out to position_range.w.
-// Fullscreen triangle, additively accumulated with the other light passes.
+// Deferred point light: omnidirectional Cook-Torrance GGX PBR with a smooth
+// quadratic falloff out to position_range.w.  Point lights never cast
+// shadows.  Fullscreen triangle, additively accumulated with the other light
+// passes.
 
 struct LightUniform {
     inv_view_proj: mat4x4<f32>,
@@ -31,6 +32,38 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
+// Cook-Torrance GGX with Schlick Fresnel and Smith-Schlick geometry.  The
+// 1/PI diffuse normalization is folded into light intensity so an intensity
+// of 1 stays intuitively bright.
+fn pbr_brdf(albedo: vec3<f32>, metallic: f32, roughness: f32,
+            n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>) -> vec3<f32> {
+    let h = normalize(v + l);
+    let n_dot_l = max(dot(n, l), 0.0);
+    let n_dot_v = max(dot(n, v), 0.0001);
+    let n_dot_h = max(dot(n, h), 0.0);
+    let h_dot_v = max(dot(h, v), 0.0);
+
+    let r = clamp(roughness, 0.045, 1.0);
+    let a = r * r;
+    let a2 = a * a;
+
+    // GGX normal distribution.
+    let d_denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    let d = a2 / (3.14159265 * d_denom * d_denom);
+
+    // Smith-Schlick geometry term.
+    let k = (r + 1.0) * (r + 1.0) / 8.0;
+    let g = (n_dot_v / (n_dot_v * (1.0 - k) + k)) * (n_dot_l / (n_dot_l * (1.0 - k) + k));
+
+    // Schlick Fresnel: dielectrics reflect ~4%, metals tint by albedo.
+    let f0 = mix(vec3<f32>(0.04, 0.04, 0.04), albedo, metallic);
+    let f = f0 + (vec3<f32>(1.0, 1.0, 1.0) - f0) * pow(1.0 - h_dot_v, 5.0);
+
+    let specular = d * g * f / max(4.0 * n_dot_v * n_dot_l, 0.0001);
+    let k_d = (vec3<f32>(1.0, 1.0, 1.0) - f) * (1.0 - metallic);
+    return (k_d * albedo + specular) * radiance * n_dot_l;
+}
+
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let coords = vec2<i32>(pos.xy);
@@ -41,7 +74,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     let albedo = textureLoad(t_albedo, coords, 0).rgb;
     let normal = normalize(textureLoad(t_normal, coords, 0).xyz * 2.0 - 1.0);
-    let spec = textureLoad(t_spec, coords, 0);
+    let mr = textureLoad(t_spec, coords, 0);
 
     // World position rebuilt from the depth buffer.
     let uv = pos.xy / light.target_dims.xy;
@@ -59,14 +92,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     let to_light = to_light_vec / max(dist, 0.0001);
-    let n_dot_l = max(dot(normal, to_light), 0.0);
-
-    // Blinn-Phong specular; gloss (spec.a) maps to the exponent.
     let view_dir = normalize(light.camera_pos.xyz - world_pos);
-    let half_dir = normalize(to_light + view_dir);
-    let shininess = mix(2.0, 128.0, spec.a);
-    let spec_term = pow(max(dot(normal, half_dir), 0.0), shininess) * step(0.0001, n_dot_l);
 
-    let lit = albedo * n_dot_l + spec.rgb * spec_term;
-    return vec4<f32>(lit * light.color_cone.rgb * attenuation, 1.0);
+    let lit = pbr_brdf(albedo, mr.x, mr.y, normal, view_dir, to_light,
+                       light.color_cone.rgb * attenuation);
+    return vec4<f32>(lit, 1.0);
 }

@@ -57,15 +57,18 @@ make_handle!(ByteVec, ByteFileHandle, ByteMappings);
 make_handle!(Model, ModelHandle, ModelMappings);
 make_handle!(Material, MaterialHandle, MaterialMappings);
 
-/// How to build a [`Material`]: optional color/spec texture paths (a missing
-/// one falls back to the built-in 1x1 white) plus the constants each texture is
-/// multiplied by.  `spec_constant` is (rgb specular tint, a gloss 0..1).
+/// How to build a [`Material`]: optional color / metallic-roughness texture
+/// paths (a missing one falls back to the built-in 1x1 white) plus the
+/// constants each texture is multiplied by.  The MR texture follows the glTF
+/// layout (G = roughness, B = metallic); `mr_constant` is (x metallic
+/// multiplier, y roughness multiplier) -- with no texture the constants pass
+/// through as the final PBR values.
 #[derive(Clone)]
 pub struct MaterialDesc {
     pub color_texture: Option<String>,
     pub spec_texture: Option<String>,
     pub color_constant: CgVec4,
-    pub spec_constant: CgVec4,
+    pub mr_constant: CgVec4,
 }
 
 impl Default for MaterialDesc {
@@ -74,21 +77,22 @@ impl Default for MaterialDesc {
             color_texture: None,
             spec_texture: None,
             color_constant: CG_VEC4_ONE,
-            spec_constant: CgVec4::new(0.0, 0.0, 0.0, 0.5),
+            mr_constant: CgVec4::new(0.0, 0.85, 0.0, 0.0),
         }
     }
 }
 
 /// A reusable surface description an actor can override its model's textures
-/// with: a color texture and a specular texture, each multiplied by a constant
-/// in the G-buffer shader (output = texture * constant).  The bind group is
-/// laid out identically to a model's texture bind group (0: color texture,
-/// 1: sampler, 2: second texture), so passes can bind either interchangeably.
+/// with: a color texture and a metallic-roughness texture, each multiplied by
+/// a constant in the G-buffer shader (output = texture * constant).  The bind
+/// group is laid out identically to a model's texture bind group (0: color
+/// texture, 1: sampler, 2: second texture), so passes can bind either
+/// interchangeably.
 pub struct Material {
     pub color_texture: TextureHandle,
     pub spec_texture: TextureHandle,
     pub color_constant: CgVec4,
-    pub spec_constant: CgVec4,
+    pub mr_constant: CgVec4,
     pub bind_group: wgpu::BindGroup,
 }
 
@@ -216,6 +220,18 @@ impl AssetManager {
         file_to_string_buffer.insert(
             "light_spot.wgsl".to_string(),
             include_str!("../engine_assets/shaders/light_spot.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "shadow_depth.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/shadow_depth.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "shadow_mask_cascades.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/shadow_mask_cascades.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "shadow_mask_spot.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/shadow_mask_spot.wgsl").to_string(),
         );
 
         #[cfg(feature = "wasm_include_3d")]
@@ -622,10 +638,7 @@ impl AssetManager {
 
     /// The built-in 1x1 white texture (created on first use); backs material
     /// slots that have no texture assigned, so constants pass through as-is.
-    async fn white_texture(
-        &mut self,
-        device_resources: &DeviceResources<'_>,
-    ) -> TextureHandle {
+    fn white_texture(&mut self, device_resources: &DeviceResources<'_>) -> TextureHandle {
         if let Some(handle) = self.white_texture {
             return handle;
         }
@@ -666,9 +679,8 @@ impl AssetManager {
         if let Some(handle) = self.material_mappings.names_to_handles.get(name) {
             return *handle;
         }
-        log!("AssetManager loading material {name}");
 
-        let white = self.white_texture(device_resources).await;
+        let white = self.white_texture(device_resources);
         let color_texture = match &desc.color_texture {
             Some(path) => self.load_texture(path, device_resources).await,
             None => white,
@@ -677,7 +689,52 @@ impl AssetManager {
             Some(path) => self.load_texture(path, device_resources).await,
             None => white,
         };
+        self.build_material(name, desc, color_texture, spec_texture, device_resources)
+    }
 
+    /// Synchronous material creation for texture-less (constant-only)
+    /// materials -- e.g. ones made in the editor's Resources panel from the
+    /// non-async frame tick.  Any texture paths in `desc` are ignored (the
+    /// built-in white is used); use [`load_material`](Self::load_material) to
+    /// load textures.
+    pub fn create_material(
+        &mut self,
+        name: &str,
+        desc: &MaterialDesc,
+        device_resources: &DeviceResources<'_>,
+    ) -> MaterialHandle {
+        if let Some(handle) = self.material_mappings.names_to_handles.get(name) {
+            return *handle;
+        }
+        let white = self.white_texture(device_resources);
+        self.build_material(name, desc, white, white, device_resources)
+    }
+
+    /// Overwrites a material's color and metallic/roughness constants.  Takes
+    /// effect immediately: the G-buffer pass reads them every frame.
+    pub fn update_material_constants(
+        &mut self,
+        handle: &MaterialHandle,
+        color_constant: &CgVec4,
+        mr_constant: &CgVec4,
+    ) {
+        if let Some(material) = self.material_mappings.handles_to_assets.get_mut(handle) {
+            material.color_constant = *color_constant;
+            material.mr_constant = *mr_constant;
+        }
+    }
+
+    // Shared tail of load_material/create_material: builds the bind group
+    // from already-resolved textures and registers the material under `name`.
+    fn build_material(
+        &mut self,
+        name: &str,
+        desc: &MaterialDesc,
+        color_texture: TextureHandle,
+        spec_texture: TextureHandle,
+        device_resources: &DeviceResources<'_>,
+    ) -> MaterialHandle {
+        log!("AssetManager loading material {name}");
         let device = &device_resources.device;
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
@@ -735,7 +792,7 @@ impl AssetManager {
             color_texture,
             spec_texture,
             color_constant: desc.color_constant,
-            spec_constant: desc.spec_constant,
+            mr_constant: desc.mr_constant,
             bind_group,
         };
 

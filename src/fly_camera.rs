@@ -27,9 +27,10 @@ pub struct FlyCamera {
     /// Base movement speed, in world units per second.
     pub move_rate: f32,
     /// Multiplier applied to [`move_rate`](Self::move_rate) while the shift key
-    /// is held. Use `> 1.0` to sprint (the viewer) or `< 1.0` to slow to a
-    /// careful walk (the 3D game).
+    /// is held.
     pub shift_move_multiplier: f32,
+
+    /// [todo]: remove
     /// Arrow-key look speed, in degrees per second.
     pub key_look_rate: f32,
     /// Right-drag mouse-look sensitivity, in degrees per pixel of raw motion.
@@ -40,17 +41,26 @@ pub struct FlyCamera {
     /// Invert the pitch (up/down) look direction for both keys and mouse.
     pub invert_pitch: bool,
     /// Inclusive pitch clamp range, in degrees, applied by [`clamp_pitch`](Self::clamp_pitch).
+    /// [todo] - use a range here?
     pub pitch_min: f32,
     pub pitch_max: f32,
 
-    /// True while the right mouse button is held for look: drives the one-shot
-    /// cursor grab/hide on press and the restore on release.
+    /// True while a right-drag look is engaged: drives the one-shot cursor
+    /// grab/hide when the drag starts and the restore on release.
     looking: bool,
+    /// Raw mouse travel accumulated while the right button is held, to tell a
+    /// right-click from a look-drag (see [`LOOK_DRAG_THRESHOLD`]).
+    look_drag_accum: f64,
 }
 
+/// Raw mouse travel (physical px) a right-button hold must cover before look
+/// engages and the cursor is grabbed/hidden.  Below this the press stays an
+/// ordinary right-click (e.g. the editor's context menu) -- important in the
+/// browser, where grabbing on the bare press fires a pointer-lock "press Esc
+/// to show your cursor" toast on every right-click and swallows the release.
+const LOOK_DRAG_THRESHOLD: f64 = 4.0;
+
 impl Default for FlyCamera {
-    /// Defaults tuned for a fly-through viewer (full 3D movement, wide pitch
-    /// range, right-drag mouse look).
     fn default() -> Self {
         Self {
             move_rate: 1.0,
@@ -62,6 +72,7 @@ impl Default for FlyCamera {
             pitch_min: -89.0,
             pitch_max: 89.0,
             looking: false,
+            look_drag_accum: 0.0,
         }
     }
 }
@@ -85,10 +96,7 @@ impl FlyCamera {
         (forward, right_dir)
     }
 
-    /// The un-normalized WASD movement direction for this frame (zero when no
-    /// key is held). It is left un-scaled so the caller can add other
-    /// contributions (touch, etc.) before normalizing and scaling by
-    /// [`move_speed`](Self::move_speed) and `delta_time`.
+    /// The un-normalized WASD movement direction for this frame.
     pub fn wasd_direction(&self, camera: &Camera, input: &InputManager) -> CgVec3 {
         let (forward, right) = self.basis(camera);
         let mut dir = CG_VEC3_ZERO;
@@ -117,6 +125,7 @@ impl FlyCamera {
         }
     }
 
+    /// [todo: remove]
     /// Applies arrow-key look to a rotation `(yaw = .x, pitch = .y)`, honoring
     /// [`invert_pitch`](Self::invert_pitch). Does not clamp -- call
     /// [`clamp_pitch`](Self::clamp_pitch) once you've applied every look source
@@ -139,10 +148,6 @@ impl FlyCamera {
     }
 
     /// Applies right-drag mouse look to a rotation `(yaw = .x, pitch = .y)`.
-    /// While the right button is held the cursor is hidden and grabbed to the
-    /// window (so raw motion can turn the camera without the pointer leaving the
-    /// window), and it is restored on release. Does not clamp; see
-    /// [`clamp_pitch`](Self::clamp_pitch).
     pub fn apply_mouse_look(
         &mut self,
         rotation: &mut CgVec3,
@@ -151,20 +156,36 @@ impl FlyCamera {
     ) {
         let rmb = input.get_key_state("mouse_right");
         if rmb.is_down() || rmb.just_pressed() {
-            if !self.looking {
+            if rmb.just_pressed() {
+                self.look_drag_accum = 0.0;
+            }
+            let (dx, dy) = input.get_mouse_raw_delta();
+            self.look_drag_accum += dx.abs() + dy.abs();
+            // Only engage look (and the cursor grab) once the hold actually
+            // drags; a sub-threshold press-release stays a plain right-click.
+            if !self.looking && self.look_drag_accum >= LOOK_DRAG_THRESHOLD {
                 self.looking = true;
                 renderer.set_cursor_visible(false);
                 renderer.set_cursor_grabbed(true);
             }
-            let (dx, dy) = input.get_mouse_raw_delta();
-            rotation.x -= dx as f32 * self.mouse_look_sensitivity;
-            let dy = dy as f32 * self.mouse_look_sensitivity;
-            rotation.y += if self.invert_pitch { -dy } else { dy };
+            if self.looking {
+                rotation.x -= dx as f32 * self.mouse_look_sensitivity;
+                let dy = dy as f32 * self.mouse_look_sensitivity;
+                rotation.y += if self.invert_pitch { -dy } else { dy };
+            }
         } else if self.looking {
             self.looking = false;
             renderer.set_cursor_grabbed(false);
             renderer.set_cursor_visible(true);
         }
+    }
+
+    /// True while a right-drag look is engaged (the cursor is grabbed/hidden).
+    /// Lets the editor tell a look-drag from a plain right-click: if look never
+    /// engaged during a right-button hold, the release is a click (e.g. opens
+    /// the context menu).
+    pub fn is_looking(&self) -> bool {
+        self.looking
     }
 
     /// Clamps a rotation's pitch (`.y`) to `[pitch_min, pitch_max]`.

@@ -479,6 +479,9 @@ pub struct RenderContext<'ctx, 'dev> {
 /// both renderable on every backend (no float-target extensions needed).
 pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 pub const GBUFFER_SPEC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Screen-space shadow masks (per-light temp + the multiplied accumulation
+/// texture the Gaussian-splat overlay reads): single-channel, 1 = fully lit.
+pub const SHADOW_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 #[allow(dead_code)]
 pub struct DeviceResources<'a> {

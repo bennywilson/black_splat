@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+d#!/usr/bin/env bash
 # Starts the launcher dashboard and opens it in your browser. Python's
 # webbrowser module handles the "open a URL" part on every platform --
 # including from Git Bash on Windows, where invoking cmd.exe directly is a

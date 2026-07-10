@@ -42,9 +42,12 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     let albedo = textureLoad(t_albedo, coords, 0).rgb;
     let normal = normalize(textureLoad(t_normal, coords, 0).xyz * 2.0 - 1.0);
+    let metallic = textureLoad(t_spec, coords, 0).x;
 
     let up_ness = normal.y * 0.5 + 0.5;
     let sky = mix(light.color2.rgb, light.color_cone.rgb, up_ness);
 
-    return vec4<f32>(albedo * sky, 1.0);
+    // Metals have no diffuse; keep a little ambient so they don't go black
+    // (no environment reflections yet).
+    return vec4<f32>(albedo * sky * (1.0 - metallic * 0.7), 1.0);
 }

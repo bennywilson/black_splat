@@ -26,9 +26,11 @@ pub struct Renderer<'a> {
     model_pass: ModelPass,
     model_with_holes_pass: ModelPass,
     // Deferred world rendering: the G-buffer pass draws the World-layer actors
-    // (color/normal/specular), then the lighting pass accumulates light_map's
-    // lights onto the scene color target.
+    // (color/normal/metallic-roughness), then the lighting pass accumulates
+    // light_map's lights onto the scene color target, with the shadow pass
+    // rendering shadow maps + screen-space masks for the lights that cast.
     gbuffer_pass: GBufferPass,
+    shadow_pass: ShadowPass,
     lighting_pass: LightingPass,
     line_pass: LinePass,
     sunbeam_pass: SunbeamPass,
@@ -145,7 +147,9 @@ impl<'a> Renderer<'a> {
         .await;
 
         let gbuffer_pass = GBufferPass::new(&device_resources, &mut asset_manager).await;
-        let lighting_pass = LightingPass::new(&device_resources, &mut asset_manager).await;
+        let shadow_pass = ShadowPass::new(&device_resources, &mut asset_manager).await;
+        let lighting_pass =
+            LightingPass::new(&device_resources, &mut asset_manager, &shadow_pass).await;
 
         let debug_lines = Vec::<Line>::new();
 
@@ -163,6 +167,7 @@ impl<'a> Renderer<'a> {
             model_pass,
             model_with_holes_pass,
             gbuffer_pass,
+            shadow_pass,
             lighting_pass,
             postprocess_pass,
             line_pass,
@@ -594,7 +599,12 @@ impl<'a> Renderer<'a> {
         }
         {
             PERF_SCOPE!("Deferred Lighting");
-            self.lighting_pass.render(&mut ctx, &self.light_map);
+            self.lighting_pass.render(
+                &mut ctx,
+                &self.light_map,
+                &self.actor_map,
+                &mut self.shadow_pass,
+            );
         }
         {
             PERF_SCOPE!("World With Holes");
@@ -750,7 +760,9 @@ impl<'a> Renderer<'a> {
         self.device_resources.resize(game_config);
         self.postprocess_pass
             .resize(&mut self.device_resources, &self.asset_manager);
-        self.lighting_pass.resize(&self.device_resources);
+        self.shadow_pass.resize(&self.device_resources);
+        self.lighting_pass
+            .resize(&self.device_resources, &self.shadow_pass);
         self.sunbeam_pass.resize(&mut self.device_resources, &self.asset_manager)
     }
 
@@ -779,6 +791,23 @@ impl<'a> Renderer<'a> {
     /// Removes every light (editor "New Scene" / scene load).
     pub fn clear_lights(&mut self) {
         self.light_map.clear();
+    }
+
+    /// Sets the shadow quality settings (cascade count, tile resolution,
+    /// cascade distance); applied at the start of the next frame.
+    pub fn set_shadow_settings(&mut self, settings: &ShadowSettings) {
+        self.shadow_pass.request_settings(settings);
+    }
+
+    pub fn get_shadow_settings(&self) -> ShadowSettings {
+        self.shadow_pass.settings()
+    }
+
+    /// This frame's screen-space shadow accumulation texture (the product of
+    /// every light's mask; 1 = fully lit).  The Gaussian-splat shadow overlay
+    /// will multiply the splats by it.
+    pub fn shadow_accum_texture(&self) -> &Texture {
+        self.shadow_pass.shadow_accum()
     }
 
     pub async fn add_particle_actor(
@@ -897,6 +926,43 @@ impl<'a> Renderer<'a> {
     /// editor's material dropdown.
     pub fn get_material_resources(&self) -> Vec<(String, MaterialHandle)> {
         self.asset_manager.get_material_resources()
+    }
+
+    /// Synchronously creates a constant-only material (no textures), for the
+    /// editor's "new material" button in the frame tick.  Same name returns
+    /// the existing handle.
+    pub fn create_material(&mut self, name: &str, desc: &MaterialDesc) -> MaterialHandle {
+        self.asset_manager
+            .create_material(name, desc, &self.device_resources)
+    }
+
+    /// A material's (color constant, metallic/roughness constant), for the
+    /// editor's resource inspector.  None if the handle is stale.
+    pub fn material_constants(&self, handle: &MaterialHandle) -> Option<(CgVec4, CgVec4)> {
+        self.asset_manager
+            .get_material(handle)
+            .map(|m| (m.color_constant, m.mr_constant))
+    }
+
+    /// Overwrites a material's constants; applies immediately (the G-buffer
+    /// pass reads them every frame).
+    pub fn update_material(
+        &mut self,
+        handle: &MaterialHandle,
+        color_constant: &CgVec4,
+        mr_constant: &CgVec4,
+    ) {
+        self.asset_manager
+            .update_material_constants(handle, color_constant, mr_constant);
+    }
+
+    /// Replaces a live emitter's particle parameters (editor resource edits).
+    /// The emitter keeps its texture -- a changed `texture_file` only affects
+    /// future spawns.
+    pub fn update_particle_params(&mut self, handle: &ParticleHandle, params: &ParticleParams) {
+        if let Some(particle) = self.particle_map.get_mut(handle) {
+            particle.params = params.clone();
+        }
     }
 
     /// Loads a splat .ply and appends it as a selectable cloud.  Returns true if

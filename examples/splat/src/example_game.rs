@@ -8,6 +8,7 @@ use black_splat::{
     egui, assets::*, config::*, editor::{self, EditorChoice, TransformGizmo}, engine::*,
     fly_camera::*, game_object::*, input::*, renderer::*, resource::SceneLayer, touch_pads::*,
     utils::*, log,
+    passes::deferred::ShadowSettings,
     passes::gaussian_splat::SplatParams,
 };
 
@@ -26,6 +27,15 @@ const PRELOADED_MODELS: &[&str] = &[
 
 // How far in front of the camera a newly added game object is dropped.
 const ADD_OBJECT_DISTANCE: f32 = 5.0;
+
+/// The renderer-side shadow settings an EditorConfig describes.
+fn shadow_settings_from_config(config: &EditorConfig) -> ShadowSettings {
+    ShadowSettings {
+        resolution: config.shadow_resolution,
+        num_cascades: config.shadow_cascades,
+        distance: config.shadow_distance,
+    }
+}
 
 // Default skylight hemisphere colors: cool sky above, warm bounce below.
 // Used for the auto-added skylight in new scenes and Add > Light > Skylight.
@@ -136,7 +146,28 @@ fn resource_display_name(path: &str) -> String {
 enum EditorTab {
     Scene,
     Details,
+    /// Inspector for the resource highlighted in the bottom Resources panel
+    /// (materials and particle definitions are edited here).
+    Resource,
     Settings,
+}
+
+/// The resource highlighted in the bottom Resources panel, shown in the
+/// right panel's Resource inspector tab.
+#[derive(Clone, Copy, PartialEq)]
+enum ResourceSelection {
+    Model(ModelHandle),
+    Material(MaterialHandle),
+    /// Index into SplatGame::particle_resources.
+    Particle(usize),
+}
+
+/// An editable particle definition in the resource library (seeded from the
+/// built-in presets; more can be created in the Resources panel).  Scene
+/// emitters reference one by name.
+struct ParticleResource {
+    name: String,
+    params: ParticleParams,
 }
 
 /// The currently selected scene object.  The three lists (actors, lights,
@@ -155,7 +186,7 @@ enum Selection {
 enum AddKind {
     Actor,
     Light(LightType),
-    Particle(usize), // index into PARTICLE_PRESETS
+    Particle(usize), // index into SplatGame::particle_resources
     Splat,           // opens the .ply picker
 }
 
@@ -430,7 +461,9 @@ fn preset_particle_params(preset: &str) -> ParticleParams {
 
 /// Fills an "Add" menu with the object choices, recording the pick in `add`.
 /// Shared by the menu bar's Add menu and the Scene tab's Add button.
-fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>) {
+/// `particle_names` are the particle library's entries (see
+/// SplatGame::particle_resources), indexed by AddKind::Particle.
+fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>, particle_names: &[String]) {
     // Buttons auto-close the menu chain on click.
     if ui.button("Actor").clicked() {
         *add = Some(AddKind::Actor);
@@ -450,8 +483,8 @@ fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>) {
         }
     });
     ui.menu_button("Particle System", |ui| {
-        for (i, preset) in PARTICLE_PRESETS.iter().enumerate() {
-            if ui.button(*preset).clicked() {
+        for (i, preset) in particle_names.iter().enumerate() {
+            if ui.button(preset.as_str()).clicked() {
                 *add = Some(AddKind::Particle(i));
             }
         }
@@ -460,6 +493,132 @@ fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>) {
     if ui.button("Gaussian Splat…").clicked() {
         *add = Some(AddKind::Splat);
     }
+}
+
+/// Editable rows for a particle definition (the Resource inspector).  Returns
+/// true if anything changed this frame.  `textures` are the preloaded particle
+/// textures offered by the texture dropdown; a texture change only affects
+/// future spawns (live emitters keep the texture they were built with).
+fn draw_particle_params_ui(
+    ui: &mut egui::Ui,
+    params: &mut ParticleParams,
+    textures: &[(String, TextureHandle)],
+) -> bool {
+    let mut changed = false;
+
+    fn drag(ui: &mut egui::Ui, value: &mut f32) -> bool {
+        ui.add(egui::DragValue::new(value).speed(0.02).max_decimals(3))
+            .changed()
+    }
+    // A "min / max" pair of drag values under one label.
+    fn minmax_f32(ui: &mut egui::Ui, label: &str, min: &mut f32, max: &mut f32) -> bool {
+        let mut changed = false;
+        ui.label(label);
+        ui.horizontal(|ui| {
+            changed |= drag(ui, min);
+            ui.label("to");
+            changed |= drag(ui, max);
+        });
+        changed
+    }
+    fn vec3_row(ui: &mut egui::Ui, label: &str, v: &mut CgVec3) -> bool {
+        let mut changed = false;
+        ui.label(label);
+        ui.horizontal(|ui| {
+            changed |= drag(ui, &mut v.x);
+            changed |= drag(ui, &mut v.y);
+            changed |= drag(ui, &mut v.z);
+        });
+        changed
+    }
+    fn color_row(ui: &mut egui::Ui, label: &str, color: &mut CgVec4) -> bool {
+        ui.label(label);
+        let mut rgba = [color.x, color.y, color.z, color.w];
+        if ui.color_edit_button_rgba_unmultiplied(&mut rgba).changed() {
+            *color = CgVec4::new(rgba[0], rgba[1], rgba[2], rgba[3]);
+            true
+        } else {
+            false
+        }
+    }
+
+    // "smoke_t" from "game_assets/fx/smoke_t.png" for the dropdown rows.
+    let texture_label = |path: &str| resource_display_name(path);
+    ui.label("Texture");
+    egui::ComboBox::from_id_salt("particle_texture")
+        .selected_text(texture_label(&params.texture_file))
+        .show_ui(ui, |ui| {
+            for (path, _) in textures {
+                changed |= ui
+                    .selectable_value(&mut params.texture_file, path.clone(), texture_label(path))
+                    .changed();
+            }
+        });
+
+    ui.label("Blend");
+    egui::ComboBox::from_id_salt("particle_blend")
+        .selected_text(match params.blend_mode {
+            ParticleBlendMode::Additive => "Additive",
+            ParticleBlendMode::AlphaBlend => "Alpha Blend",
+        })
+        .show_ui(ui, |ui| {
+            changed |= ui
+                .selectable_value(&mut params.blend_mode, ParticleBlendMode::Additive, "Additive")
+                .changed();
+            changed |= ui
+                .selectable_value(
+                    &mut params.blend_mode,
+                    ParticleBlendMode::AlphaBlend,
+                    "Alpha Blend",
+                )
+                .changed();
+        });
+
+    changed |= minmax_f32(
+        ui,
+        "Spawn Rate (s)",
+        &mut params.min_start_spawn_rate,
+        &mut params.max_start_spawn_rate,
+    );
+    changed |= minmax_f32(
+        ui,
+        "Particle Life (s)",
+        &mut params.min_particle_life,
+        &mut params.max_particle_life,
+    );
+    {
+        // Burst counts are u32; edited through f32 drags.
+        let (mut burst_min, mut burst_max) =
+            (params.min_burst_count as f32, params.max_burst_count as f32);
+        if minmax_f32(ui, "Burst Count", &mut burst_min, &mut burst_max) {
+            params.min_burst_count = burst_min.max(0.0) as u32;
+            params.max_burst_count = burst_max.max(0.0) as u32;
+            changed = true;
+        }
+    }
+
+    changed |= vec3_row(ui, "Spawn Pos Min", &mut params.min_start_pos);
+    changed |= vec3_row(ui, "Spawn Pos Max", &mut params.max_start_pos);
+    changed |= vec3_row(ui, "Start Scale Min", &mut params.min_start_scale);
+    changed |= vec3_row(ui, "Start Scale Max", &mut params.max_start_scale);
+    changed |= vec3_row(ui, "End Scale Min", &mut params.min_end_scale);
+    changed |= vec3_row(ui, "End Scale Max", &mut params.max_end_scale);
+    changed |= vec3_row(ui, "Velocity Min", &mut params.min_start_velocity);
+    changed |= vec3_row(ui, "Velocity Max", &mut params.max_start_velocity);
+    changed |= vec3_row(ui, "Acceleration Min", &mut params.min_start_acceleration);
+    changed |= vec3_row(ui, "Acceleration Max", &mut params.max_start_acceleration);
+    changed |= minmax_f32(
+        ui,
+        "Rotation Rate",
+        &mut params.min_start_rotation_rate,
+        &mut params.max_start_rotation_rate,
+    );
+
+    changed |= color_row(ui, "Start Color A", &mut params.start_color_0);
+    changed |= color_row(ui, "Start Color B", &mut params.start_color_1);
+    changed |= color_row(ui, "End Color", &mut params.end_color_0);
+
+    changed
 }
 
 /// A particle system placed in the scene.  The live emitter lives in the
@@ -657,6 +816,9 @@ pub struct SplatGame {
     // Mouse travel while the right button is held, to tell a right-click
     // (context menu) from a right-drag (camera look).
     rmb_drag_accum: f32,
+    // Whether the fly camera's look engaged at any point during the current
+    // right-button hold; a release without it is a right-click.
+    rmb_look_engaged: bool,
     // Object awaiting delete confirmation (the Scene tab's ✕ button).
     confirm_delete: Option<Selection>,
     // File > New Scene awaiting its confirmation modal (it wipes unsaved work).
@@ -664,9 +826,13 @@ pub struct SplatGame {
     // Whether a user-saved startup scene exists (drives the Settings tab UI;
     // cached so native doesn't stat the config file every frame).
     has_custom_startup: bool,
-    // Model highlighted in the resources browser, offered to the Details
+    // Resource highlighted in the bottom Resources panel: shown in the right
+    // panel's Resource inspector tab, and (for models) offered to the Details
     // panel's Model row as a one-click assignment.
-    selected_resource: Option<ModelHandle>,
+    selected_resource: Option<ResourceSelection>,
+    // The editable particle-definition library (see ParticleResource).  Scene
+    // emitters reference an entry by name; edits push to live emitters.
+    particle_resources: Vec<ParticleResource>,
     // Object currently being renamed (double-click in the Scene tab).
     name_edit: Option<Selection>,
     // The rename field's working text.  Persists across frames -- re-deriving
@@ -793,6 +959,122 @@ impl SplatGame {
         self.selected = Some(sel);
     }
 
+    /// Display name of a selected object (None if the index went stale).
+    fn selection_name(&self, sel: Selection) -> Option<String> {
+        match sel {
+            Selection::Actor(i) => self.scene_actors.get(i).map(|a| a.get_name().to_string()),
+            Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_name().to_string()),
+            Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.name.clone()),
+            Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.name.clone()),
+        }
+    }
+
+    /// World position of a selected object of any kind (None if stale).
+    fn selection_position(&self, sel: Selection) -> Option<CgVec3> {
+        match sel {
+            Selection::Actor(i) => self.scene_actors.get(i).map(|a| a.get_position()),
+            Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_position()),
+            Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.position),
+            Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.transform.position),
+        }
+    }
+
+    /// Moves a selected object of any kind to `pos`, pushing the change to the
+    /// renderer's copy.
+    fn set_selection_position(&mut self, sel: Selection, pos: &CgVec3, renderer: &mut Renderer) {
+        match sel {
+            Selection::Actor(i) => {
+                if let Some(actor) = self.scene_actors.get_mut(i) {
+                    actor.set_position(pos);
+                    renderer.add_or_update_actor(actor);
+                }
+            }
+            Selection::Light(i) => {
+                if let Some(light) = self.scene_lights.get_mut(i) {
+                    light.set_position(pos);
+                    renderer.add_or_update_light(light);
+                }
+            }
+            Selection::Particle(i) => {
+                if let Some(particle) = self.scene_particles.get_mut(i) {
+                    particle.position = *pos;
+                    renderer.update_particle_transform(&particle.handle, pos, &None);
+                }
+            }
+            Selection::Splat(i) => {
+                if let Some(splat) = self.scene_splats.get_mut(i) {
+                    splat.transform.position = *pos;
+                    if i == self.active_splat {
+                        renderer.set_gaussian_splat_transform(&splat.transform);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies one frame of a multi-selection gizmo drag to a selected object.
+    /// `new_pos` is the object's position already orbited/scaled about the
+    /// pivot; the rotation/scale deltas compose onto the object's own where
+    /// the kind has them (particles don't rotate; splats scale uniformly).
+    fn apply_pivot_delta(
+        &mut self,
+        sel: Selection,
+        new_pos: CgVec3,
+        delta_rot: CgQuat,
+        scale_mult: CgVec3,
+        renderer: &mut Renderer,
+    ) {
+        fn scaled(v: CgVec3, m: CgVec3) -> CgVec3 {
+            CgVec3::new(
+                (v.x * m.x).max(0.001),
+                (v.y * m.y).max(0.001),
+                (v.z * m.z).max(0.001),
+            )
+        }
+        match sel {
+            Selection::Actor(i) => {
+                if let Some(actor) = self.scene_actors.get_mut(i) {
+                    actor.set_position(&new_pos);
+                    actor.set_rotation(&(delta_rot * actor.get_rotation()).normalize());
+                    actor.set_scale(&scaled(actor.get_scale(), scale_mult));
+                    renderer.add_or_update_actor(actor);
+                }
+            }
+            Selection::Light(i) => {
+                if let Some(light) = self.scene_lights.get_mut(i) {
+                    light.set_position(&new_pos);
+                    light.set_rotation(&(delta_rot * light.get_rotation()).normalize());
+                    renderer.add_or_update_light(light);
+                }
+            }
+            Selection::Particle(i) => {
+                if let Some(particle) = self.scene_particles.get_mut(i) {
+                    particle.position = new_pos;
+                    particle.scale = scaled(particle.scale, scale_mult);
+                    renderer.update_particle_transform(
+                        &particle.handle,
+                        &new_pos,
+                        &Some(particle.scale),
+                    );
+                }
+            }
+            Selection::Splat(i) => {
+                if let Some(splat) = self.scene_splats.get_mut(i) {
+                    splat.transform.position = new_pos;
+                    splat.transform.rotation =
+                        (delta_rot * splat.transform.rotation).normalize();
+                    // Uniform scale only (non-uniform cloud scale is only
+                    // approximate).
+                    let uniform = (splat.transform.scale.x * scale_mult.x).max(0.001);
+                    splat.transform.scale = CgVec3::new(uniform, uniform, uniform);
+                    if i == self.active_splat {
+                        renderer.set_gaussian_splat_transform(&splat.transform);
+                    }
+                }
+            }
+        }
+    }
+
     /// World position and an approximate radius of the selected object, used to
     /// frame it (the [F] hotkey).  None if nothing is selected.
     fn selected_focus(&self) -> Option<(CgVec3, f32)> {
@@ -873,9 +1155,10 @@ impl SplatGame {
         self.scene_lights.push(light);
     }
 
-    /// Spawns a particle system from a preset (see PARTICLE_PRESETS) at the given
+    /// Spawns a particle system from a named particle resource at the given
     /// transform, recording it as a scene object.  Uses the preloaded texture, so
-    /// no async is needed.  Returns false if that texture wasn't preloaded.
+    /// no async is needed.  Returns false if the resource is unknown or its
+    /// texture wasn't preloaded.
     fn spawn_particle(
         &mut self,
         preset_name: &str,
@@ -884,7 +1167,19 @@ impl SplatGame {
         scale: CgVec3,
         renderer: &mut Renderer,
     ) -> bool {
-        let params = preset_particle_params(preset_name);
+        let Some(params) = self
+            .particle_resources
+            .iter()
+            .find(|r| r.name == preset_name)
+            .map(|r| r.params.clone())
+        else {
+            self.status = Some((
+                format!("Unknown particle resource: {preset_name}"),
+                STATUS_RED,
+                5.0,
+            ));
+            return false;
+        };
         let Some((_, texture)) = self
             .particle_textures
             .iter()
@@ -911,16 +1206,17 @@ impl SplatGame {
         true
     }
 
-    /// Spawns a preset particle system ahead of the camera and selects it (Add
-    /// menu).
+    /// Spawns a particle system from resource `preset` (an index into
+    /// particle_resources) ahead of the camera and selects it (Add menu).
     fn add_particle(&mut self, preset: usize, renderer: &mut Renderer) {
-        let Some(preset_name) = PARTICLE_PRESETS.get(preset).copied() else {
+        let Some(preset_name) = self.particle_resources.get(preset).map(|r| r.name.clone())
+        else {
             return;
         };
         self.next_object_num += 1;
         let name = format!("{preset_name} {}", self.next_object_num);
         let spawn_pos = self.spawn_point();
-        if self.spawn_particle(preset_name, name, spawn_pos, CG_VEC3_ONE, renderer) {
+        if self.spawn_particle(&preset_name, name, spawn_pos, CG_VEC3_ONE, renderer) {
             self.select_after_add(Selection::Particle(self.scene_particles.len() - 1));
         }
     }
@@ -1476,10 +1772,19 @@ impl GameEngine for SplatGame {
             multi_selected: Vec::new(),
             context_menu: None,
             rmb_drag_accum: 0.0,
+            rmb_look_engaged: false,
             confirm_delete: None,
             confirm_new_scene: false,
             has_custom_startup: editor_config::load_startup_scene().is_some(),
             selected_resource: None,
+            // Seed the particle library with the built-in presets.
+            particle_resources: PARTICLE_PRESETS
+                .iter()
+                .map(|preset| ParticleResource {
+                    name: preset.to_string(),
+                    params: preset_particle_params(preset),
+                })
+                .collect(),
             name_edit: None,
             name_edit_buffer: String::new(),
             name_edit_focus: false,
@@ -1517,6 +1822,8 @@ impl GameEngine for SplatGame {
         log!("SplatGame::initialize_world()");
         game_config.clear_color = CgVec4::new(0.02, 0.02, 0.03, 1.0);
         renderer.set_tonemap_enabled(true);
+        // Persisted shadow quality (Settings tab > Shadows).
+        renderer.set_shadow_settings(&shadow_settings_from_config(&self.editor_config));
 
         // Preload the editor's model resources (Resources tab / the Details
         // panel's model dropdown).  Done here because loading is async.
@@ -1526,14 +1833,15 @@ impl GameEngine for SplatGame {
 
         // Starter materials for the Details panel's Material dropdown
         // (constant-only: no texture means the built-in white, so the
-        // constants pass straight through).  Assigning one to an actor
-        // overrides its model's textures in the world G-buffer pass.
+        // metallic/roughness constants pass straight through).  Assigning one
+        // to an actor overrides its model's textures in the world G-buffer
+        // pass.
         renderer.load_material("Matte", &MaterialDesc::default()).await;
         renderer
             .load_material(
                 "Plastic",
                 &MaterialDesc {
-                    spec_constant: CgVec4::new(0.5, 0.5, 0.5, 0.7),
+                    mr_constant: CgVec4::new(0.0, 0.35, 0.0, 0.0),
                     ..Default::default()
                 },
             )
@@ -1542,7 +1850,7 @@ impl GameEngine for SplatGame {
             .load_material(
                 "Chrome",
                 &MaterialDesc {
-                    spec_constant: CgVec4::new(1.0, 1.0, 1.0, 0.9),
+                    mr_constant: CgVec4::new(1.0, 0.12, 0.0, 0.0),
                     ..Default::default()
                 },
             )
@@ -1706,6 +2014,26 @@ impl GameEngine for SplatGame {
         // Loaded materials for the Details panel's Material dropdown.
         let material_resources: Vec<(String, MaterialHandle)> =
             renderer.get_material_resources();
+        // Particle library names for the Add menus and the Resources panel.
+        let particle_names: Vec<String> = self
+            .particle_resources
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        // The model offered to the Details panel's "use selected" button (only
+        // model resources apply there).
+        let selected_model = match self.selected_resource {
+            Some(ResourceSelection::Model(handle)) => Some(handle),
+            _ => None,
+        };
+        // Resources-panel actions, applied after the egui pass.
+        let mut create_material = false;
+        let mut create_particle = false;
+        // Particle-resource edits from the Resource inspector this frame:
+        // which entry changed (push params to its live emitters), and a
+        // rename (propagate to scene emitters referencing the old name).
+        let mut edited_particle: Option<usize> = None;
+        let mut renamed_particle: Option<(String, String)> = None;
 
         // Editor vs game mode.  In editor mode the full bar is always shown --
         // the mode switch, File (open), Debug (scene cycle + future toggles),
@@ -1743,7 +2071,7 @@ impl GameEngine for SplatGame {
                             do_load |= ui.button("Load .ply…").clicked();
                         });
                         ui.menu_button("Add", |ui| {
-                            add_menu_ui(ui, &mut do_add);
+                            add_menu_ui(ui, &mut do_add, &particle_names);
                         });
                         // Splat params live in the Details panel and camera /
                         // keybindings in the right-hand Settings tab, so the old
@@ -1857,27 +2185,91 @@ impl GameEngine for SplatGame {
                             egui::ScrollArea::vertical()
                                 .max_height(ui.available_height())
                                 .show(ui, |ui| {
-                                    ui.columns(2, |columns| {
+                                    // Clicking a resource highlights it and
+                                    // opens the right panel's Resource
+                                    // inspector; clicking again deselects.
+                                    let mut pick: Option<Option<ResourceSelection>> = None;
+                                    let mut resource_row =
+                                        |ui: &mut egui::Ui,
+                                         name: &str,
+                                         sel: ResourceSelection,
+                                         current: Option<ResourceSelection>| {
+                                            let is_selected = current == Some(sel);
+                                            if ui
+                                                .selectable_label(is_selected, name)
+                                                .clicked()
+                                            {
+                                                pick = Some(if is_selected {
+                                                    None
+                                                } else {
+                                                    Some(sel)
+                                                });
+                                            }
+                                        };
+                                    let current = self.selected_resource;
+                                    ui.columns(4, |columns| {
                                         let ui = &mut columns[0];
                                         ui.label(egui::RichText::new("Models").strong());
                                         if model_resources.is_empty() {
                                             ui.label("(none)");
                                         }
-                                        // Click to highlight; the Details
-                                        // panel's Model row can then apply the
-                                        // highlighted model with one click.
                                         for (name, handle) in &model_resources {
-                                            let is_selected =
-                                                self.selected_resource == Some(*handle);
+                                            resource_row(
+                                                ui,
+                                                name,
+                                                ResourceSelection::Model(*handle),
+                                                current,
+                                            );
+                                        }
+
+                                        let ui = &mut columns[1];
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Materials").strong(),
+                                            );
                                             if ui
-                                                .selectable_label(is_selected, name.as_str())
+                                                .small_button("+")
+                                                .on_hover_text("New material")
                                                 .clicked()
                                             {
-                                                self.selected_resource =
-                                                    if is_selected { None } else { Some(*handle) };
+                                                create_material = true;
                                             }
+                                        });
+                                        if material_resources.is_empty() {
+                                            ui.label("(none)");
                                         }
-                                        let ui = &mut columns[1];
+                                        for (name, handle) in &material_resources {
+                                            resource_row(
+                                                ui,
+                                                name,
+                                                ResourceSelection::Material(*handle),
+                                                current,
+                                            );
+                                        }
+
+                                        let ui = &mut columns[2];
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Particles").strong(),
+                                            );
+                                            if ui
+                                                .small_button("+")
+                                                .on_hover_text("New particle definition")
+                                                .clicked()
+                                            {
+                                                create_particle = true;
+                                            }
+                                        });
+                                        for (i, name) in particle_names.iter().enumerate() {
+                                            resource_row(
+                                                ui,
+                                                name,
+                                                ResourceSelection::Particle(i),
+                                                current,
+                                            );
+                                        }
+
+                                        let ui = &mut columns[3];
                                         ui.label(egui::RichText::new("Splats").strong());
                                         if self.scene_splats.is_empty() {
                                             ui.label("(none)");
@@ -1886,6 +2278,12 @@ impl GameEngine for SplatGame {
                                             ui.label(splat.name.as_str());
                                         }
                                     });
+                                    if let Some(new_selection) = pick {
+                                        self.selected_resource = new_selection;
+                                        if new_selection.is_some() {
+                                            self.active_tab = Some(EditorTab::Resource);
+                                        }
+                                    }
                                 });
                         });
                     });
@@ -1926,6 +2324,7 @@ impl GameEngine for SplatGame {
                             for (tab, label) in [
                                 (EditorTab::Scene, "Scene"),
                                 (EditorTab::Details, "Details"),
+                                (EditorTab::Resource, "Resource"),
                                 (EditorTab::Settings, "Settings"),
                             ] {
                                 let is_active = self.active_tab == Some(tab);
@@ -2054,7 +2453,7 @@ impl GameEngine for SplatGame {
                                             },
                                         );
 
-                                        let particle_names: Vec<String> = self
+                                        let particle_instance_names: Vec<String> = self
                                             .scene_particles
                                             .iter()
                                             .map(|p| p.name.clone())
@@ -2063,7 +2462,7 @@ impl GameEngine for SplatGame {
                                             ui,
                                             "Particles",
                                             Selection::Particle,
-                                            &particle_names,
+                                            &particle_instance_names,
                                             self.selected,
                                             &self.multi_selected,
                                             &mut self.name_edit,
@@ -2075,9 +2474,9 @@ impl GameEngine for SplatGame {
                                             |ui| {
                                                 ui.menu_button("+", |ui| {
                                                     for (i, preset) in
-                                                        PARTICLE_PRESETS.iter().enumerate()
+                                                        particle_names.iter().enumerate()
                                                     {
-                                                        if ui.button(*preset).clicked() {
+                                                        if ui.button(preset.as_str()).clicked() {
                                                             do_add = Some(AddKind::Particle(i));
                                                         }
                                                     }
@@ -2095,7 +2494,7 @@ impl GameEngine for SplatGame {
                                                     actor,
                                                     &model_resources,
                                                     &material_resources,
-                                                    self.selected_resource,
+                                                    selected_model,
                                                 );
                                             }
                                         }
@@ -2106,7 +2505,7 @@ impl GameEngine for SplatGame {
                                                     light,
                                                     &model_resources,
                                                     &material_resources,
-                                                    self.selected_resource,
+                                                    selected_model,
                                                 );
                                             }
                                         }
@@ -2119,7 +2518,7 @@ impl GameEngine for SplatGame {
                                                     particle,
                                                     &model_resources,
                                                     &material_resources,
-                                                    self.selected_resource,
+                                                    selected_model,
                                                 );
                                             }
                                         }
@@ -2135,13 +2534,112 @@ impl GameEngine for SplatGame {
                                                     splat,
                                                     &model_resources,
                                                     &material_resources,
-                                                    self.selected_resource,
+                                                    selected_model,
                                                 );
                                             }
                                         }
                                         None => {
                                             ui.label("Nothing selected.");
                                             ui.label("Pick something in the Scene tab.");
+                                        }
+                                    },
+                                    // Resource inspector: edits the resource
+                                    // highlighted in the bottom Resources
+                                    // panel.  Material constants apply live
+                                    // (the G-buffer reads them every frame);
+                                    // particle edits are pushed to live
+                                    // emitters after the pass.
+                                    EditorTab::Resource => match self.selected_resource {
+                                        Some(ResourceSelection::Model(handle)) => {
+                                            let name = model_resources
+                                                .iter()
+                                                .find(|(_, h)| *h == handle)
+                                                .map_or("(unknown model)", |(n, _)| n.as_str());
+                                            ui.label(egui::RichText::new(name).strong());
+                                            ui.separator();
+                                            ui.label("Models aren't editable yet.");
+                                        }
+                                        Some(ResourceSelection::Material(handle)) => {
+                                            let name = material_resources
+                                                .iter()
+                                                .find(|(_, h)| *h == handle)
+                                                .map_or("(unknown material)", |(n, _)| {
+                                                    n.as_str()
+                                                });
+                                            ui.label(egui::RichText::new(name).strong());
+                                            ui.separator();
+                                            if let Some((color, mr)) =
+                                                renderer.material_constants(&handle)
+                                            {
+                                                let (mut color, mut mr) = (color, mr);
+                                                let mut changed = false;
+                                                ui.label("Color");
+                                                let mut rgb = [color.x, color.y, color.z];
+                                                if ui
+                                                    .color_edit_button_rgb(&mut rgb)
+                                                    .changed()
+                                                {
+                                                    color = CgVec4::new(
+                                                        rgb[0], rgb[1], rgb[2], color.w,
+                                                    );
+                                                    changed = true;
+                                                }
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(&mut mr.x, 0.0..=1.0)
+                                                            .text("metallic"),
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(&mut mr.y, 0.0..=1.0)
+                                                            .text("roughness"),
+                                                    )
+                                                    .changed();
+                                                if changed {
+                                                    renderer.update_material(
+                                                        &handle, &color, &mr,
+                                                    );
+                                                }
+                                            } else {
+                                                ui.label("(missing material)");
+                                            }
+                                        }
+                                        Some(ResourceSelection::Particle(i)) => {
+                                            // Cloned so the params borrow below
+                                            // doesn't collide.
+                                            let textures = self.particle_textures.clone();
+                                            if let Some(resource) =
+                                                self.particle_resources.get_mut(i)
+                                            {
+                                                let old_name = resource.name.clone();
+                                                ui.label("Name");
+                                                if ui
+                                                    .text_edit_singleline(&mut resource.name)
+                                                    .changed()
+                                                {
+                                                    renamed_particle = Some((
+                                                        old_name,
+                                                        resource.name.clone(),
+                                                    ));
+                                                }
+                                                ui.separator();
+                                                if draw_particle_params_ui(
+                                                    ui,
+                                                    &mut resource.params,
+                                                    &textures,
+                                                ) {
+                                                    edited_particle = Some(i);
+                                                }
+                                            } else {
+                                                ui.label("(missing particle resource)");
+                                            }
+                                        }
+                                        None => {
+                                            ui.label("No resource selected.");
+                                            ui.label(
+                                                "Pick one in the Resources panel below.",
+                                            );
                                         }
                                     },
                                     EditorTab::Settings => {
@@ -2162,6 +2660,58 @@ impl GameEngine for SplatGame {
                                             )
                                             .text("sprint ×"),
                                         );
+
+                                        // Global shadow quality; per-light
+                                        // casting stays on the light's own
+                                        // "Casts Shadow" checkbox in Details.
+                                        ui.add_space(12.0);
+                                        ui.label(egui::RichText::new("Shadows").strong());
+                                        let mut shadows_changed = false;
+                                        egui::ComboBox::from_label("Resolution")
+                                            .selected_text(format!(
+                                                "{}",
+                                                self.editor_config.shadow_resolution
+                                            ))
+                                            .show_ui(ui, |ui| {
+                                                for res in [512u32, 1024, 2048] {
+                                                    shadows_changed |= ui
+                                                        .selectable_value(
+                                                            &mut self
+                                                                .editor_config
+                                                                .shadow_resolution,
+                                                            res,
+                                                            res.to_string(),
+                                                        )
+                                                        .changed();
+                                                }
+                                            });
+                                        shadows_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut self.editor_config.shadow_cascades,
+                                                    1..=4,
+                                                )
+                                                .text("cascades"),
+                                            )
+                                            .changed();
+                                        shadows_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut self.editor_config.shadow_distance,
+                                                    10.0..=300.0,
+                                                )
+                                                .logarithmic(true)
+                                                .text("distance"),
+                                            )
+                                            .changed();
+                                        if shadows_changed {
+                                            renderer.set_shadow_settings(
+                                                &shadow_settings_from_config(
+                                                    &self.editor_config,
+                                                ),
+                                            );
+                                            self.editor_config.save();
+                                        }
 
                                         ui.add_space(12.0);
                                         ui.label(egui::RichText::new("Editor").strong());
@@ -2219,12 +2769,7 @@ impl GameEngine for SplatGame {
         // Delete confirmation for the Scene tab's ✕ button.  A modal blocks
         // the rest of the UI until answered; clicking the backdrop cancels.
         if let Some(sel) = self.confirm_delete {
-            let name = match sel {
-                Selection::Actor(i) => self.scene_actors.get(i).map(|a| a.get_name().to_string()),
-                Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_name().to_string()),
-                Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.name.clone()),
-                Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.name.clone()),
-            };
+            let name = self.selection_name(sel);
             match name {
                 None => self.confirm_delete = None, // Stale selection.
                 Some(name) => {
@@ -2396,14 +2941,57 @@ impl GameEngine for SplatGame {
             None
         };
         if let Some(i) = clicked_light {
-            select_object = Some((Selection::Light(i), false));
+            // Ctrl+click joins the multi-selection, like the outliner rows.
+            let additive =
+                ctx.input(|input| input.modifiers.ctrl || input.modifiers.command);
+            select_object = Some((Selection::Light(i), additive));
         }
 
         // Translate/rotate/scale gizmo on the selected object, drawn over the 3D
         // view.  Its edits ride the same `selection_edited` path as Details.
         // Lights have no scale (only translate/rotate apply); particles use
         // translate/scale (rotation is ignored); splats have no gizmo.
-        if editor {
+        //
+        // With a multi-selection the gizmo sits at the selection's centroid
+        // and edits every selected object: the gizmo is fed an identity pivot
+        // each frame, so what comes back is this frame's delta -- positions
+        // orbit/scale about the centroid, and the rotation/scale compose onto
+        // each object's own transform (see apply_pivot_delta).
+        if editor && self.multi_selected.len() >= 2 {
+            let objects: Vec<(Selection, CgVec3)> = self
+                .multi_selected
+                .iter()
+                .filter_map(|sel| self.selection_position(*sel).map(|p| (*sel, p)))
+                .collect();
+            if !objects.is_empty() {
+                let centroid = objects
+                    .iter()
+                    .fold(CG_VEC3_ZERO, |acc, (_, p)| acc + *p)
+                    / objects.len() as f32;
+                let mut position = centroid;
+                let mut rotation = CG_QUAT_IDENT;
+                let mut scale = CG_VEC3_ONE;
+                if self.gizmo.ui(
+                    &ctx,
+                    &self.game_camera,
+                    game_config,
+                    &mut position,
+                    &mut rotation,
+                    &mut scale,
+                ) {
+                    for (sel, old_pos) in objects {
+                        let offset = old_pos - centroid;
+                        let scaled_offset = CgVec3::new(
+                            offset.x * scale.x,
+                            offset.y * scale.y,
+                            offset.z * scale.z,
+                        );
+                        let new_pos = position + rotation * scaled_offset;
+                        self.apply_pivot_delta(sel, new_pos, rotation, scale, renderer);
+                    }
+                }
+            }
+        } else if editor {
             if let Some(sel) = self.selected {
                 let current = match sel {
                     Selection::Actor(i) => self
@@ -2506,64 +3094,76 @@ impl GameEngine for SplatGame {
         }
 
         // Right-click (a click, not a look-drag) opens the context menu when
-        // exactly two actors are multi-selected.  Drag distance is accumulated
-        // from raw mouse motion because the cursor is grabbed while looking.
+        // two or more objects (of any kind) are multi-selected.  "Click" is
+        // defined by the same signal that drives the camera: if the fly
+        // camera's look never engaged during the hold (see
+        // FlyCamera::is_looking), the release is a click -- so the menu and
+        // the pointer grab can never disagree, whatever the platform's
+        // raw-delta behavior (the browser's differs from native).
         {
             let rmb = input_manager.get_key_state("mouse_right");
             if rmb.just_pressed() {
                 self.rmb_drag_accum = 0.0;
+                self.rmb_look_engaged = false;
             }
             if rmb.is_down() {
                 let (dx, dy) = input_manager.get_mouse_raw_delta();
                 self.rmb_drag_accum += dx.abs() as f32 + dy.abs() as f32;
+                self.rmb_look_engaged |= self.fly_camera.is_looking();
             }
             let released = ctx
                 .input(|i| i.pointer.button_released(egui::PointerButton::Secondary));
-            if editor
-                && released
-                && self.rmb_drag_accum < 6.0
-                && !ctx.egui_wants_pointer_input()
-                && matches!(
-                    self.multi_selected.as_slice(),
-                    [Selection::Actor(_), Selection::Actor(_)]
-                )
-            {
-                if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
-                    self.context_menu = Some(p);
+            if editor && released && self.multi_selected.len() >= 2 {
+                let pointer = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.latest_pos()));
+                // "Over UI" = an egui Area above the Background painter layer
+                // (panels, menus, modals) under the pointer.  Deliberately not
+                // egui_wants_pointer_input(): on the release frame its
+                // pointer-over check flips on (`!any_down`) and can claim
+                // empty-viewport clicks.
+                let over_ui = pointer
+                    .and_then(|p| ctx.layer_id_at(p))
+                    .is_some_and(|l| l.order != egui::Order::Background);
+                if !self.rmb_look_engaged && !over_ui {
+                    if let Some(p) = pointer {
+                        self.context_menu = Some(p);
+                    }
                 }
             }
         }
 
-        // The context menu itself: currently one action, snapping the second
-        // selected actor onto the first.
-        let mut do_snap: Option<(usize, usize)> = None; // (target, source)
+        // The context menu itself: currently one action, snapping every other
+        // selected object (any kind -- actors, lights, particles, splats)
+        // onto the first-selected one.
+        let mut do_snap = false;
         if editor {
             if let Some(menu_pos) = self.context_menu {
-                let pair = match self.multi_selected.as_slice() {
-                    [Selection::Actor(first), Selection::Actor(second)] => self
-                        .scene_actors
-                        .get(*first)
-                        .zip(self.scene_actors.get(*second))
-                        .map(|(a, b)| {
-                            (*first, *second, a.get_name().to_string(), b.get_name().to_string())
-                        }),
+                // First selection = the snap anchor; the rest move to it.
+                // Names resolved up front (stale selections dismiss the menu).
+                let label = match self.multi_selected.split_first() {
+                    Some((anchor, rest @ [_, ..])) => {
+                        self.selection_name(*anchor).map(|anchor_name| {
+                            if let [only] = rest {
+                                let moved = self
+                                    .selection_name(*only)
+                                    .unwrap_or_else(|| "object".to_string());
+                                format!("Snap \"{moved}\" to \"{anchor_name}\"")
+                            } else {
+                                format!("Snap {} objects to \"{anchor_name}\"", rest.len())
+                            }
+                        })
+                    }
                     _ => None,
                 };
-                match pair {
+                match label {
                     None => self.context_menu = None, // Selection changed under it.
-                    Some((first, second, first_name, second_name)) => {
+                    Some(label) => {
                         let menu = egui::Area::new(egui::Id::new("viewport_context_menu"))
                             .fixed_pos(menu_pos)
                             .constrain(true)
                             .show(&ctx, |ui| {
                                 egui::Frame::menu(ui.style()).show(ui, |ui| {
-                                    if ui
-                                        .button(format!(
-                                            "Snap \"{second_name}\" to \"{first_name}\""
-                                        ))
-                                        .clicked()
-                                    {
-                                        do_snap = Some((second, first));
+                                    if ui.button(label).clicked() {
+                                        do_snap = true;
                                         self.context_menu = None;
                                     }
                                 });
@@ -2610,14 +3210,17 @@ impl GameEngine for SplatGame {
                 self.activate_splat(i, renderer);
             }
         }
-        // Snap from the context menu: move the target actor onto the source.
-        if let Some((target, source)) = do_snap {
-            if target != source {
-                if let Some(pos) = self.scene_actors.get(source).map(|a| a.get_position()) {
-                    if let Some(actor) = self.scene_actors.get_mut(target) {
-                        actor.set_position(&pos);
-                        renderer.add_or_update_actor(actor);
-                    }
+        // Snap from the context menu: move every other selected object onto
+        // the first-selected one.
+        if do_snap {
+            let anchor_pos = self
+                .multi_selected
+                .first()
+                .and_then(|sel| self.selection_position(*sel));
+            if let Some(pos) = anchor_pos {
+                let targets: Vec<Selection> = self.multi_selected[1..].to_vec();
+                for sel in targets {
+                    self.set_selection_position(sel, &pos, renderer);
                 }
             }
         }
@@ -2649,6 +3252,50 @@ impl GameEngine for SplatGame {
         }
         if let Some(sel) = delete_object {
             self.delete_selected(sel, renderer);
+        }
+        // Resources-panel actions: create a library resource and open it in
+        // the Resource inspector.
+        if create_material {
+            self.next_object_num += 1;
+            let name = format!("Material {}", self.next_object_num);
+            let handle = renderer.create_material(&name, &MaterialDesc::default());
+            self.selected_resource = Some(ResourceSelection::Material(handle));
+            self.active_tab = Some(EditorTab::Resource);
+        }
+        if create_particle {
+            self.next_object_num += 1;
+            self.particle_resources.push(ParticleResource {
+                name: format!("Particle {}", self.next_object_num),
+                params: preset_particle_params("Fire"),
+            });
+            self.selected_resource =
+                Some(ResourceSelection::Particle(self.particle_resources.len() - 1));
+            self.active_tab = Some(EditorTab::Resource);
+        }
+        // Renaming a particle resource keeps the scene emitters that reference
+        // it pointing at the new name.
+        if let Some((old_name, new_name)) = renamed_particle {
+            for particle in &mut self.scene_particles {
+                if particle.preset == old_name {
+                    particle.preset = new_name.clone();
+                }
+            }
+        }
+        // Inspector edits to a particle resource push to every live emitter
+        // spawned from it (texture changes only affect future spawns).
+        if let Some(i) = edited_particle {
+            if let Some(resource) = self.particle_resources.get(i) {
+                let params = resource.params.clone();
+                let handles: Vec<ParticleHandle> = self
+                    .scene_particles
+                    .iter()
+                    .filter(|p| p.preset == resource.name)
+                    .map(|p| p.handle.clone())
+                    .collect();
+                for handle in handles {
+                    renderer.update_particle_params(&handle, &params);
+                }
+            }
         }
         // Push Details-panel / gizmo edits to the renderer's copy of the object.
         if selection_edited {

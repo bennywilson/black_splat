@@ -1,11 +1,22 @@
 //! Deferred world rendering: `GBufferPass` draws the `SceneLayer::World`
-//! actors into the G-buffer (albedo / world normal / specular + depth), then
-//! `LightingPass` accumulates every scene light into the scene color target
-//! with one fullscreen pass per light (skylight, directional, point, spot --
-//! no shadows yet).  Everything after (holes, custom passes, splats,
-//! particles) still renders forward on top, sharing the same depth buffer.
+//! actors into the G-buffer (albedo / world normal / metallic+roughness +
+//! depth), then `LightingPass` accumulates every scene light into the scene
+//! color target with one fullscreen pass per light (skylight, directional,
+//! point, spot).  Everything after (holes, custom passes, splats, particles)
+//! still renders forward on top, sharing the same depth buffer.
+//!
+//! Shadows are screen-space masks (see `ShadowPass`): a shadowed light first
+//! renders casters into a depth map -- the directional light into a 2x2
+//! cascade atlas, each spot light serially into one shared depth tile -- then
+//! a fullscreen mask pass projects that map against the G-buffer depth into a
+//! per-light screen-space shadow factor.  The light's shading pass multiplies
+//! by its mask, and every mask also multiplies into a persistent screen-space
+//! accumulation texture that will later darken the Gaussian splats (which
+//! never sample shadow maps themselves).  Because each spot's map is consumed
+//! into a mask before the next spot renders, any number of spot lights can
+//! cast shadows.
 
-use cgmath::{InnerSpace, SquareMatrix};
+use cgmath::{EuclideanSpace, InnerSpace, SquareMatrix};
 use std::collections::HashMap;
 use wgpu::{
     util::DeviceExt, BindGroupLayoutEntry, BindingType, SamplerBindingType, ShaderStages,
@@ -16,6 +27,16 @@ use crate::{assets::*, game_object::*, log, passes::model::*, resource::*, utils
 
 /// Most lights drawn per frame; extras are ignored.
 pub const MAX_LIGHTS: usize = 32;
+
+/// Cascade tiles in the shadow atlas (and the most a directional light uses).
+pub const MAX_CASCADES: usize = 4;
+// Bias subtracted from the receiver depth when comparing against the shadow
+// map (on top of the shadow pipeline's slope-scaled rasterizer bias).
+const SHADOW_DEPTH_BIAS: f32 = 0.0015;
+// Uniform pool for shadow draws: one 256-byte slot (dynamic offset) per
+// caster-per-tile draw.
+const SHADOW_DRAW_STRIDE: usize = 256;
+const MAX_SHADOW_DRAWS: usize = 1024;
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -30,14 +51,110 @@ pub struct LightUniform {
     // Skylight bottom-hemisphere color * intensity.
     pub color2: [f32; 4],
     pub camera_pos: [f32; 4],
-    // xy render target size in pixels.
+    // xy render target size in pixels, zw this light's shadow map size in
+    // pixels (the cascade atlas or the spot tile).
     pub target_dims: [f32; 4],
+    // Light view-projection per shadow tile: the directional light's cascades
+    // (near to far), or the spot's single projection in [0].  Consumed by the
+    // shadow *mask* pass; the shading pass only reads shadow_params.x.
+    pub shadow_matrices: [[[f32; 4]; 4]; MAX_CASCADES],
+    // Each tile's rect in its shadow map: xy uv offset, zw uv scale.
+    pub shadow_rects: [[f32; 4]; MAX_CASCADES],
+    // x: shadow tile count (0 = unshadowed), y: depth bias.
+    pub shadow_params: [f32; 4],
+}
+
+/// Shadow quality settings, tweakable at runtime (the editor exposes them in
+/// its Settings tab).  Changing the resolution recreates the shadow maps.
+/// Per-light on/off stays on the light (`Light::casts_shadow`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ShadowSettings {
+    /// Side of one shadow tile in texels (the cascade atlas is 2x2 tiles; the
+    /// shared spot tile is one).
+    pub resolution: u32,
+    /// Directional-light cascade count, 1..=MAX_CASCADES.
+    pub num_cascades: u32,
+    /// How far from the camera the directional cascades reach, in world units.
+    pub distance: f32,
+}
+
+impl Default for ShadowSettings {
+    fn default() -> Self {
+        ShadowSettings {
+            resolution: 1024,
+            num_cascades: 3,
+            distance: 75.0,
+        }
+    }
+}
+
+impl ShadowSettings {
+    fn clamped(&self) -> Self {
+        ShadowSettings {
+            resolution: self.resolution.clamp(256, 2048),
+            num_cascades: self.num_cascades.clamp(1, MAX_CASCADES as u32),
+            distance: self.distance.max(5.0),
+        }
+    }
+}
+
+/// One rendered shadow-map tile: the light's view-projection and where the
+/// tile sits in its depth map (uv offset + scale).
+#[derive(Clone, Copy)]
+struct ShadowTile {
+    view_proj: CgMat4,
+    rect: [f32; 4],
+}
+
+// Right-handed orthographic projection with wgpu's 0..1 clip z, for a box
+// centered on the view axis.  (cgmath::ortho targets OpenGL's -1..1 z, which
+// would clip away half the casters on wgpu.)
+fn ortho_wgpu(half_extent: f32, near: f32, far: f32) -> CgMat4 {
+    let inv_depth = 1.0 / (far - near);
+    #[rustfmt::skip]
+    let m = CgMat4::new(
+        1.0 / half_extent, 0.0, 0.0, 0.0,
+        0.0, 1.0 / half_extent, 0.0, 0.0,
+        0.0, 0.0, -inv_depth, 0.0,
+        0.0, 0.0, -near * inv_depth, 1.0,
+    );
+    m
+}
+
+// Right-handed perspective projection with wgpu's 0..1 clip z (for the spot
+// shadow projection; see ortho_wgpu on why cgmath::perspective isn't used).
+fn perspective_wgpu(fovy_rad: f32, aspect: f32, near: f32, far: f32) -> CgMat4 {
+    let f = 1.0 / (fovy_rad * 0.5).tan();
+    #[rustfmt::skip]
+    let m = CgMat4::new(
+        f / aspect, 0.0, 0.0, 0.0,
+        0.0, f, 0.0, 0.0,
+        0.0, 0.0, far / (near - far), -1.0,
+        0.0, 0.0, near * far / (near - far), 0.0,
+    );
+    m
+}
+
+// An up vector that isn't parallel to `dir`, for the light's look_at.
+fn shadow_up(dir: CgVec3) -> CgVec3 {
+    if dir.y.abs() > 0.99 {
+        CgVec3::new(0.0, 0.0, 1.0)
+    } else {
+        CgVec3::new(0.0, 1.0, 0.0)
+    }
+}
+
+/// A world-layer shadow caster gathered once per frame: its model and world
+/// matrix, re-projected per shadow tile.
+struct ShadowCaster {
+    model: ModelHandle,
+    world: CgMat4,
 }
 
 /// Renders the world-layer actors into the G-buffer.  Mirrors
-/// `ModelPass::render`'s actor walk, but writes albedo/normal/specular to
-/// three color targets and lets an actor's material override its model's
-/// textures and constants.
+/// `ModelPass::render`'s actor walk, but writes albedo/normal/metallic-
+/// roughness to three color targets and lets an actor's material override its
+/// model's textures and constants.
 pub struct GBufferPass {
     pipeline: wgpu::RenderPipeline,
 }
@@ -250,14 +367,15 @@ impl GBufferPass {
             }
             let model_handle = actor.get_model();
 
-            // Material constants: multiplied into the actor color / written as
-            // the specular constant.  No material = albedo only, no specular.
-            // Fetched before get_model so the borrows don't overlap.
+            // Material constants: color multiplied into the actor color;
+            // metallic/roughness written as the spec constant.  No material =
+            // albedo only (dielectric, fairly rough).  Fetched before
+            // get_model so the borrows don't overlap.
             let material_handle = actor.get_material();
-            let (color_const, spec_const) = asset_manager
+            let (color_const, mr_const) = asset_manager
                 .get_material(&material_handle)
-                .map_or((CG_VEC4_ONE, CG_VEC4_ZERO), |m| {
-                    (m.color_constant, m.spec_constant)
+                .map_or((CG_VEC4_ONE, CgVec4::new(0.0, 0.85, 0.0, 0.0)), |m| {
+                    (m.color_constant, m.mr_constant)
                 });
 
             // Editor-placed actors can exist before a model is assigned.
@@ -306,7 +424,7 @@ impl GBufferPass {
                 actor_color.z * color_const.z,
                 actor_color.w * color_const.w,
             ];
-            uniform_data.spec_color = spec_const.into();
+            uniform_data.spec_color = mr_const.into();
             uniform_data.custom_data_1 = [
                 actor.get_custom_data_1().x,
                 actor.get_custom_data_1().y,
@@ -356,9 +474,765 @@ impl GBufferPass {
     }
 }
 
+/// Which shadow mask shader a mask pass uses.
+enum MaskKind {
+    Cascades,
+    Spot,
+}
+
+/// Everything shadows: the caster depth pipeline, the directional cascade
+/// atlas, the shared serially-reused spot depth tile, and the screen-space
+/// mask plumbing (per-light temp mask + the multiplied accumulation texture
+/// for the future Gaussian-splat overlay).
+pub struct ShadowPass {
+    settings: ShadowSettings,
+    pending_settings: Option<ShadowSettings>,
+
+    // Caster depth rendering.
+    depth_pipeline: wgpu::RenderPipeline,
+    // 2x2 cascade tiles for the one shadow-casting directional light.
+    atlas: Texture,
+    // One tile, re-rendered per shadow-casting spot light (its contents are
+    // consumed into a screen-space mask before the next spot needs it).
+    spot_depth: Texture,
+    // Dynamic-offset uniform pool: one 256-byte slot per caster-per-tile draw.
+    draw_uniform_buffer: wgpu::Buffer,
+    draw_bind_group: wgpu::BindGroup,
+    next_draw_slot: usize,
+
+    // Screen-space masks.
+    mask_cascades_pipeline: wgpu::RenderPipeline,
+    mask_spot_pipeline: wgpu::RenderPipeline,
+    mask_bind_group_layout: wgpu::BindGroupLayout,
+    // Scene depth + cascade atlas / spot tile + comparison sampler.
+    cascades_mask_bind_group: wgpu::BindGroup,
+    spot_mask_bind_group: wgpu::BindGroup,
+    // This light's shadow factor (1 = lit), sampled by its shading pass.
+    pub mask_temp: Texture,
+    // Product of every light's mask this frame; the later splat-overlay pass
+    // darkens the Gaussians with it.
+    pub mask_accum: Texture,
+}
+
+impl ShadowPass {
+    pub async fn new(
+        device_resources: &DeviceResources<'_>,
+        asset_manager: &mut AssetManager,
+    ) -> Self {
+        log!("Creating ShadowPass");
+        let device = &device_resources.device;
+        let settings = ShadowSettings::default();
+
+        // Caster depth pipeline: vertex-only, depth-writes into a tile of the
+        // atlas / the spot map, with slope-scaled bias against acne.
+        let draw_uniform_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(64),
+                    },
+                    count: None,
+                }],
+                label: Some("ShadowPass_draw_uniform_layout"),
+            });
+        let draw_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ShadowPass_draw_uniform_buffer"),
+            size: (SHADOW_DRAW_STRIDE * MAX_SHADOW_DRAWS) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let draw_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &draw_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &draw_uniform_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(64),
+                }),
+            }],
+            label: Some("ShadowPass_draw_bind_group"),
+        });
+
+        let depth_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ShadowPass_depth_pipeline_layout"),
+                bind_group_layouts: &[Some(&draw_uniform_layout)],
+                immediate_size: 0,
+            });
+        let depth_shader_handle = asset_manager
+            .load_shader("/engine_assets/shaders/shadow_depth.wgsl", device_resources)
+            .await;
+        let depth_shader = asset_manager.get_shader(&depth_shader_handle);
+        let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ShadowPass_depth_pipeline"),
+            layout: Some(&depth_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: depth_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let (atlas, spot_depth) = Self::make_shadow_maps(device_resources, &settings);
+
+        // Mask pass inputs: scene depth + the light's shadow map + a
+        // comparison sampler (hardware PCF taps).
+        let mask_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Depth,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Depth,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Sampler(SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                ],
+                label: Some("ShadowPass_mask_bind_group_layout"),
+            });
+
+        // Same layout the lighting pass binds its per-light uniform with, so
+        // a light's uniform slot serves both its mask and shading passes.
+        let light_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("ShadowPass_light_bind_group_layout"),
+            });
+
+        let mask_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ShadowPass_mask_pipeline_layout"),
+                bind_group_layouts: &[
+                    Some(&mask_bind_group_layout),
+                    Some(&light_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
+        // Two targets: the per-light temp mask (replace) and the accumulation
+        // texture (multiply: accum *= mask).
+        let multiply_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let mask_targets = [
+            Some(wgpu::ColorTargetState {
+                format: SHADOW_MASK_FORMAT,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+            Some(wgpu::ColorTargetState {
+                format: SHADOW_MASK_FORMAT,
+                blend: Some(multiply_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+        ];
+
+        let mut mask_shader_handles = Vec::new();
+        for path in [
+            "/engine_assets/shaders/shadow_mask_cascades.wgsl",
+            "/engine_assets/shaders/shadow_mask_spot.wgsl",
+        ] {
+            mask_shader_handles.push(asset_manager.load_shader(path, device_resources).await);
+        }
+        let make_mask_pipeline = |handle: &ShaderHandle, label: &str| -> wgpu::RenderPipeline {
+            let shader = asset_manager.get_shader(handle);
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mask_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &mask_targets,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let mask_cascades_pipeline =
+            make_mask_pipeline(&mask_shader_handles[0], "ShadowPass_mask_cascades");
+        let mask_spot_pipeline = make_mask_pipeline(&mask_shader_handles[1], "ShadowPass_mask_spot");
+
+        let (rw, rh) = (
+            device_resources.render_textures[0].texture.width(),
+            device_resources.render_textures[0].texture.height(),
+        );
+        let mask_temp = Texture::new_render_texture_with_format(
+            device,
+            SHADOW_MASK_FORMAT,
+            rw,
+            rh,
+        )
+        .unwrap();
+        let mask_accum = Texture::new_render_texture_with_format(
+            device,
+            SHADOW_MASK_FORMAT,
+            rw,
+            rh,
+        )
+        .unwrap();
+
+        let cascades_mask_bind_group = Self::make_mask_bind_group(
+            device_resources,
+            &mask_bind_group_layout,
+            &atlas,
+            "cascades",
+        );
+        let spot_mask_bind_group = Self::make_mask_bind_group(
+            device_resources,
+            &mask_bind_group_layout,
+            &spot_depth,
+            "spot",
+        );
+
+        ShadowPass {
+            settings,
+            pending_settings: None,
+            depth_pipeline,
+            atlas,
+            spot_depth,
+            draw_uniform_buffer,
+            draw_bind_group,
+            next_draw_slot: 0,
+            mask_cascades_pipeline,
+            mask_spot_pipeline,
+            mask_bind_group_layout,
+            cascades_mask_bind_group,
+            spot_mask_bind_group,
+            mask_temp,
+            mask_accum,
+        }
+    }
+
+    fn make_shadow_maps(
+        device_resources: &DeviceResources,
+        settings: &ShadowSettings,
+    ) -> (Texture, Texture) {
+        let res = settings.resolution;
+        let atlas = Texture::new_depth_texture(
+            &device_resources.device,
+            &device_resources.surface_config,
+            res * 2,
+            res * 2,
+        )
+        .unwrap();
+        let spot = Texture::new_depth_texture(
+            &device_resources.device,
+            &device_resources.surface_config,
+            res,
+            res,
+        )
+        .unwrap();
+        (atlas, spot)
+    }
+
+    fn make_mask_bind_group(
+        device_resources: &DeviceResources,
+        layout: &wgpu::BindGroupLayout,
+        shadow_map: &Texture,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device_resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &device_resources.render_textures[1].view,
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&shadow_map.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&shadow_map.sampler),
+                    },
+                ],
+                label: Some(&format!("ShadowPass_mask_bind_group_{label}")),
+            })
+    }
+
+    /// Requests new quality settings; applied at the start of the next frame.
+    pub fn request_settings(&mut self, settings: &ShadowSettings) {
+        let clamped = settings.clamped();
+        if clamped != self.settings {
+            self.pending_settings = Some(clamped);
+        }
+    }
+
+    pub fn settings(&self) -> ShadowSettings {
+        self.pending_settings.unwrap_or(self.settings)
+    }
+
+    // Applies pending settings, recreating the shadow maps (and their mask
+    // bind groups) if the resolution changed.
+    fn apply_pending(&mut self, device_resources: &DeviceResources) {
+        let Some(pending) = self.pending_settings.take() else {
+            return;
+        };
+        let resolution_changed = pending.resolution != self.settings.resolution;
+        self.settings = pending;
+        if resolution_changed {
+            let (atlas, spot) = Self::make_shadow_maps(device_resources, &self.settings);
+            self.atlas = atlas;
+            self.spot_depth = spot;
+            self.rebuild_mask_bind_groups(device_resources);
+        }
+    }
+
+    fn rebuild_mask_bind_groups(&mut self, device_resources: &DeviceResources) {
+        self.cascades_mask_bind_group = Self::make_mask_bind_group(
+            device_resources,
+            &self.mask_bind_group_layout,
+            &self.atlas,
+            "cascades",
+        );
+        self.spot_mask_bind_group = Self::make_mask_bind_group(
+            device_resources,
+            &self.mask_bind_group_layout,
+            &self.spot_depth,
+            "spot",
+        );
+    }
+
+    /// Window resize: the screen-space mask textures track the render
+    /// resolution, and the mask bind groups reference the recreated scene
+    /// depth.  The lighting pass must rebuild its bind group after this (it
+    /// samples `mask_temp`).
+    pub fn resize(&mut self, device_resources: &DeviceResources) {
+        let (rw, rh) = (
+            device_resources.render_textures[0].texture.width(),
+            device_resources.render_textures[0].texture.height(),
+        );
+        self.mask_temp = Texture::new_render_texture_with_format(
+            &device_resources.device,
+            SHADOW_MASK_FORMAT,
+            rw,
+            rh,
+        )
+        .unwrap();
+        self.mask_accum = Texture::new_render_texture_with_format(
+            &device_resources.device,
+            SHADOW_MASK_FORMAT,
+            rw,
+            rh,
+        )
+        .unwrap();
+        self.rebuild_mask_bind_groups(device_resources);
+    }
+
+    // Resets the per-frame draw pool and clears the accumulation texture to
+    // fully lit (each light's mask multiplies into it).
+    fn begin_frame(&mut self, ctx: &mut RenderContext) {
+        self.apply_pending(ctx.device);
+        self.next_draw_slot = 0;
+
+        let mut encoder =
+            ctx.device
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ShadowPass::begin_frame()"),
+                });
+        {
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Shadow accum clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_accum.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+                timestamp_writes: None,
+            });
+        }
+        ctx.device.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    // Renders `casters` into tiles of a shadow map.  `tiles` gives each
+    // tile's pixel origin and light view-projection; the whole map is cleared
+    // first (each light's map is consumed into a mask before the next light
+    // renders, so nothing outlives the frame).
+    fn render_depth(
+        &mut self,
+        ctx: &mut RenderContext,
+        casters: &[ShadowCaster],
+        tiles: &[(u32, u32, CgMat4)],
+        use_atlas: bool,
+    ) {
+        let device_resources = &mut *ctx.device;
+        let asset_manager = &mut *ctx.assets;
+        let resolution = self.settings.resolution;
+
+        let mut encoder =
+            device_resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ShadowPass::render_depth()"),
+                });
+        let target_view = if use_atlas {
+            &self.atlas.view
+        } else {
+            &self.spot_depth.view
+        };
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Shadow depth"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: target_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            multiview_mask: None,
+            timestamp_writes: None,
+        });
+        render_pass.set_pipeline(&self.depth_pipeline);
+
+        let model_mappings = asset_manager.get_model_mappings();
+        for (x, y, view_proj) in tiles {
+            render_pass.set_viewport(
+                *x as f32,
+                *y as f32,
+                resolution as f32,
+                resolution as f32,
+                0.0,
+                1.0,
+            );
+            render_pass.set_scissor_rect(*x, *y, resolution, resolution);
+            for caster in casters {
+                if self.next_draw_slot >= MAX_SHADOW_DRAWS {
+                    break; // Pool exhausted; remaining casters drop out this frame.
+                }
+                let Some(model) = model_mappings.get(&caster.model) else {
+                    continue;
+                };
+                let mvp: [[f32; 4]; 4] = (view_proj * caster.world).into();
+                let offset = (self.next_draw_slot * SHADOW_DRAW_STRIDE) as u64;
+                device_resources.queue.write_buffer(
+                    &self.draw_uniform_buffer,
+                    offset,
+                    bytemuck::cast_slice(&[mvp]),
+                );
+                render_pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.set_bind_group(0, &self.draw_bind_group, &[offset as u32]);
+                render_pass.draw_indexed(0..model.num_indices, 0, 0..1);
+                self.next_draw_slot += 1;
+            }
+        }
+
+        drop(render_pass);
+        device_resources.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    // Projects the just-rendered shadow map into screen space: writes this
+    // light's shadow factor into mask_temp and multiplies it into mask_accum.
+    // `light_bind_group` is the light's uniform slot (it holds the tile
+    // matrices/rects the mask shader needs).
+    fn render_mask(
+        &mut self,
+        ctx: &mut RenderContext,
+        kind: MaskKind,
+        light_bind_group: &wgpu::BindGroup,
+    ) {
+        let device_resources = &mut *ctx.device;
+        let mut encoder =
+            device_resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ShadowPass::render_mask()"),
+                });
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Shadow mask"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_temp.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.mask_accum.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+            timestamp_writes: None,
+        });
+        let (pipeline, bind_group) = match kind {
+            MaskKind::Cascades => (&self.mask_cascades_pipeline, &self.cascades_mask_bind_group),
+            MaskKind::Spot => (&self.mask_spot_pipeline, &self.spot_mask_bind_group),
+        };
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.set_bind_group(1, light_bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+        drop(render_pass);
+        device_resources.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    // Cascade tiles for the shadowed directional light: split the camera
+    // frustum out to settings.distance, fit a texel-snapped light-space ortho
+    // box around each slice's bounding sphere, and render the casters into
+    // the 2x2 atlas.
+    fn render_cascades(
+        &mut self,
+        ctx: &mut RenderContext,
+        casters: &[ShadowCaster],
+        light: &Light,
+    ) -> Vec<ShadowTile> {
+        let camera = ctx.camera;
+        let config = ctx.config;
+        let num_cascades = self.settings.num_cascades as usize;
+        let resolution = self.settings.resolution;
+
+        let light_dir = {
+            let dir = light.get_direction();
+            if dir.magnitude2() > 0.0001 {
+                dir.normalize()
+            } else {
+                CgVec3::new(0.0, -1.0, 0.0)
+            }
+        };
+        let up = shadow_up(light_dir);
+
+        let (_, forward, right) = camera.calculate_view_matrix();
+        let cam_pos = camera.get_position();
+        let cam_up = forward.cross(right).normalize();
+        let tan_v = (config.fov.to_radians() * 0.5).tan();
+        let tan_h = tan_v * (config.window_width as f32 / config.window_height as f32);
+
+        // Practical split scheme: halfway between uniform and logarithmic.
+        let near = 0.1_f32;
+        let far = self.settings.distance;
+        let split = |t: f32| -> f32 {
+            if t <= 0.0 {
+                return near;
+            }
+            let uniform = near + (far - near) * t;
+            let logarithmic = near * (far / near).powf(t);
+            (uniform + logarithmic) * 0.5
+        };
+
+        let mut tiles = Vec::with_capacity(num_cascades);
+        let mut tile_origins = Vec::with_capacity(num_cascades);
+        for i in 0..num_cascades {
+            let slice_near = split(i as f32 / num_cascades as f32);
+            let slice_far = split((i + 1) as f32 / num_cascades as f32);
+
+            // Bounding sphere of the frustum slice (corner spans are symmetric
+            // around the view axis, so the centroid sits on it).
+            let center = cam_pos + forward * (slice_near + slice_far) * 0.5;
+            let corner_dist = |d: f32| -> f32 {
+                let corner = cam_pos + forward * d + right * (d * tan_h) + cam_up * (d * tan_v);
+                (corner - center).magnitude()
+            };
+            let mut radius = corner_dist(slice_near).max(corner_dist(slice_far));
+            // Quantize the radius so tiny camera moves don't resize the box
+            // (resizing re-scales texels and makes edges shimmer).
+            radius = (radius * 16.0).ceil() / 16.0;
+
+            // Pull the light eye back far enough to catch casters behind the
+            // slice (e.g. a roof above the view) on their way to it.
+            let backup = radius.max(20.0);
+            let eye = center - light_dir * (radius + backup);
+            let view = CgMat4::look_at_rh(
+                CgPoint::from_vec(eye),
+                CgPoint::from_vec(center),
+                up,
+            );
+            let proj = ortho_wgpu(radius, 0.0, backup + radius * 2.0);
+            let mut view_proj = proj * view;
+
+            // Texel snapping: shift the projection so the world origin lands
+            // on a texel boundary, killing edge shimmer as the camera pans.
+            let origin = view_proj * CgVec4::new(0.0, 0.0, 0.0, 1.0);
+            let half_res = resolution as f32 * 0.5;
+            let snap_x = ((origin.x * half_res).round() - origin.x * half_res) / half_res;
+            let snap_y = ((origin.y * half_res).round() - origin.y * half_res) / half_res;
+            view_proj =
+                CgMat4::from_translation(CgVec3::new(snap_x, snap_y, 0.0)) * view_proj;
+
+            // 2x2 atlas layout.
+            let (tx, ty) = ((i as u32 % 2) * resolution, (i as u32 / 2) * resolution);
+            tiles.push(ShadowTile {
+                view_proj,
+                rect: [
+                    (i % 2) as f32 * 0.5,
+                    (i / 2) as f32 * 0.5,
+                    0.5,
+                    0.5,
+                ],
+            });
+            tile_origins.push((tx, ty, view_proj));
+        }
+
+        self.render_depth(ctx, casters, &tile_origins, true);
+        tiles
+    }
+
+    // The spot light's single projected shadow map, rendered into the shared
+    // spot tile (consumed into a screen-space mask right after).
+    fn render_spot(
+        &mut self,
+        ctx: &mut RenderContext,
+        casters: &[ShadowCaster],
+        light: &Light,
+    ) -> ShadowTile {
+        let position = light.get_position();
+        let direction = {
+            let dir = light.get_direction();
+            if dir.magnitude2() > 0.0001 {
+                dir.normalize()
+            } else {
+                CgVec3::new(0.0, 0.0, 1.0)
+            }
+        };
+        let fovy = (light.get_spot_angle().clamp(1.0, 85.0) * 2.0).to_radians();
+        let proj = perspective_wgpu(fovy, 1.0, 0.05, light.get_range().max(0.5));
+        let view = CgMat4::look_at_rh(
+            CgPoint::from_vec(position),
+            CgPoint::from_vec(position + direction),
+            shadow_up(direction),
+        );
+        let view_proj = proj * view;
+
+        self.render_depth(ctx, casters, &[(0, 0, view_proj)], false);
+        ShadowTile {
+            view_proj,
+            rect: [0.0, 0.0, 1.0, 1.0],
+        }
+    }
+
+    /// The screen-space product of every shadow mask this frame (1 = fully
+    /// lit).  The Gaussian-splat overlay will multiply the splats by it.
+    pub fn shadow_accum(&self) -> &Texture {
+        &self.mask_accum
+    }
+}
+
 /// Accumulates the scene's lights onto the scene color target from the
 /// G-buffer: the pass clears to the config's clear color, then draws one
-/// additive fullscreen triangle per light with the pipeline matching its type.
+/// additive fullscreen triangle per light with the pipeline matching its
+/// type.  Shadowed lights (the first directional caster, every spot caster)
+/// first get their shadow map + screen-space mask rendered via `ShadowPass`,
+/// and their shading pass multiplies by the mask.
 pub struct LightingPass {
     skylight_pipeline: wgpu::RenderPipeline,
     directional_pipeline: wgpu::RenderPipeline,
@@ -375,13 +1249,14 @@ impl LightingPass {
     pub async fn new(
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
+        shadow_pass: &ShadowPass,
     ) -> Self {
         log!("Creating LightingPass");
         let device = &device_resources.device;
         let surface_config = &device_resources.surface_config;
 
-        // G-buffer inputs: albedo / normal / specular / depth, all read with
-        // textureLoad (no sampler).
+        // G-buffer inputs: albedo / normal / metallic-roughness / depth read
+        // with textureLoad, plus the current light's screen-space shadow mask.
         let gbuffer_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -425,11 +1300,24 @@ impl LightingPass {
                         },
                         count: None,
                     },
+                    BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("LightingPass_gbuffer_bind_group_layout"),
             });
-        let gbuffer_bind_group =
-            Self::make_gbuffer_bind_group(device_resources, &gbuffer_bind_group_layout);
+        let gbuffer_bind_group = Self::make_gbuffer_bind_group(
+            device_resources,
+            &gbuffer_bind_group_layout,
+            shadow_pass,
+        );
 
         let light_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -561,6 +1449,7 @@ impl LightingPass {
     fn make_gbuffer_bind_group(
         device_resources: &DeviceResources,
         layout: &wgpu::BindGroupLayout,
+        shadow_pass: &ShadowPass,
     ) -> wgpu::BindGroup {
         device_resources
             .device
@@ -591,30 +1480,41 @@ impl LightingPass {
                             &device_resources.render_textures[1].view,
                         ),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(
+                            &shadow_pass.mask_temp.view,
+                        ),
+                    },
                 ],
                 label: Some("LightingPass_gbuffer_bind_group"),
             })
     }
 
-    /// Rebind the (recreated) G-buffer/depth textures after a window resize.
-    pub fn resize(&mut self, device_resources: &DeviceResources) {
-        self.gbuffer_bind_group =
-            Self::make_gbuffer_bind_group(device_resources, &self.gbuffer_bind_group_layout);
+    /// Rebind the (recreated) G-buffer / depth / shadow-mask textures after a
+    /// window resize.
+    pub fn resize(&mut self, device_resources: &DeviceResources, shadow_pass: &ShadowPass) {
+        self.gbuffer_bind_group = Self::make_gbuffer_bind_group(
+            device_resources,
+            &self.gbuffer_bind_group_layout,
+            shadow_pass,
+        );
     }
 
     /// Clears the scene color target to the config's clear color and adds
-    /// every light's contribution from the G-buffer.
-    pub fn render(&mut self, ctx: &mut RenderContext, lights: &HashMap<u32, Light>) {
-        let device_resources = &mut *ctx.device;
+    /// every light's contribution from the G-buffer, rendering shadow maps +
+    /// screen-space masks along the way for the lights that cast them.
+    pub fn render(
+        &mut self,
+        ctx: &mut RenderContext,
+        lights: &HashMap<u32, Light>,
+        actors: &HashMap<u32, Actor>,
+        shadow_pass: &mut ShadowPass,
+    ) {
+        shadow_pass.begin_frame(ctx);
+
         let game_camera = ctx.camera;
         let game_config = ctx.config;
-        let mut command_encoder =
-            device_resources
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("LightingPass::render()"),
-                });
-
         let (view_matrix, _, _) = game_camera.calculate_view_matrix();
         let proj_matrix = cgmath::perspective(
             cgmath::Deg(game_config.fov),
@@ -622,17 +1522,77 @@ impl LightingPass {
             0.1,
             10000.0,
         );
-        let inv_view_proj = (proj_matrix * view_matrix)
+        let inv_view_proj: [[f32; 4]; 4] = (proj_matrix * view_matrix)
             .invert()
-            .unwrap_or_else(cgmath::Matrix4::identity);
+            .unwrap_or_else(cgmath::Matrix4::identity)
+            .into();
         let camera_pos = game_camera.get_position();
         // The G-buffer renders at render_resolution (not the window size);
         // the shaders rebuild UVs from pixel coords with these dimensions.
         let (rw, rh) = game_config.render_resolution();
+        let clear_color = game_config.clear_color;
+        let settings = shadow_pass.settings;
 
-        // Fill one uniform slot per light (the writes land before the submit).
-        let mut draws = Vec::<(usize, LightType)>::new();
-        for (slot, light) in lights.values().enumerate().take(MAX_LIGHTS) {
+        // World-layer casters, gathered once and re-projected per shadow tile.
+        let casters: Vec<ShadowCaster> = actors
+            .values()
+            .filter(|actor| actor.get_layer().0 == SceneLayer::World)
+            .map(|actor| ShadowCaster {
+                model: actor.get_model(),
+                world: cgmath::Matrix4::from_translation(actor.get_position())
+                    * cgmath::Matrix4::from(actor.get_rotation())
+                    * cgmath::Matrix4::from_nonuniform_scale(
+                        actor.get_scale().x,
+                        actor.get_scale().y,
+                        actor.get_scale().z,
+                    ),
+            })
+            .collect();
+
+        // Clear the scene target up front; each light then adds onto it in
+        // its own pass (shadowed lights interleave their depth/mask renders).
+        {
+            let mut encoder =
+                ctx.device
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("LightingPass clear"),
+                    });
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Deferred Lighting clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &ctx.device.render_textures[0].view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: clear_color.x as f64,
+                            g: clear_color.y as f64,
+                            b: clear_color.z as f64,
+                            a: clear_color.w as f64,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+                timestamp_writes: None,
+            });
+            drop(_clear);
+            ctx.device.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Deterministic order, and the first shadow-casting directional light
+        // owns the cascade atlas (only one directional can cast per frame).
+        let mut sorted_lights: Vec<&Light> = lights.values().collect();
+        sorted_lights.sort_by_key(|light| light.id);
+        let cascade_owner = sorted_lights
+            .iter()
+            .find(|l| l.get_light_type() == LightType::Directional && l.casts_shadow())
+            .map(|l| l.id);
+
+        for (slot, light) in sorted_lights.iter().enumerate().take(MAX_LIGHTS) {
             let position = light.get_position();
             let direction = {
                 let dir = light.get_direction();
@@ -648,62 +1608,89 @@ impl LightingPass {
             // The cone fades in over the outer 20% of the angle.
             let inner_rad = outer_rad * 0.8;
 
-            let uniform = LightUniform {
-                inv_view_proj: inv_view_proj.into(),
+            let mut uniform = LightUniform {
+                inv_view_proj,
                 position_range: [position.x, position.y, position.z, light.get_range()],
                 direction_cone: [direction.x, direction.y, direction.z, outer_rad.cos()],
                 color_cone: [color.x, color.y, color.z, inner_rad.cos()],
                 color2: [color2.x, color2.y, color2.z, 0.0],
                 camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
                 target_dims: [rw as f32, rh as f32, 0.0, 0.0],
+                ..Default::default()
             };
-            device_resources.queue.write_buffer(
+
+            // Shadowed lights: render the depth map, fill the tile matrices,
+            // then bake the screen-space mask their shading pass will read.
+            let light_type = light.get_light_type();
+            let mask_kind = if light_type == LightType::Directional
+                && cascade_owner == Some(light.id)
+            {
+                let tiles = shadow_pass.render_cascades(ctx, &casters, light);
+                for (i, tile) in tiles.iter().enumerate() {
+                    uniform.shadow_matrices[i] = tile.view_proj.into();
+                    uniform.shadow_rects[i] = tile.rect;
+                }
+                uniform.shadow_params = [tiles.len() as f32, SHADOW_DEPTH_BIAS, 0.0, 0.0];
+                let atlas_size = (settings.resolution * 2) as f32;
+                uniform.target_dims[2] = atlas_size;
+                uniform.target_dims[3] = atlas_size;
+                Some(MaskKind::Cascades)
+            } else if light_type == LightType::Spot && light.casts_shadow() {
+                let tile = shadow_pass.render_spot(ctx, &casters, light);
+                uniform.shadow_matrices[0] = tile.view_proj.into();
+                uniform.shadow_rects[0] = tile.rect;
+                uniform.shadow_params = [1.0, SHADOW_DEPTH_BIAS, 0.0, 0.0];
+                uniform.target_dims[2] = settings.resolution as f32;
+                uniform.target_dims[3] = settings.resolution as f32;
+                Some(MaskKind::Spot)
+            } else {
+                None
+            };
+
+            ctx.device.queue.write_buffer(
                 &self.light_uniforms[slot].0,
                 0,
                 bytemuck::cast_slice(&[uniform]),
             );
-            draws.push((slot, light.get_light_type()));
-        }
+            if let Some(kind) = mask_kind {
+                shadow_pass.render_mask(ctx, kind, &self.light_uniforms[slot].1);
+            }
 
-        let clear_color = game_config.clear_color;
-        let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Deferred Lighting"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &device_resources.render_textures[0].view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: clear_color.x as f64,
-                        g: clear_color.y as f64,
-                        b: clear_color.z as f64,
-                        a: clear_color.w as f64,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-            timestamp_writes: None,
-        });
-
-        render_pass.set_bind_group(0, &self.gbuffer_bind_group, &[]);
-        for (slot, light_type) in &draws {
+            // The light's additive shading pass.
             let pipeline = match light_type {
                 LightType::Skylight => &self.skylight_pipeline,
                 LightType::Directional => &self.directional_pipeline,
                 LightType::Point => &self.point_pipeline,
                 LightType::Spot => &self.spot_pipeline,
             };
+            let mut encoder =
+                ctx.device
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("LightingPass light"),
+                    });
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Deferred Light"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &ctx.device.render_textures[0].view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+                timestamp_writes: None,
+            });
             render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(1, &self.light_uniforms[*slot].1, &[]);
+            render_pass.set_bind_group(0, &self.gbuffer_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.light_uniforms[slot].1, &[]);
             render_pass.draw(0..3, 0..1);
+            drop(render_pass);
+            ctx.device.queue.submit(std::iter::once(encoder.finish()));
         }
-
-        drop(render_pass);
-        device_resources
-            .queue
-            .submit(std::iter::once(command_encoder.finish()));
     }
 }

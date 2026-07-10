@@ -29,17 +29,26 @@ pub const GIZMO_ACTIONS: [(GizmoMode, &str); 3] = [
 const CONFIG_KEYS: [&str; 3] = ["gizmo_translate", "gizmo_rotate", "gizmo_scale"];
 
 /// Editor preferences that persist across runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct EditorConfig {
     /// Hotkey per [`GIZMO_ACTIONS`] slot.  Kept distinct by [`rebind`](Self::rebind).
     pub gizmo_keys: [egui::Key; 3],
+    /// Shadow quality (Settings tab > Shadows), pushed to the renderer's
+    /// `ShadowSettings` at startup and whenever edited.
+    pub shadow_resolution: u32,
+    pub shadow_cascades: u32,
+    pub shadow_distance: f32,
 }
 
 impl Default for EditorConfig {
     fn default() -> Self {
-        // The Unity-style W / E / R.
         Self {
+            // The Unity-style W / E / R.
             gizmo_keys: [egui::Key::W, egui::Key::E, egui::Key::R],
+            // Mirrors black_splat::passes::deferred::ShadowSettings::default().
+            shadow_resolution: 1024,
+            shadow_cascades: 3,
+            shadow_distance: 75.0,
         }
     }
 }
@@ -62,18 +71,21 @@ impl EditorConfig {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl EditorConfig {
-    /// Serializes to the simple `name = Key` line format (also the on-disk
+    /// Serializes to the simple `name = value` line format (also the on-disk
     /// format), e.g. `gizmo_translate = W`.
     fn serialize(&self) -> String {
-        let mut text = String::from("# black_splat editor keybindings\n");
+        let mut text = String::from("# black_splat editor preferences\n");
         for (slot, id) in CONFIG_KEYS.iter().enumerate() {
             text.push_str(&format!("{id} = {}\n", self.gizmo_keys[slot].name()));
         }
+        text.push_str(&format!("shadow_resolution = {}\n", self.shadow_resolution));
+        text.push_str(&format!("shadow_cascades = {}\n", self.shadow_cascades));
+        text.push_str(&format!("shadow_distance = {}\n", self.shadow_distance));
         text
     }
 
     /// Parses the [`serialize`](Self::serialize) format on top of the defaults,
-    /// so unknown/missing/renamed lines simply keep their default binding.
+    /// so unknown/missing/renamed lines simply keep their default value.
     fn parse(text: &str) -> Self {
         let mut config = Self::default();
         for line in text.lines() {
@@ -84,9 +96,22 @@ impl EditorConfig {
             let Some((name, value)) = line.split_once('=') else {
                 continue;
             };
-            if let Some(slot) = CONFIG_KEYS.iter().position(|id| *id == name.trim()) {
-                if let Some(key) = egui::Key::from_name(value.trim()) {
+            let (name, value) = (name.trim(), value.trim());
+            if let Some(slot) = CONFIG_KEYS.iter().position(|id| *id == name) {
+                if let Some(key) = egui::Key::from_name(value) {
                     config.gizmo_keys[slot] = key;
+                }
+            } else if name == "shadow_resolution" {
+                if let Ok(v) = value.parse() {
+                    config.shadow_resolution = v;
+                }
+            } else if name == "shadow_cascades" {
+                if let Ok(v) = value.parse() {
+                    config.shadow_cascades = v;
+                }
+            } else if name == "shadow_distance" {
+                if let Ok(v) = value.parse() {
+                    config.shadow_distance = v;
                 }
             }
         }
