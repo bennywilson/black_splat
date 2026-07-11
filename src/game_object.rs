@@ -48,14 +48,14 @@ pub struct ParticleHandle {
 
 pub const INVALID_PARTICLE_HANDLE: ParticleHandle = ParticleHandle { index: u32::MAX };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ParticleBlendMode {
     Additive,
     AlphaBlend,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParticleParams {
     pub texture_file: String,
     pub blend_mode: ParticleBlendMode,
@@ -339,6 +339,13 @@ pub struct Actor {
     // Optional material override: when valid, the world G-buffer pass binds
     // this material's textures/constants instead of the model's own textures.
     material_handle: MaterialHandle,
+
+    // When true this actor is an invisible shadow-catcher proxy: it is skipped
+    // by the G-buffer (never shaded) and by the shadow casters, and instead
+    // renders only into the catcher depth so the deferred pass can project the
+    // inserted CG objects' shadows onto it and darken the Gaussian splats
+    // behind it -- grounding those objects in the splat scene.
+    shadow_catcher: bool,
 }
 
 // Editor markup: the fields the editor's Details panel shows and how each is
@@ -351,6 +358,7 @@ crate::editor_properties!(Actor {
     layer: choice("Scene Layer"),
     model_handle: model("Model"),
     material_handle: material("Material"),
+    shadow_catcher: bool("Shadow Catcher"),
 });
 
 impl Default for Actor {
@@ -377,6 +385,7 @@ impl Actor {
             custom_pass_handle: None,
             model_handle: ModelHandle::make_invalid(),
             material_handle: MaterialHandle::make_invalid(),
+            shadow_catcher: false,
         }
     }
 
@@ -456,6 +465,14 @@ impl Actor {
 
     pub fn get_custom_data_1(&self) -> CgVec4 {
         self.custom_data_1
+    }
+
+    pub fn set_shadow_catcher(&mut self, shadow_catcher: bool) {
+        self.shadow_catcher = shadow_catcher;
+    }
+
+    pub fn is_shadow_catcher(&self) -> bool {
+        self.shadow_catcher
     }
 }
 

@@ -15,6 +15,8 @@ pub mod editor;
 pub mod engine;
 pub mod fly_camera;
 pub mod game_object;
+#[cfg(target_arch = "wasm32")]
+pub mod idb;
 pub mod input;
 pub mod renderer;
 pub mod resource;
@@ -228,6 +230,15 @@ where
                                 if input_manager.get_key_state("h").just_pressed() {
                                     game_renderer.enable_help_text();
                                 }
+                            } else if event.state == ElementState::Released {
+                                // Always forward releases, even when egui
+                                // consumed them (e.g. a field grabbed focus
+                                // mid-hold): swallowing a release leaves the
+                                // key stuck "down" in the game -- held-key
+                                // actions (splat param nudges) run forever.
+                                input_manager.set_key_state(event.physical_key, event.state);
+                            }
+                            if !egui_consumed {
 
                                 if input_manager.get_key_state("v").just_pressed() {
                                     game_config.vsync = !game_config.vsync;
@@ -384,6 +395,15 @@ where
                                 if input_manager.get_key_state("h").just_pressed() {
                                     game_renderer.enable_help_text();
                                 }
+                            } else if event.state == ElementState::Released {
+                                // Always forward releases, even when egui
+                                // consumed them (e.g. a field grabbed focus
+                                // mid-hold): swallowing a release leaves the
+                                // key stuck "down" in the game -- held-key
+                                // actions (splat param nudges) run forever.
+                                input_manager.set_key_state(event.physical_key, event.state);
+                            }
+                            if !egui_consumed {
 
                                 if input_manager.get_key_state("v").just_pressed() {
                                     game_config.vsync = !game_config.vsync;

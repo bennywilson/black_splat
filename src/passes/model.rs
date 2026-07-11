@@ -373,7 +373,7 @@ impl Model {
         let texture = {
             if !textures.is_empty() {
                 asset_manager.get_texture(&textures[0])
-            } else {
+            } else if !gltf_images.is_empty() {
                 let image = &gltf_images[0];
                 //   image.
                 empty_texture = Some(
@@ -384,6 +384,21 @@ impl Model {
                         image.height,
                         device_resources,
                         Some("gltf tex"),
+                    )
+                    .unwrap(),
+                );
+                empty_texture.as_ref().unwrap()
+            } else {
+                // Untextured model (e.g. a bare quad): fall back to a 1x1 white
+                // texture so the bind group still has something to sample.
+                empty_texture = Some(
+                    Texture::from_rgba(
+                        &[255, 255, 255, 255],
+                        true,
+                        1,
+                        1,
+                        device_resources,
+                        Some("untextured model fallback"),
                     )
                     .unwrap(),
                 );

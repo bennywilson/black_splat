@@ -372,6 +372,12 @@ const GIZMO_MIN_SCALE: f32 = 0.001;
 // drag_axis value for the scale gizmo's uniform-scale center handle
 // (0..2 are the entries of GIZMO_AXES).
 const GIZMO_CENTER_HANDLE: usize = 3;
+// Rotate-drag gain: how much the object turns per unit of pointer angle swept
+// around the gizmo center.  1.0 tracks the pointer exactly (a full lap around
+// the center = one turn), but that makes a straight drag across the view worth
+// only ~half a turn; >1 trades exact tracking for a livelier feel so a
+// screen-wide drag spins the object a bit more than the pointer sweep.
+const GIZMO_ROTATE_SENSITIVITY: f32 = 1.5;
 
 /// A screen-space translate/rotate/scale gizmo drawn over the 3D view for the
 /// selected actor.  Translate shows three world-axis arrows; dragging one
@@ -382,16 +388,56 @@ const GIZMO_CENTER_HANDLE: usize = 3;
 /// the center scales all three uniformly.
 pub struct TransformGizmo {
     pub mode: GizmoMode,
+    /// Rotate-mode snap increment in degrees; 0 disables snapping so rotation
+    /// is continuous.  When set, a rotate drag commits only in whole
+    /// increments of this many degrees.
+    pub rotate_snap_degrees: f32,
+    /// Translate-mode snap increment in world units; 0 disables snapping so
+    /// translation is continuous.  When set, a translate drag commits only
+    /// in whole increments of this many units along the dragged axis.
+    pub translate_snap_units: f32,
+    /// Scale-mode snap increment; 0 disables snapping so scaling is
+    /// continuous.  When set, a scale drag commits only in whole increments
+    /// of this much scale, applied to the axis' (or, for the uniform center
+    /// handle, each axis') absolute scale value.
+    pub scale_snap_units: f32,
     // Handle currently being dragged: an index into GIZMO_AXES, or
     // GIZMO_CENTER_HANDLE for the uniform-scale center square.
     drag_axis: Option<usize>,
+    // Rotate-drag accumulation: the raw angle dragged since the drag began
+    // and how much of it has been committed (after snapping).  Snapping
+    // quantizes the *cumulative* turn, so a small wiggle never jumps a full
+    // increment -- the object only turns once the drag passes a half-step.
+    rotate_accum: f32,
+    rotate_applied: f32,
+    // Translate-drag accumulation, same shape as the rotate fields above but
+    // in world units along the dragged axis.
+    translate_accum: f32,
+    translate_applied: f32,
+    // Scale-drag accumulation: unlike rotate/translate this tracks the raw
+    // (unsnapped) *absolute* scale value per axis rather than a delta, since
+    // a scale drag is multiplicative (feel stays the same at any current
+    // scale) while the snap increment is a fixed absolute step.  Seeded from
+    // the actor's current scale on press; the center handle drives all three
+    // entries at once, an axis handle drives just its own.
+    scale_accum: [f32; 3],
+    scale_applied: [f32; 3],
 }
 
 impl Default for TransformGizmo {
     fn default() -> Self {
         TransformGizmo {
             mode: GizmoMode::Translate,
+            rotate_snap_degrees: 0.0,
+            translate_snap_units: 0.0,
+            scale_snap_units: 0.0,
             drag_axis: None,
+            rotate_accum: 0.0,
+            rotate_applied: 0.0,
+            translate_accum: 0.0,
+            translate_applied: 0.0,
+            scale_accum: [0.0; 3],
+            scale_applied: [0.0; 3],
         }
     }
 }
@@ -466,6 +512,17 @@ impl TransformGizmo {
         if !down {
             self.drag_axis = None;
         }
+        // A fresh press starts a new drag: reset every mode's snap
+        // accumulation.  Rotate/translate track a delta-since-press (start at
+        // 0); scale tracks an absolute value (seed from the current scale).
+        if pressed {
+            self.rotate_accum = 0.0;
+            self.rotate_applied = 0.0;
+            self.translate_accum = 0.0;
+            self.translate_applied = 0.0;
+            self.scale_accum = [scale.x, scale.y, scale.z];
+            self.scale_applied = [scale.x, scale.y, scale.z];
+        }
         // Neither grabs nor hover highlights reach through the editor UI.  (A
         // drag that started on the gizmo and passes over a panel keeps going:
         // egui_wants_pointer_input stays false for drags started outside it.)
@@ -492,9 +549,15 @@ impl TransformGizmo {
                 // current scale and an axis can never cross zero.
                 let factor = 1.0 + (delta.x - delta.y) * 0.01;
                 for i in 0..3 {
-                    scale[i] = (scale[i] * factor).max(GIZMO_MIN_SCALE);
+                    self.scale_accum[i] = (self.scale_accum[i] * factor).max(GIZMO_MIN_SCALE);
+                    let target = snap_value(self.scale_accum[i], self.scale_snap_units)
+                        .max(GIZMO_MIN_SCALE);
+                    if target != self.scale_applied[i] {
+                        scale[i] = target;
+                        self.scale_applied[i] = target;
+                        changed = true;
+                    }
                 }
-                changed |= factor != 1.0;
             }
         }
 
@@ -517,13 +580,23 @@ impl TransformGizmo {
                     let hovered = !any_down && !over_ui && hit;
                     if active && down {
                         // Pointer movement along the axis' screen direction,
-                        // converted back to world units.
+                        // converted back to world units.  Accumulated and
+                        // snapped the same way as rotate above: the raw drag
+                        // is tracked in full, but only the snapped portion of
+                        // it is ever committed to `position`.
                         let screen_axis = tip - center;
                         let len2 = screen_axis.length_sq();
                         if len2 > 1.0 {
                             let t = delta.dot(screen_axis) / len2;
-                            *position += *dir * (t * world_size);
-                            changed = true;
+                            self.translate_accum += t * world_size;
+                            let target =
+                                snap_value(self.translate_accum, self.translate_snap_units);
+                            let to_apply = target - self.translate_applied;
+                            if to_apply != 0.0 {
+                                *position += *dir * to_apply;
+                                self.translate_applied = target;
+                                changed = true;
+                            }
                         }
                     }
                     let color = if active || hovered {
@@ -588,10 +661,27 @@ impl TransformGizmo {
                             if dir.dot(camera.get_position() - *position) >= 0.0 {
                                 d_angle = -d_angle;
                             }
-                            if d_angle != 0.0 {
-                                *rotation = (CgQuat::from_axis_angle(*dir, cgmath::Rad(d_angle))
+                            // Amplify so a screen-wide drag is worth several
+                            // turns rather than the ~half-turn exact pointer
+                            // tracking would give.
+                            d_angle *= GIZMO_ROTATE_SENSITIVITY;
+                            // Accumulate the raw drag, then commit only the
+                            // snapped delta.  With no snap the target tracks
+                            // the accumulation exactly (continuous rotation);
+                            // with snap the object turns a whole increment only
+                            // once the cumulative drag crosses a half-step, so
+                            // a minor drag never over-rotates.
+                            self.rotate_accum += d_angle;
+                            let target = snap_value(
+                                self.rotate_accum,
+                                self.rotate_snap_degrees.to_radians(),
+                            );
+                            let to_apply = target - self.rotate_applied;
+                            if to_apply != 0.0 {
+                                *rotation = (CgQuat::from_axis_angle(*dir, cgmath::Rad(to_apply))
                                     * *rotation)
                                     .normalize();
+                                self.rotate_applied = target;
                                 changed = true;
                             }
                         }
@@ -629,13 +719,23 @@ impl TransformGizmo {
                         // Pointer movement along the axis' screen direction as
                         // a fraction of the gizmo length, applied
                         // multiplicatively: dragging outward grows, inward
-                        // shrinks, same feel at any current scale.
+                        // shrinks, same feel at any current scale.  The raw
+                        // (unsnapped) value keeps accumulating so the drag
+                        // feel never changes; only the snapped value is ever
+                        // written to `scale`.
                         let screen_axis = tip - center;
                         let len2 = screen_axis.length_sq();
                         if len2 > 1.0 {
                             let t = delta.dot(screen_axis) / len2;
-                            scale[axis] = (scale[axis] * (1.0 + t)).max(GIZMO_MIN_SCALE);
-                            changed |= t != 0.0;
+                            self.scale_accum[axis] =
+                                (self.scale_accum[axis] * (1.0 + t)).max(GIZMO_MIN_SCALE);
+                            let target = snap_value(self.scale_accum[axis], self.scale_snap_units)
+                                .max(GIZMO_MIN_SCALE);
+                            if target != self.scale_applied[axis] {
+                                scale[axis] = target;
+                                self.scale_applied[axis] = target;
+                                changed = true;
+                            }
                         }
                     }
                     let color = if active || hovered {
@@ -674,6 +774,16 @@ impl TransformGizmo {
             );
         }
         changed
+    }
+}
+
+// Rounds `value` to the nearest multiple of `step`, or returns it unchanged
+// if `step` is 0 (snapping disabled).
+fn snap_value(value: f32, step: f32) -> f32 {
+    if step > 0.0 {
+        (value / step).round() * step
+    } else {
+        value
     }
 }
 

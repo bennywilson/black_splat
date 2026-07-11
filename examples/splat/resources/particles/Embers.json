@@ -1,0 +1,101 @@
+{
+  "name": "Embers",
+  "params": {
+    "texture_file": "game_assets/fx/ember_t.png",
+    "blend_mode": "Additive",
+    "min_burst_count": 0,
+    "max_burst_count": 0,
+    "min_particle_life": 0.6,
+    "max_particle_life": 1.4,
+    "_min_actor_life": 0.0,
+    "_max_actor_life": 0.0,
+    "min_start_spawn_rate": 0.02,
+    "max_start_spawn_rate": 0.05,
+    "min_start_pos": {
+      "x": -0.1,
+      "y": 0.0,
+      "z": -0.1
+    },
+    "max_start_pos": {
+      "x": 0.1,
+      "y": 0.0,
+      "z": 0.1
+    },
+    "min_start_scale": {
+      "x": 0.15,
+      "y": 0.15,
+      "z": 0.15
+    },
+    "max_start_scale": {
+      "x": 0.3,
+      "y": 0.3,
+      "z": 0.3
+    },
+    "min_end_scale": {
+      "x": 0.4,
+      "y": 0.4,
+      "z": 0.4
+    },
+    "max_end_scale": {
+      "x": 0.9,
+      "y": 0.9,
+      "z": 0.9
+    },
+    "min_start_velocity": {
+      "x": -0.3,
+      "y": 1.0,
+      "z": -0.3
+    },
+    "max_start_velocity": {
+      "x": 0.3,
+      "y": 2.0,
+      "z": 0.3
+    },
+    "min_start_rotation_rate": -60.0,
+    "max_start_rotation_rate": 60.0,
+    "min_start_acceleration": {
+      "x": 0.0,
+      "y": 0.5,
+      "z": 0.0
+    },
+    "max_start_acceleration": {
+      "x": 0.0,
+      "y": 1.0,
+      "z": 0.0
+    },
+    "min_end_velocity": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    },
+    "max_end_velocity": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    },
+    "start_color_0": {
+      "x": 1.0,
+      "y": 0.65,
+      "z": 0.2,
+      "w": 1.0
+    },
+    "start_color_1": {
+      "x": 1.0,
+      "y": 0.65,
+      "z": 0.2,
+      "w": 1.0
+    },
+    "end_color_0": {
+      "x": 1.0,
+      "y": 0.15,
+      "z": 0.0,
+      "w": 0.0
+    },
+    "_end_color1": {
+      "x": 1.0,
+      "y": 0.15,
+      "z": 0.0,
+      "w": 0.0
+    }
+  }
+}

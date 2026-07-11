@@ -16,6 +16,7 @@ so the same code runs on Windows, Linux, and macOS.
 """
 import argparse
 import glob as globmod
+import json
 import os
 import re
 import shutil
@@ -40,7 +41,9 @@ EXAMPLE_BASE_PORT = 8000  # examples get 8000, 8001, 8002, ... by discovery orde
 WASM_ASSETS = {
     "splat": [
         ("game_assets/splats/*.ply", "rust_assets"),
-        ("game_assets/models/*.glb", "rust_assets"),
+        # ** so models nested in per-asset folders (e.g. Barrel/barrel_hq.glb)
+        # are found too, matching the native editor's recursive model scan.
+        ("game_assets/models/**/*.glb", "rust_assets"),
         ("game_assets/fx/*.png", "rust_assets"),
     ],
 }
@@ -49,22 +52,30 @@ URL_RE = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 PY = sys.executable or "python3"
 
 
-def discover_examples():
+def discover_example_projects():
     """Every examples/<name>/ that is a cargo crate, with its binary name."""
     out = []
     for name in sorted(os.listdir(EXAMPLES_DIR)):
         cargo = os.path.join(EXAMPLES_DIR, name, "Cargo.toml")
         if not os.path.isfile(cargo):
             continue
+
+        """with is a context manager which cleans up resources properly"""
         with open(cargo, "rb") as f:
             meta = tomllib.load(f)
+
         crate = meta.get("package", {}).get("name")
         if crate:
-            out.append({"name": name, "crate": crate})
+            thumb = next(
+                (fname for fname in ("thumbnail.jpg", "thumbnail.png", "thumbnail.svg")
+                 if os.path.isfile(os.path.join(EXAMPLES_DIR, name, fname))),
+                None,
+            )
+            out.append({"name": name, "crate": crate, "thumbnail": thumb})
     return out
 
 
-EXAMPLES = discover_examples()
+EXAMPLES = discover_example_projects()
 PORTS = {e["name"]: EXAMPLE_BASE_PORT + i for i, e in enumerate(EXAMPLES)}
 CRATES = {e["name"]: e["crate"] for e in EXAMPLES}
 
@@ -139,13 +150,37 @@ def build_wasm(example, log):
     shutil.copy(os.path.join(ex_dir, "index.html"), out_dir)
     log("copied index.html")
 
+    # The browser can't enumerate a served directory, so alongside copying the
+    # runtime assets we record the models/textures in a manifest the wasm
+    # resource browser reads to populate its pickers (see resource_library.rs).
+    manifest = {"models": [], "textures": []}
     for pattern, subdir in WASM_ASSETS.get(example, []):
         dest = os.path.join(out_dir, subdir)
         os.makedirs(dest, exist_ok=True)
-        matches = globmod.glob(os.path.join(ex_dir, pattern))
+        # recursive=True so a `**` in the pattern spans subfolders; the copy
+        # flattens everything into rust_assets/ (basenames must stay unique).
+        matches = globmod.glob(os.path.join(ex_dir, pattern), recursive=True)
         for src in matches:
             shutil.copy(src, dest)
         log(f"copied {len(matches)} file(s): {pattern} -> {subdir}/")
+
+        # Manifest paths are the file's real path relative to the example dir
+        # (e.g. game_assets/models/Barrel/barrel_hq.glb) -- the same string the
+        # app loads a model by, which its loader reduces to the served basename.
+        for src in matches:
+            rel = os.path.relpath(src, ex_dir).replace("\\", "/")
+            if "/models/" in rel:
+                manifest["models"].append(rel)
+            elif "/fx/" in rel or "/textures/" in rel:
+                manifest["textures"].append(rel)
+
+    if WASM_ASSETS.get(example):
+        manifest_dir = os.path.join(out_dir, "rust_assets")
+        os.makedirs(manifest_dir, exist_ok=True)
+        with open(os.path.join(manifest_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        log(f"wrote manifest.json ({len(manifest['models'])} models, "
+            f"{len(manifest['textures'])} textures)")
 
     return out_dir
 

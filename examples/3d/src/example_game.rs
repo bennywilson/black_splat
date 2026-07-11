@@ -222,8 +222,13 @@ impl GameEngine for Example3DGame {
             crosshair_error: 0.0,
             collision_manager: CollisionManager::new(),
             fly_camera,
-            // Shown from the start (unlike the desktop viewer's reveal-on-touch).
-            touch_pads: TouchPads::default(),
+            touch_pads: {
+                // Hidden until the first touch: mouse/keyboard players (native
+                // and web-on-desktop) never see them, phones still get them.
+                let mut pads = TouchPads::default();
+                pads.reveal_on_touch = true;
+                pads
+            },
             debug_collision: false,
             pause_monsters: false,
             score: 0,
@@ -574,8 +579,8 @@ impl GameEngine for Example3DGame {
         let ctx = renderer.egui_ctx().clone();
         let pads = self.touch_pads.update(&ctx, input_manager, delta_time);
         move_vec += right_dir * pads.move_deflection.x - forward_dir * pads.move_deflection.y;
-        camera_rot.x += pads.yaw_delta_deg;
-        camera_rot.y += pads.pitch_delta_deg;
+        camera_rot.x += pads.yaw_delta_deg * 1.5;
+        camera_rot.y += pads.pitch_delta_deg * 1.5;
 
         // Keyboard WASD adds to the touch-pad contribution above; the combined
         // direction is then normalized and scaled (shift = slow walk).

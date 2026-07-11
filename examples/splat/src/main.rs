@@ -2,6 +2,7 @@ use black_splat::config::Config;
 
 mod editor_config;
 mod example_game;
+mod resource_library;
 
 use example_game::SplatGame;
 

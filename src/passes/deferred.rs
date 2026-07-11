@@ -76,6 +76,10 @@ pub struct ShadowSettings {
     pub num_cascades: u32,
     /// How far from the camera the directional cascades reach, in world units.
     pub distance: f32,
+    /// Artist control over how black shadow-catcher shadows land: a multiplier
+    /// on the projected darkening amount.  1 = as projected; > 1 deepens toward
+    /// black; 0 disables the catcher darkening.
+    pub density: f32,
 }
 
 impl Default for ShadowSettings {
@@ -84,6 +88,7 @@ impl Default for ShadowSettings {
             resolution: 1024,
             num_cascades: 3,
             distance: 75.0,
+            density: 1.0,
         }
     }
 }
@@ -94,6 +99,7 @@ impl ShadowSettings {
             resolution: self.resolution.clamp(256, 2048),
             num_cascades: self.num_cascades.clamp(1, MAX_CASCADES as u32),
             distance: self.distance.max(5.0),
+            density: self.density.clamp(0.0, 4.0),
         }
     }
 }
@@ -365,6 +371,12 @@ impl GBufferPass {
             if actor_layer != SceneLayer::World {
                 continue;
             }
+            // Shadow-catcher proxies are invisible: they never write the
+            // G-buffer (the deferred catcher pass renders them into their own
+            // depth instead -- see ShadowPass::render_catcher_depth).
+            if actor.is_shadow_catcher() {
+                continue;
+            }
             let model_handle = actor.get_model();
 
             // Material constants: color multiplied into the actor color;
@@ -475,6 +487,7 @@ impl GBufferPass {
 }
 
 /// Which shadow mask shader a mask pass uses.
+#[derive(Clone, Copy)]
 enum MaskKind {
     Cascades,
     Spot,
@@ -512,6 +525,29 @@ pub struct ShadowPass {
     // Product of every light's mask this frame; the later splat-overlay pass
     // darkens the Gaussians with it.
     pub mask_accum: Texture,
+
+    // --- Shadow catchers -------------------------------------------------
+    // Invisible catcher proxies rendered from the camera into their own depth
+    // (they must NOT write the shared scene depth, or they would cull the
+    // ground splats behind them).  The catcher mask passes project the frame's
+    // shadow maps onto this depth to build `catcher_shadow`, and the overlay
+    // multiplies the splats by it.
+    catcher_depth_pipeline: wgpu::RenderPipeline,
+    catcher_depth: Texture,
+    // Per-light scratch (mask target 0) + the multiplied catcher shadow factor
+    // (target 1); mirrors mask_temp / mask_accum but keyed to catcher depth.
+    catcher_temp: Texture,
+    pub catcher_shadow: Texture,
+    // Cascade / spot mask bind groups whose receiver-depth slot is the catcher
+    // depth instead of the scene depth (they reuse the mask pipelines).
+    catcher_cascades_mask_bind_group: wgpu::BindGroup,
+    catcher_spot_mask_bind_group: wgpu::BindGroup,
+    // Fullscreen overlay that darkens the composited splats by catcher_shadow.
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_bind_group_layout: wgpu::BindGroupLayout,
+    overlay_bind_group: wgpu::BindGroup,
+    // Artist params for the overlay (shadow density); written each frame.
+    overlay_params_buffer: wgpu::Buffer,
 }
 
 impl ShadowPass {
@@ -777,6 +813,198 @@ impl ShadowPass {
             "spot",
         );
 
+        // --- Shadow-catcher resources ----------------------------------------
+        // Camera-space depth pipeline for the invisible proxies: reuses the
+        // depth-only shadow shader (a plain MVP -> depth) and the draw-uniform
+        // pool, but without the shadow bias and with no back-face culling (the
+        // proxy is viewed from the camera, either side may face us).  Re-fetch
+        // the depth shader (the mask/overlay loads above took a mutable borrow
+        // of the asset manager, ending the earlier immutable one).
+        let depth_shader = asset_manager.get_shader(&depth_shader_handle);
+        let catcher_depth_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ShadowPass_catcher_depth_pipeline"),
+                layout: Some(&depth_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: depth_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex::desc()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: None,
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let catcher_depth =
+            Texture::new_depth_texture(device, &device_resources.surface_config, rw, rh).unwrap();
+        let catcher_temp =
+            Texture::new_render_texture_with_format(device, SHADOW_MASK_FORMAT, rw, rh).unwrap();
+        let catcher_shadow =
+            Texture::new_render_texture_with_format(device, SHADOW_MASK_FORMAT, rw, rh).unwrap();
+
+        let catcher_cascades_mask_bind_group = Self::make_catcher_mask_bind_group(
+            device_resources,
+            &mask_bind_group_layout,
+            &catcher_depth,
+            &atlas,
+            "cascades",
+        );
+        let catcher_spot_mask_bind_group = Self::make_catcher_mask_bind_group(
+            device_resources,
+            &mask_bind_group_layout,
+            &catcher_depth,
+            &spot_depth,
+            "spot",
+        );
+
+        // Fullscreen overlay that multiplies the composited splats by the
+        // catcher shadow factor.  Samples the catcher shadow + both depths via
+        // textureLoad, so it needs no sampler.
+        let overlay_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Depth,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Depth,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(16),
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("ShadowPass_overlay_bind_group_layout"),
+            });
+        let overlay_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ShadowPass_overlay_pipeline_layout"),
+                bind_group_layouts: &[Some(&overlay_bind_group_layout)],
+                immediate_size: 0,
+            });
+        // Multiply color (scene *= factor), keep the scene's alpha untouched.
+        let overlay_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Dst,
+                dst_factor: wgpu::BlendFactor::Zero,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let overlay_shader_handle = asset_manager
+            .load_shader(
+                "/engine_assets/shaders/shadow_catcher_overlay.wgsl",
+                device_resources,
+            )
+            .await;
+        let overlay_shader = asset_manager.get_shader(&overlay_shader_handle);
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ShadowPass_overlay_pipeline"),
+            layout: Some(&overlay_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: overlay_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: overlay_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: device_resources.surface_config.format.add_srgb_suffix(),
+                    blend: Some(overlay_blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+        let overlay_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ShadowPass_overlay_params_buffer"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let overlay_bind_group = Self::make_overlay_bind_group(
+            device_resources,
+            &overlay_bind_group_layout,
+            &catcher_shadow,
+            &catcher_depth,
+            &overlay_params_buffer,
+        );
+
         ShadowPass {
             settings,
             pending_settings: None,
@@ -793,6 +1021,16 @@ impl ShadowPass {
             spot_mask_bind_group,
             mask_temp,
             mask_accum,
+            catcher_depth_pipeline,
+            catcher_depth,
+            catcher_temp,
+            catcher_shadow,
+            catcher_cascades_mask_bind_group,
+            catcher_spot_mask_bind_group,
+            overlay_pipeline,
+            overlay_bind_group_layout,
+            overlay_bind_group,
+            overlay_params_buffer,
         }
     }
 
@@ -848,6 +1086,75 @@ impl ShadowPass {
             })
     }
 
+    // Like make_mask_bind_group, but the receiver-depth slot (binding 0) is the
+    // catcher depth instead of the scene depth, so the mask projects the shadow
+    // map onto the catcher proxy.
+    fn make_catcher_mask_bind_group(
+        device_resources: &DeviceResources,
+        layout: &wgpu::BindGroupLayout,
+        catcher_depth: &Texture,
+        shadow_map: &Texture,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device_resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&catcher_depth.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&shadow_map.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&shadow_map.sampler),
+                    },
+                ],
+                label: Some(&format!("ShadowPass_catcher_mask_bind_group_{label}")),
+            })
+    }
+
+    // The overlay's inputs: the catcher shadow factor plus the catcher and
+    // scene depths (all read via textureLoad, so no sampler).
+    fn make_overlay_bind_group(
+        device_resources: &DeviceResources,
+        layout: &wgpu::BindGroupLayout,
+        catcher_shadow: &Texture,
+        catcher_depth: &Texture,
+        params_buffer: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        device_resources
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&catcher_shadow.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&catcher_depth.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            &device_resources.render_textures[1].view,
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+                label: Some("ShadowPass_overlay_bind_group"),
+            })
+    }
+
     /// Requests new quality settings; applied at the start of the next frame.
     pub fn request_settings(&mut self, settings: &ShadowSettings) {
         let clamped = settings.clamped();
@@ -889,6 +1196,20 @@ impl ShadowPass {
             &self.spot_depth,
             "spot",
         );
+        self.catcher_cascades_mask_bind_group = Self::make_catcher_mask_bind_group(
+            device_resources,
+            &self.mask_bind_group_layout,
+            &self.catcher_depth,
+            &self.atlas,
+            "cascades",
+        );
+        self.catcher_spot_mask_bind_group = Self::make_catcher_mask_bind_group(
+            device_resources,
+            &self.mask_bind_group_layout,
+            &self.catcher_depth,
+            &self.spot_depth,
+            "spot",
+        );
     }
 
     /// Window resize: the screen-space mask textures track the render
@@ -914,7 +1235,38 @@ impl ShadowPass {
             rh,
         )
         .unwrap();
+        // Catcher targets track the render resolution too; recreate them before
+        // rebuild_mask_bind_groups so the catcher mask groups pick up the new
+        // catcher depth, then refresh the overlay (it references scene depth).
+        self.catcher_depth = Texture::new_depth_texture(
+            &device_resources.device,
+            &device_resources.surface_config,
+            rw,
+            rh,
+        )
+        .unwrap();
+        self.catcher_temp = Texture::new_render_texture_with_format(
+            &device_resources.device,
+            SHADOW_MASK_FORMAT,
+            rw,
+            rh,
+        )
+        .unwrap();
+        self.catcher_shadow = Texture::new_render_texture_with_format(
+            &device_resources.device,
+            SHADOW_MASK_FORMAT,
+            rw,
+            rh,
+        )
+        .unwrap();
         self.rebuild_mask_bind_groups(device_resources);
+        self.overlay_bind_group = Self::make_overlay_bind_group(
+            device_resources,
+            &self.overlay_bind_group_layout,
+            &self.catcher_shadow,
+            &self.catcher_depth,
+            &self.overlay_params_buffer,
+        );
     }
 
     // Resets the per-frame draw pool and clears the accumulation texture to
@@ -929,11 +1281,13 @@ impl ShadowPass {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("ShadowPass::begin_frame()"),
                 });
-        {
+        // Both the scene and the catcher shadow accumulators start fully lit;
+        // each shadow-casting light multiplies its mask into them.
+        for view in [&self.mask_accum.view, &self.catcher_shadow.view] {
             let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Shadow accum clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.mask_accum.view,
+                    view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -1084,6 +1438,171 @@ impl ShadowPass {
         render_pass.set_bind_group(1, light_bind_group, &[]);
         render_pass.draw(0..3, 0..1);
         drop(render_pass);
+        device_resources.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    // Renders the invisible catcher proxies into their own full-screen depth
+    // from the camera's view (clearing it to far first).  Kept separate from
+    // the shared scene depth so the proxies don't occlude the ground splats
+    // behind them.  `view_proj` must match the scene's camera projection so the
+    // overlay can compare catcher and scene depth.  Always call it (even with
+    // no casters) so the depth is cleared to "no catcher" for the frame.
+    fn render_catcher_depth(
+        &mut self,
+        ctx: &mut RenderContext,
+        casters: &[ShadowCaster],
+        view_proj: CgMat4,
+    ) {
+        let device_resources = &mut *ctx.device;
+        let asset_manager = &mut *ctx.assets;
+
+        let mut encoder =
+            device_resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ShadowPass::render_catcher_depth()"),
+                });
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Catcher depth"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.catcher_depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            multiview_mask: None,
+            timestamp_writes: None,
+        });
+        render_pass.set_pipeline(&self.catcher_depth_pipeline);
+
+        let model_mappings = asset_manager.get_model_mappings();
+        for caster in casters {
+            if self.next_draw_slot >= MAX_SHADOW_DRAWS {
+                break; // Pool exhausted; remaining catchers drop out this frame.
+            }
+            let Some(model) = model_mappings.get(&caster.model) else {
+                continue;
+            };
+            let mvp: [[f32; 4]; 4] = (view_proj * caster.world).into();
+            let offset = (self.next_draw_slot * SHADOW_DRAW_STRIDE) as u64;
+            device_resources.queue.write_buffer(
+                &self.draw_uniform_buffer,
+                offset,
+                bytemuck::cast_slice(&[mvp]),
+            );
+            render_pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_bind_group(0, &self.draw_bind_group, &[offset as u32]);
+            render_pass.draw_indexed(0..model.num_indices, 0, 0..1);
+            self.next_draw_slot += 1;
+        }
+
+        drop(render_pass);
+        device_resources.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    // Same as render_mask, but projects the light's shadow map onto the catcher
+    // depth (not the scene depth) and multiplies the result into catcher_shadow.
+    // catcher_temp is a throwaway (the mask pipeline's replace target).
+    fn render_catcher_mask(
+        &mut self,
+        ctx: &mut RenderContext,
+        kind: MaskKind,
+        light_bind_group: &wgpu::BindGroup,
+    ) {
+        let device_resources = &mut *ctx.device;
+        let mut encoder =
+            device_resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ShadowPass::render_catcher_mask()"),
+                });
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Catcher shadow mask"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.catcher_temp.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.catcher_shadow.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+            timestamp_writes: None,
+        });
+        let (pipeline, bind_group) = match kind {
+            MaskKind::Cascades => (
+                &self.mask_cascades_pipeline,
+                &self.catcher_cascades_mask_bind_group,
+            ),
+            MaskKind::Spot => (&self.mask_spot_pipeline, &self.catcher_spot_mask_bind_group),
+        };
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.set_bind_group(1, light_bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+        drop(render_pass);
+        device_resources.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Darkens the composited scene color (the Gaussian splats) by this frame's
+    /// catcher shadow factor, where a catcher proxy is the frontmost surface.
+    /// Runs after the splat pass; a no-op wherever no catcher was rendered
+    /// (catcher depth stays at far -> factor 1).
+    pub fn render_catcher_overlay(&mut self, ctx: &mut RenderContext) {
+        let device_resources = &mut *ctx.device;
+        // Upload the current shadow density (padded to 16 bytes) for the overlay.
+        let params = [self.settings.density, 0.0, 0.0, 0.0];
+        device_resources.queue.write_buffer(
+            &self.overlay_params_buffer,
+            0,
+            bytemuck::cast_slice(&params),
+        );
+        let mut encoder =
+            device_resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ShadowPass::render_catcher_overlay()"),
+                });
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Catcher overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &device_resources.render_textures[0].view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+                timestamp_writes: None,
+            });
+            render_pass.set_pipeline(&self.overlay_pipeline);
+            render_pass.set_bind_group(0, &self.overlay_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
         device_resources.queue.submit(std::iter::once(encoder.finish()));
     }
 
@@ -1533,21 +2052,47 @@ impl LightingPass {
         let clear_color = game_config.clear_color;
         let settings = shadow_pass.settings;
 
+        // World-space transform of an actor, shared by the caster and catcher
+        // gathers below.
+        let actor_world = |actor: &Actor| -> CgMat4 {
+            cgmath::Matrix4::from_translation(actor.get_position())
+                * cgmath::Matrix4::from(actor.get_rotation())
+                * cgmath::Matrix4::from_nonuniform_scale(
+                    actor.get_scale().x,
+                    actor.get_scale().y,
+                    actor.get_scale().z,
+                )
+        };
+
         // World-layer casters, gathered once and re-projected per shadow tile.
+        // Catcher proxies are excluded -- they receive shadow, they don't cast.
         let casters: Vec<ShadowCaster> = actors
             .values()
-            .filter(|actor| actor.get_layer().0 == SceneLayer::World)
+            .filter(|actor| {
+                actor.get_layer().0 == SceneLayer::World && !actor.is_shadow_catcher()
+            })
             .map(|actor| ShadowCaster {
                 model: actor.get_model(),
-                world: cgmath::Matrix4::from_translation(actor.get_position())
-                    * cgmath::Matrix4::from(actor.get_rotation())
-                    * cgmath::Matrix4::from_nonuniform_scale(
-                        actor.get_scale().x,
-                        actor.get_scale().y,
-                        actor.get_scale().z,
-                    ),
+                world: actor_world(actor),
             })
             .collect();
+
+        // The invisible catcher proxies, rendered into their own depth so the
+        // masks can project the casters' shadows onto them.
+        let catcher_casters: Vec<ShadowCaster> = actors
+            .values()
+            .filter(|actor| {
+                actor.get_layer().0 == SceneLayer::World && actor.is_shadow_catcher()
+            })
+            .map(|actor| ShadowCaster {
+                model: actor.get_model(),
+                world: actor_world(actor),
+            })
+            .collect();
+
+        // Camera-view catcher depth (matches the scene projection so the overlay
+        // can compare depths).  Always run so the depth is cleared each frame.
+        shadow_pass.render_catcher_depth(ctx, &catcher_casters, proj_matrix * view_matrix);
 
         // Clear the scene target up front; each light then adds onto it in
         // its own pass (shadowed lights interleave their depth/mask renders).
@@ -1654,6 +2199,10 @@ impl LightingPass {
             );
             if let Some(kind) = mask_kind {
                 shadow_pass.render_mask(ctx, kind, &self.light_uniforms[slot].1);
+                // Project the same shadow map onto the catcher proxies too.
+                if !catcher_casters.is_empty() {
+                    shadow_pass.render_catcher_mask(ctx, kind, &self.light_uniforms[slot].1);
+                }
             }
 
             // The light's additive shading pass.

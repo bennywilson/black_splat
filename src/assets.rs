@@ -15,15 +15,23 @@ fn format_url(file_name: &str) -> reqwest::Url {
 pub async fn load_binary(file_name: &str) -> anyhow::Result<Vec<u8>> {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "wasm32")] {
-            let path = Path::new(file_name);
-            let file_name = format!("/rust_assets/{}", path.file_name().unwrap().to_str().unwrap());
-
-            let url = format_url(&file_name);
-            let data = reqwest::get(url)
-                .await?
-                .bytes()
-                .await?
-                .to_vec();
+            // Serve from the IndexedDB cache when present -- also the only source
+            // for user-imported assets, which were never on the server -- else
+            // fetch from /rust_assets/ and cache for next time.  Keyed by the
+            // caller's relative path so imports and bundled assets stay distinct.
+            let data = if let Some(cached) = crate::idb::get(file_name).await {
+                cached
+            } else {
+                let base = Path::new(file_name).file_name().unwrap().to_str().unwrap();
+                let url = format_url(&format!("/rust_assets/{}", base));
+                let bytes = reqwest::get(url)
+                    .await?
+                    .bytes()
+                    .await?
+                    .to_vec();
+                crate::idb::put(file_name, &bytes).await;
+                bytes
+            };
         } else {
             let data = std::fs::read(file_name)?;
         }
@@ -63,7 +71,7 @@ make_handle!(Material, MaterialHandle, MaterialMappings);
 /// layout (G = roughness, B = metallic); `mr_constant` is (x metallic
 /// multiplier, y roughness multiplier) -- with no texture the constants pass
 /// through as the final PBR values.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct MaterialDesc {
     pub color_texture: Option<String>,
     pub spec_texture: Option<String>,
@@ -232,6 +240,10 @@ impl AssetManager {
         file_to_string_buffer.insert(
             "shadow_mask_spot.wgsl".to_string(),
             include_str!("../engine_assets/shaders/shadow_mask_spot.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
+            "shadow_catcher_overlay.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/shadow_catcher_overlay.wgsl").to_string(),
         );
 
         #[cfg(feature = "wasm_include_3d")]
@@ -615,6 +627,48 @@ impl AssetManager {
         new_handle
     }
 
+    /// Registers a model directly from in-memory glb/gltf bytes, keyed by
+    /// `file_path` (a later `load_model` with the same path returns this
+    /// handle).  Synchronous counterpart to [`load_model`](Self::load_model)
+    /// for the wasm frame tick, which can't `.await`: used by the editor's
+    /// web model import.  `Model::from_bytes` only awaits when resolving
+    /// URI-referenced external textures, which needs a filesystem and so never
+    /// happens on wasm, so the future is driven to completion in place.
+    #[cfg(target_arch = "wasm32")]
+    pub fn add_model_from_bytes(
+        &mut self,
+        file_path: &str,
+        bytes: &[u8],
+        device_resource: &mut DeviceResources<'_>,
+        use_holes: bool,
+    ) -> ModelHandle {
+        let bytes_vec = bytes.to_vec();
+        let new_model = crate::utils::now_or_never(Model::from_bytes(
+            &bytes_vec,
+            device_resource,
+            self,
+            use_holes,
+        ))
+        .expect("glb import future must not suspend on wasm");
+
+        let mappings = &mut self.model_mappings;
+        // Re-importing a name overwrites the model but keeps its handle valid.
+        if let Some(handle) = mappings.names_to_handles.get(file_path).copied() {
+            mappings.handles_to_assets.insert(handle, new_model);
+            return handle;
+        }
+        if !mappings.next_handle.is_valid() {
+            mappings.next_handle.index = 0;
+        }
+        let new_handle = mappings.next_handle;
+        mappings.next_handle.index += 1;
+        mappings.handles_to_assets.insert(new_handle, new_model);
+        mappings
+            .names_to_handles
+            .insert(file_path.to_string(), new_handle);
+        new_handle
+    }
+
     pub fn get_model(&mut self, model_handle: &ModelHandle) -> Option<&mut Model> {
         self.model_mappings.handles_to_assets.get_mut(model_handle)
     }
@@ -724,6 +778,34 @@ impl AssetManager {
         }
     }
 
+    /// Rebuilds an existing material in place from a new description, keeping
+    /// its handle valid (so actors referencing it pick up the change) --
+    /// unlike [`load_material`](Self::load_material), which early-returns the
+    /// old material untouched when the name already exists.  Used by the editor
+    /// when a material's textures or constants change.
+    pub async fn reload_material(
+        &mut self,
+        handle: &MaterialHandle,
+        name: &str,
+        desc: &MaterialDesc,
+        device_resources: &DeviceResources<'_>,
+    ) {
+        let white = self.white_texture(device_resources);
+        let color_texture = match &desc.color_texture {
+            Some(path) => self.load_texture(path, device_resources).await,
+            None => white,
+        };
+        let spec_texture = match &desc.spec_texture {
+            Some(path) => self.load_texture(path, device_resources).await,
+            None => white,
+        };
+        let material =
+            self.make_material(name, desc, color_texture, spec_texture, device_resources);
+        self.material_mappings
+            .handles_to_assets
+            .insert(*handle, material);
+    }
+
     // Shared tail of load_material/create_material: builds the bind group
     // from already-resolved textures and registers the material under `name`.
     fn build_material(
@@ -734,6 +816,32 @@ impl AssetManager {
         spec_texture: TextureHandle,
         device_resources: &DeviceResources<'_>,
     ) -> MaterialHandle {
+        let material =
+            self.make_material(name, desc, color_texture, spec_texture, device_resources);
+        let mappings = &mut self.material_mappings;
+        if !mappings.next_handle.is_valid() {
+            mappings.next_handle.index = 0;
+        }
+        let new_handle = mappings.next_handle;
+        mappings.next_handle.index += 1;
+        mappings.handles_to_assets.insert(new_handle, material);
+        mappings
+            .names_to_handles
+            .insert(name.to_string(), new_handle);
+        new_handle
+    }
+
+    // Builds a Material (bind group + constants) from already-resolved
+    // textures, without registering it -- callers place it under a new or
+    // existing handle (see build_material / reload_material).
+    fn make_material(
+        &self,
+        name: &str,
+        desc: &MaterialDesc,
+        color_texture: TextureHandle,
+        spec_texture: TextureHandle,
+        device_resources: &DeviceResources<'_>,
+    ) -> Material {
         log!("AssetManager loading material {name}");
         let device = &device_resources.device;
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -788,25 +896,13 @@ impl AssetManager {
             label: Some(&format!("Material::{name}")),
         });
 
-        let material = Material {
+        Material {
             color_texture,
             spec_texture,
             color_constant: desc.color_constant,
             mr_constant: desc.mr_constant,
             bind_group,
-        };
-
-        let mappings = &mut self.material_mappings;
-        if !mappings.next_handle.is_valid() {
-            mappings.next_handle.index = 0;
         }
-        let new_handle = mappings.next_handle;
-        mappings.next_handle.index += 1;
-        mappings.handles_to_assets.insert(new_handle, material);
-        mappings
-            .names_to_handles
-            .insert(name.to_string(), new_handle);
-        new_handle
     }
 
     pub fn get_material(&self, handle: &MaterialHandle) -> Option<&Material> {

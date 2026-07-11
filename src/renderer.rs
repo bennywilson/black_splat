@@ -29,9 +29,20 @@ pub struct Renderer<'a> {
     // (color/normal/metallic-roughness), then the lighting pass accumulates
     // light_map's lights onto the scene color target, with the shadow pass
     // rendering shadow maps + screen-space masks for the lights that cast.
-    gbuffer_pass: GBufferPass,
-    shadow_pass: ShadowPass,
-    lighting_pass: LightingPass,
+    // None on the GL backend: the light/shadow shaders textureLoad from depth
+    // textures, which naga can't translate to GLSL, and GL is treated as a
+    // basic backend anyway, so the whole deferred trio is skipped rather than
+    // chasing GL fallbacks for every feature (same reasoning as
+    // gaussian_splat_pass below).
+    gbuffer_pass: Option<GBufferPass>,
+    shadow_pass: Option<ShadowPass>,
+    lighting_pass: Option<LightingPass>,
+    // Games opt in via set_deferred_world_enabled (the splat editor does; it
+    // registers scene lights).  Off, World-layer actors render through the
+    // classic forward model pass -- a game without lights would otherwise get
+    // a flat clear_color world, since the lighting pass is what composites
+    // G-buffer contents onto the screen.
+    deferred_world_enabled: bool,
     line_pass: LinePass,
     sunbeam_pass: SunbeamPass,
     // Built lazily on first load_gaussian_splat() call: its pipeline binds storage
@@ -44,6 +55,10 @@ pub struct Renderer<'a> {
     // output onto the swapchain as the final pass.
     egui_ctx: egui::Context,
     egui_renderer: egui_wgpu::Renderer,
+    // egui TextureIds for loaded textures the GUI wants to draw (e.g. the
+    // editor's content-browser thumbnails), registered on first request and
+    // cached so we don't re-register every frame.
+    egui_texture_ids: HashMap<TextureHandle, egui::TextureId>,
     // True between begin_egui_pass() and the end_pass in render_frame; used
     // to keep the begin/end pairing balanced when frames are skipped.
     egui_pass_active: bool,
@@ -146,10 +161,18 @@ impl<'a> Renderer<'a> {
         )
         .await;
 
-        let gbuffer_pass = GBufferPass::new(&device_resources, &mut asset_manager).await;
-        let shadow_pass = ShadowPass::new(&device_resources, &mut asset_manager).await;
-        let lighting_pass =
-            LightingPass::new(&device_resources, &mut asset_manager, &shadow_pass).await;
+        // GL (the 2D demo's backend) can't run the deferred shadow/lighting
+        // pipeline -- see the field comments on gbuffer_pass et al.
+        let deferred_supported = device_resources.adapter.get_info().backend != wgpu::Backend::Gl;
+        let (gbuffer_pass, shadow_pass, lighting_pass) = if deferred_supported {
+            let gbuffer_pass = GBufferPass::new(&device_resources, &mut asset_manager).await;
+            let shadow_pass = ShadowPass::new(&device_resources, &mut asset_manager).await;
+            let lighting_pass =
+                LightingPass::new(&device_resources, &mut asset_manager, &shadow_pass).await;
+            (Some(gbuffer_pass), Some(shadow_pass), Some(lighting_pass))
+        } else {
+            (None, None, None)
+        };
 
         let debug_lines = Vec::<Line>::new();
 
@@ -162,6 +185,7 @@ impl<'a> Renderer<'a> {
 
         Renderer {
             device_resources,
+            egui_texture_ids: HashMap::new(),
             default_sprite_pass,
             custom_sprite_passes: vec![],
             model_pass,
@@ -169,6 +193,7 @@ impl<'a> Renderer<'a> {
             gbuffer_pass,
             shadow_pass,
             lighting_pass,
+            deferred_world_enabled: false,
             postprocess_pass,
             line_pass,
             sunbeam_pass,
@@ -590,21 +615,34 @@ impl<'a> Renderer<'a> {
                 .render(&mut ctx, actor, &self.bullet_hole_trace);
             self.bullet_hole_actor_index = None;
         }
-        {
-            // Deferred world: actors into the G-buffer, then one fullscreen
-            // pass per light composites them (and the clear color) onto the
-            // scene target.  Everything below renders forward on top.
-            PERF_SCOPE!("World GBuffer");
-            self.gbuffer_pass.render(&mut ctx, &self.actor_map);
-        }
-        {
-            PERF_SCOPE!("Deferred Lighting");
-            self.lighting_pass.render(
-                &mut ctx,
-                &self.light_map,
-                &self.actor_map,
-                &mut self.shadow_pass,
-            );
+        // World-layer actors: deferred when the game opted in (and the
+        // backend built the passes -- GL never does), otherwise the classic
+        // forward path.  Deferred draws actors into the G-buffer, then one
+        // fullscreen pass per light composites them (and the clear color)
+        // onto the scene target; forward is a single model pass whose World
+        // branch clears the scene color/depth targets itself.  Either way,
+        // everything below renders forward on top.
+        if self.deferred_world_enabled && self.gbuffer_pass.is_some() {
+            {
+                PERF_SCOPE!("World GBuffer");
+                self.gbuffer_pass
+                    .as_mut()
+                    .unwrap()
+                    .render(&mut ctx, &self.actor_map);
+            }
+            {
+                PERF_SCOPE!("Deferred Lighting");
+                self.lighting_pass.as_mut().unwrap().render(
+                    &mut ctx,
+                    &self.light_map,
+                    &self.actor_map,
+                    self.shadow_pass.as_mut().unwrap(),
+                );
+            }
+        } else {
+            PERF_SCOPE!("World Opaque");
+            self.model_pass
+                .render(&mut ctx, &SceneLayer::World, None, &self.actor_map);
         }
         {
             PERF_SCOPE!("World With Holes");
@@ -633,10 +671,23 @@ impl<'a> Renderer<'a> {
         // geometry occludes them, and everything transparent below (lines,
         // particles, sunbeams) composites on top.  A future PBR opaque pass
         // just needs to render above this point.
+        let mut splats_rendered = false;
         if let Some(splat_pass) = &mut self.gaussian_splat_pass {
             if splat_pass.has_model() {
                 PERF_SCOPE!("Gaussian Splats");
                 splat_pass.render(&mut ctx);
+                splats_rendered = true;
+            }
+        }
+
+        // Shadow-catcher overlay: darkens the just-composited splats where an
+        // invisible catcher proxy received a CG object's shadow this frame.
+        // Only meaningful in the deferred path (which produced the catcher
+        // depth + shadow); a no-op where no catcher was rendered.
+        if splats_rendered && self.deferred_world_enabled {
+            if let Some(shadow_pass) = self.shadow_pass.as_mut() {
+                PERF_SCOPE!("Shadow Catcher Overlay");
+                shadow_pass.render_catcher_overlay(&mut ctx);
             }
         }
 
@@ -760,9 +811,14 @@ impl<'a> Renderer<'a> {
         self.device_resources.resize(game_config);
         self.postprocess_pass
             .resize(&mut self.device_resources, &self.asset_manager);
-        self.shadow_pass.resize(&self.device_resources);
-        self.lighting_pass
-            .resize(&self.device_resources, &self.shadow_pass);
+        if let Some(shadow_pass) = self.shadow_pass.as_mut() {
+            shadow_pass.resize(&self.device_resources);
+        }
+        if let (Some(lighting_pass), Some(shadow_pass)) =
+            (self.lighting_pass.as_mut(), self.shadow_pass.as_ref())
+        {
+            lighting_pass.resize(&self.device_resources, shadow_pass);
+        }
         self.sunbeam_pass.resize(&mut self.device_resources, &self.asset_manager)
     }
 
@@ -793,21 +849,41 @@ impl<'a> Renderer<'a> {
         self.light_map.clear();
     }
 
-    /// Sets the shadow quality settings (cascade count, tile resolution,
-    /// cascade distance); applied at the start of the next frame.
-    pub fn set_shadow_settings(&mut self, settings: &ShadowSettings) {
-        self.shadow_pass.request_settings(settings);
+    /// Routes World-layer actors through the deferred G-buffer + lighting
+    /// pipeline instead of the classic forward model pass.  Only makes sense
+    /// for games that register scene lights (add_or_update_light) -- without
+    /// any, the world composites to flat clear_color.  Ignored on the GL
+    /// backend, which never builds the deferred passes.
+    pub fn set_deferred_world_enabled(&mut self, enabled: bool) {
+        self.deferred_world_enabled = enabled;
     }
 
+    /// Sets the shadow quality settings (cascade count, tile resolution,
+    /// cascade distance); applied at the start of the next frame. A no-op on
+    /// the GL backend, which has no shadow pass to configure.
+    pub fn set_shadow_settings(&mut self, settings: &ShadowSettings) {
+        if let Some(shadow_pass) = self.shadow_pass.as_mut() {
+            shadow_pass.request_settings(settings);
+        }
+    }
+
+    /// Returns `ShadowSettings::default()` on the GL backend, which has no
+    /// shadow pass of its own to report settings from.
     pub fn get_shadow_settings(&self) -> ShadowSettings {
-        self.shadow_pass.settings()
+        self.shadow_pass
+            .as_ref()
+            .map_or_else(ShadowSettings::default, |p| p.settings())
     }
 
     /// This frame's screen-space shadow accumulation texture (the product of
     /// every light's mask; 1 = fully lit).  The Gaussian-splat shadow overlay
-    /// will multiply the splats by it.
+    /// will multiply the splats by it. Only the non-GL backends load Gaussian
+    /// splats, so this is never called without a shadow pass to back it.
     pub fn shadow_accum_texture(&self) -> &Texture {
-        self.shadow_pass.shadow_accum()
+        self.shadow_pass
+            .as_ref()
+            .expect("shadow_accum_texture: no shadow pass (GL backend has none)")
+            .shadow_accum()
     }
 
     pub async fn add_particle_actor(
@@ -845,6 +921,24 @@ impl<'a> Renderer<'a> {
         self.asset_manager
             .load_texture(file_path, &self.device_resources)
             .await
+    }
+
+    /// egui TextureId for an already-loaded texture, so the in-engine GUI can
+    /// draw it (e.g. content-browser thumbnails).  Registered with the egui
+    /// renderer on first request and cached; returns None if the handle is
+    /// stale.
+    pub fn egui_texture_id(&mut self, handle: &TextureHandle) -> Option<egui::TextureId> {
+        if let Some(id) = self.egui_texture_ids.get(handle) {
+            return Some(*id);
+        }
+        let texture = self.asset_manager.get_texture(handle);
+        let id = self.egui_renderer.register_native_texture(
+            &self.device_resources.device,
+            &texture.view,
+            wgpu::FilterMode::Linear,
+        );
+        self.egui_texture_ids.insert(handle.clone(), id);
+        Some(id)
     }
 
     /// Synchronous counterpart to `add_particle_actor`: spawns a particle actor
@@ -908,6 +1002,20 @@ impl<'a> Renderer<'a> {
             .await
     }
 
+    /// Registers a model from in-memory glb/gltf bytes (see
+    /// [`AssetManager::add_model_from_bytes`]).  Synchronous, for the web
+    /// editor's model import from the frame tick.
+    #[cfg(target_arch = "wasm32")]
+    pub fn load_model_from_bytes(
+        &mut self,
+        file_path: &str,
+        bytes: &[u8],
+        use_holes: bool,
+    ) -> ModelHandle {
+        self.asset_manager
+            .add_model_from_bytes(file_path, bytes, &mut self.device_resources, use_holes)
+    }
+
     /// Every loaded model as (file path, handle), sorted by path -- feeds the
     /// editor's resource list and model dropdowns.
     pub fn get_model_resources(&self) -> Vec<(String, ModelHandle)> {
@@ -934,6 +1042,20 @@ impl<'a> Renderer<'a> {
     pub fn create_material(&mut self, name: &str, desc: &MaterialDesc) -> MaterialHandle {
         self.asset_manager
             .create_material(name, desc, &self.device_resources)
+    }
+
+    /// Rebuilds an existing material from a new description (textures and/or
+    /// constants), keeping its handle valid so actors using it update.  Async
+    /// because assigning a texture may need to load it.
+    pub async fn reload_material(
+        &mut self,
+        handle: &MaterialHandle,
+        name: &str,
+        desc: &MaterialDesc,
+    ) {
+        self.asset_manager
+            .reload_material(handle, name, desc, &self.device_resources)
+            .await;
     }
 
     /// A material's (color constant, metallic/roughness constant), for the

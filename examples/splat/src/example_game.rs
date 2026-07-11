@@ -13,17 +13,10 @@ use black_splat::{
 };
 
 use crate::editor_config::{self, EditorConfig, GIZMO_ACTIONS};
+use crate::resource_library::{self, MaterialFile};
 
 // No clouds are hardcoded: startup opens the user's saved startup scene, or
 // `default_startup_scene()` (the church) if none is saved yet.
-
-// Model resources preloaded for the editor (the Resources tab and the Details
-// panel's model dropdown).  Loaded in initialize_world -- model loading is
-// async and the frame tick isn't -- so they're always available to assign.
-const PRELOADED_MODELS: &[&str] = &[
-    "game_assets/models/barrel.glb",
-    "game_assets/models/shotgun.glb",
-];
 
 // How far in front of the camera a newly added game object is dropped.
 const ADD_OBJECT_DISTANCE: f32 = 5.0;
@@ -34,6 +27,7 @@ fn shadow_settings_from_config(config: &EditorConfig) -> ShadowSettings {
         resolution: config.shadow_resolution,
         num_cascades: config.shadow_cascades,
         distance: config.shadow_distance,
+        density: config.shadow_density,
     }
 }
 
@@ -46,6 +40,224 @@ const SKYLIGHT_BOTTOM: CgVec3 = CgVec3::new(0.28, 0.24, 0.2);
 // the on-screen touch pads from the shared TouchPads (black_splat::fly_camera /
 // ::touch_pads), whose defaults already match this viewer's feel.
 const PARAM_RATE: f32 = 1.5;
+// Smallest a splat's cloud scale / render scale may be dragged to in the
+// Details panel: a zero scale collapses the cloud and it can't be recovered by
+// dragging (0 * anything stays 0).  Matches the gizmo's own floor in spirit.
+const SPLAT_MIN_SCALE: f32 = 0.001;
+
+/// Draws a resource inspector's header row: the bold name with a `*` when it
+/// has unsaved edits, plus a floppy-disk save button that's enabled only while
+/// dirty.  Returns true iff the save button was clicked this frame -- the
+/// caller performs the actual save (so it can take `&mut` on the resource,
+/// which the `name` borrow here would otherwise block).
+fn resource_header(ui: &mut egui::Ui, name: &str, dirty: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        let title = if dirty {
+            format!("{name}  *")
+        } else {
+            name.to_string()
+        };
+        ui.label(egui::RichText::new(title).strong());
+        if ui
+            .add_enabled(dirty, egui::Button::new("💾").small())
+            .on_hover_text("Save to disk")
+            .clicked()
+        {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
+/// Saves a material, first deleting its previous file/localStorage entry if it
+/// was renamed since the last save (so a rename doesn't orphan the old copy).
+/// Updates `saved_name` on success.
+fn save_material_file(mat: &mut MaterialResource) -> Result<(), String> {
+    if let Some(old) = &mat.saved_name {
+        if *old != mat.name {
+            resource_library::delete_material(old);
+        }
+    }
+    resource_library::save_material(&mat.name, &mat.desc)?;
+    mat.saved_name = Some(mat.name.clone());
+    Ok(())
+}
+
+/// Particle counterpart to [`save_material_file`].
+fn save_particle_file(res: &mut ParticleResource) -> Result<(), String> {
+    if let Some(old) = &res.saved_name {
+        if *old != res.name {
+            resource_library::delete_particle(old);
+        }
+    }
+    resource_library::save_particle(&res.name, &res.params)?;
+    res.saved_name = Some(res.name.clone());
+    Ok(())
+}
+
+/// Which category the content browser is showing.  Splats/Models are
+/// read-only; Materials/Particles are editable+saveable; Textures are imported.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserCategory {
+    Models,
+    Materials,
+    Particles,
+    Textures,
+    Splats,
+}
+
+const BROWSER_CATEGORIES: &[(BrowserCategory, &str)] = &[
+    (BrowserCategory::Models, "Models"),
+    (BrowserCategory::Materials, "Materials"),
+    (BrowserCategory::Particles, "Particles"),
+    (BrowserCategory::Textures, "Textures"),
+    (BrowserCategory::Splats, "Splats"),
+];
+
+// Content-browser tile geometry (points): a square thumbnail with a name below.
+const TILE_THUMB: f32 = 72.0;
+const TILE_W: f32 = 92.0;
+const TILE_H: f32 = TILE_THUMB + 24.0;
+
+/// What a browser tile draws in its thumbnail square.
+enum Thumb {
+    /// A loaded texture image (see Renderer::egui_texture_id).
+    Image(egui::TextureId),
+    /// A material's base color, as a swatch.
+    Color([f32; 3]),
+    /// A single glyph on a neutral plate (models, particles, splats).
+    Glyph(&'static str),
+}
+
+/// Case-insensitive substring filter used by the content browser.  `filter` is
+/// already lowercased by the caller.
+fn name_matches(name: &str, filter: &str) -> bool {
+    filter.is_empty() || name.to_lowercase().contains(filter)
+}
+
+/// Places a small floppy-disk save button in a tile's top-right corner (shown
+/// for dirty materials/particles).  Returns its response.
+fn tile_save_button(ui: &mut egui::Ui, tile: &egui::Response) -> egui::Response {
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(tile.rect.right() - 20.0, tile.rect.top() + 2.0),
+        egui::vec2(18.0, 18.0),
+    );
+    ui.put(rect, egui::Button::new("💾").small())
+        .on_hover_text("Save to disk")
+}
+
+/// Truncates a label to `max` chars with an ellipsis, on a char boundary.
+fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+/// Draws one content-browser tile (thumbnail + name) with a selection/hover
+/// background and a `*` when dirty.  Returns the tile's click response.
+fn browser_tile(
+    ui: &mut egui::Ui,
+    name: &str,
+    thumb: &Thumb,
+    selected: bool,
+    dirty: bool,
+) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(TILE_W, TILE_H), egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    let bg = if selected {
+        ui.visuals().selection.bg_fill
+    } else if resp.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 4.0, bg);
+    let thumb_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x - TILE_THUMB / 2.0, rect.top() + 4.0),
+        egui::vec2(TILE_THUMB, TILE_THUMB),
+    );
+    match thumb {
+        Thumb::Image(id) => {
+            painter.image(
+                *id,
+                thumb_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        Thumb::Color(rgb) => {
+            let color = egui::Color32::from_rgb(
+                (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+            );
+            painter.rect_filled(thumb_rect, 4.0, color);
+        }
+        Thumb::Glyph(g) => {
+            painter.rect_filled(thumb_rect, 4.0, ui.visuals().extreme_bg_color);
+            painter.text(
+                thumb_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                g,
+                egui::FontId::proportional(30.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
+    }
+    let label = if dirty {
+        format!("{}  *", elide(name, 11))
+    } else {
+        elide(name, 12)
+    };
+    painter.text(
+        egui::pos2(rect.center().x, thumb_rect.bottom() + 3.0),
+        egui::Align2::CENTER_TOP,
+        label,
+        egui::FontId::proportional(12.0),
+        ui.visuals().text_color(),
+    );
+    resp.on_hover_text(name)
+}
+
+/// A labelled dropdown for choosing a texture (or "(none)") from the library,
+/// writing the chosen relative path into `slot`.  Returns true if the choice
+/// changed.  `options` is (display name, relative path).
+fn texture_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    slot: &mut Option<String>,
+    options: &[(String, String)],
+) -> bool {
+    let mut changed = false;
+    let current = slot.clone();
+    let selected_text = current
+        .as_deref()
+        .map(resource_display_name)
+        .unwrap_or_else(|| "(none)".to_string());
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(slot.is_none(), "(none)").clicked() && slot.is_some() {
+                *slot = None;
+                changed = true;
+            }
+            for (name, path) in options {
+                let is_selected = current.as_deref() == Some(path.as_str());
+                if ui.selectable_label(is_selected, name).clicked() && !is_selected {
+                    *slot = Some(path.clone());
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
 
 /// Draws the "Editor | Game" mode switch and applies clicks to `editor_mode`.
 /// Always shown (in both modes) so it's the way back from game mode -- important
@@ -163,11 +375,57 @@ enum ResourceSelection {
 }
 
 /// An editable particle definition in the resource library (seeded from the
-/// built-in presets; more can be created in the Resources panel).  Scene
-/// emitters reference one by name.
+/// built-in presets or loaded from `resources/particles/`).  Scene emitters
+/// reference one by name.
 struct ParticleResource {
     name: String,
     params: ParticleParams,
+    /// True when edited since its last save; drives the `*` marker and save
+    /// icon in the content browser.
+    dirty: bool,
+    /// The name this resource currently exists under on disk / in localStorage,
+    /// or None if never saved.  Lets a rename-then-save delete the stale file
+    /// rather than orphaning it (see [`save_particle_file`]).
+    saved_name: Option<String>,
+}
+
+/// An editable material in the resource library (seeded from built-in defaults
+/// or loaded from `resources/materials/`).  Actors reference one by handle;
+/// the owned `desc` is what gets written back to disk on save (the renderer
+/// keeps only the built GPU material, not its description).
+struct MaterialResource {
+    name: String,
+    desc: MaterialDesc,
+    handle: MaterialHandle,
+    /// True when edited since its last save (see [`ParticleResource::dirty`]).
+    dirty: bool,
+    /// Name last saved under (see [`ParticleResource::saved_name`]).
+    saved_name: Option<String>,
+}
+
+/// A texture in the library: an image file under `game_assets/textures/` (or a
+/// preset's `game_assets/fx/`), already loaded into the renderer.  Materials
+/// reference one by its relative `path`.  Textures have no editable state, so
+/// nothing to save -- the file on disk is the resource.
+struct TextureResource {
+    /// Short display name (file stem), for dropdowns and the browser.
+    name: String,
+    /// Relative path the material stores and the renderer loads from.
+    path: String,
+    handle: TextureHandle,
+}
+
+/// A discovered model in the editor's catalog.  Discovery is decoupled from
+/// loading: every model under game_assets/models/ (and imports) is catalogued
+/// so it shows in the browser, but its geometry isn't loaded until it's
+/// actually used -- selected in the browser, or referenced by an opened scene.
+/// Whether a catalog entry is currently loaded (and its handle) is owned by the
+/// renderer's AssetManager, keyed by `path`.
+struct ModelResource {
+    /// Short display name (file stem), for dropdowns and the browser.
+    name: String,
+    /// Relative path the model loads from (also the AssetManager key).
+    path: String,
 }
 
 /// The currently selected scene object.  The three lists (actors, lights,
@@ -255,6 +513,10 @@ struct ActorDto {
     model: Option<String>, // resource display name, or none for an empty actor
     #[serde(default)]
     layer: u32, // SceneLayer choice index
+    // Invisible shadow-catcher proxy (receives CG shadows onto the splat).
+    // Defaulted so scenes saved before the feature landed still load.
+    #[serde(default)]
+    shadow_catcher: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -402,6 +664,32 @@ fn arr_quat(a: [f32; 4]) -> CgQuat {
 /// is preloaded in initialize_world so instances can be spawned synchronously
 /// from the frame tick (see Renderer::spawn_particle_actor).
 const PARTICLE_PRESETS: &[&str] = &["Fire", "Smoke", "Embers"];
+
+/// The built-in materials seeded into a fresh library (constant-only PBR
+/// looks).  Written to resources/materials/ the first time the editor runs, and
+/// editable/saveable thereafter.
+fn default_materials() -> Vec<MaterialFile> {
+    vec![
+        MaterialFile {
+            name: "Matte".to_string(),
+            desc: MaterialDesc::default(),
+        },
+        MaterialFile {
+            name: "Plastic".to_string(),
+            desc: MaterialDesc {
+                mr_constant: CgVec4::new(0.0, 0.35, 0.0, 0.0),
+                ..Default::default()
+            },
+        },
+        MaterialFile {
+            name: "Chrome".to_string(),
+            desc: MaterialDesc {
+                mr_constant: CgVec4::new(1.0, 0.12, 0.0, 0.0),
+                ..Default::default()
+            },
+        },
+    ]
+}
 
 /// ParticleParams for a named preset (see PARTICLE_PRESETS).  Shares one emitter
 /// shape; only the texture, blend mode and colors differ.
@@ -652,16 +940,27 @@ impl editor::EditorInspect for SceneSplat {
         changed |= visitor.edit_vec3("Position", &mut self.transform.position);
         changed |= visitor.edit_rotation("Rotation", &mut self.transform.rotation);
         // Uniform scale only (non-uniform cloud scale is only approximate).
+        // Every scale edit is floored above zero: a zero scale collapses the
+        // cloud's world matrix and makes it vanish with no easy way back.  The
+        // gizmo/hotkey paths already guard this; the Details drags (edit_float
+        // allows 0) were the one gap that let the scale drop to 0.
         let mut uniform = self.transform.scale.x;
         if visitor.edit_float("Scale", &mut uniform) {
+            uniform = uniform.max(SPLAT_MIN_SCALE);
             self.transform.scale = CgVec3::new(uniform, uniform, uniform);
             changed = true;
         }
         // Render params.
         changed |= visitor.edit_float("Falloff", &mut self.params.falloff);
-        changed |= visitor.edit_float("Splat Scale", &mut self.params.scale);
+        if visitor.edit_float("Splat Scale", &mut self.params.scale) {
+            self.params.scale = self.params.scale.max(SPLAT_MIN_SCALE);
+            changed = true;
+        }
         changed |= visitor.edit_float("Contrast", &mut self.params.contrast);
-        changed |= visitor.edit_float("Overall Scale", &mut self.params.overall_scale);
+        if visitor.edit_float("Overall Scale", &mut self.params.overall_scale) {
+            self.params.overall_scale = self.params.overall_scale.max(SPLAT_MIN_SCALE);
+            changed = true;
+        }
         changed |= visitor.edit_float("SH Degree", &mut self.params.max_sh_degree);
         changed
     }
@@ -833,6 +1132,22 @@ pub struct SplatGame {
     // The editable particle-definition library (see ParticleResource).  Scene
     // emitters reference an entry by name; edits push to live emitters.
     particle_resources: Vec<ParticleResource>,
+    // The editable material library (see MaterialResource).  Populated in
+    // initialize_world from resources/materials/ (or seeded defaults); the
+    // renderer holds the built GPU materials, this holds their descriptions
+    // so edits can be saved back to disk.
+    material_library: Vec<MaterialResource>,
+    // The texture library (see TextureResource): images under
+    // game_assets/textures/ plus preset fx textures, scanned at startup and
+    // grown by the "import texture" button.  Materials pick from these.
+    texture_resources: Vec<TextureResource>,
+    // The model library (see ModelResource): models under game_assets/models/,
+    // scanned at startup. Actors pick from these.
+    model_resources: Vec<ModelResource>,
+    // "Import texture" plumbing: the picked image's (file name, bytes) land
+    // here for a later tick to copy into game_assets/textures/ and load
+    // (mirrors picked_ply).  Native only; wasm can't write project assets.
+    picked_texture: Arc<Mutex<Option<(String, Vec<u8>)>>>,
     // Object currently being renamed (double-click in the Scene tab).
     name_edit: Option<Selection>,
     // The rename field's working text.  Persists across frames -- re-deriving
@@ -862,6 +1177,13 @@ pub struct SplatGame {
     // by dragging the grab strip along its top edge.
     resources_open: bool,
     resources_height: f32,
+    // Content browser: which category is shown and the name filter text.
+    browser_category: BrowserCategory,
+    browser_filter: String,
+    // Content browser: material being renamed via its right-click menu, and
+    // the working text.  Persists while the menu is open (like name_edit_*);
+    // cleared when the menu closes so a re-open re-seeds from the current name.
+    material_rename: Option<(MaterialHandle, String)>,
     // Monotonic counter so added objects get unique default names.
     next_object_num: u32,
     // Splat clouds that loaded, each carrying its own render params, aligned with
@@ -876,6 +1198,20 @@ pub struct SplatGame {
     // only, browsers don't expose one -- and the bytes).  `picker_state` keeps a
     // held key / double tap from stacking dialogs and reports read progress.
     picked_ply: Arc<Mutex<Option<(String, Option<String>, Vec<u8>)>>>,
+    // "Import model" plumbing (glb): the picked file's name + bytes land here
+    // for a later tick to register (so it shows in the model picker) and
+    // persist -- to game_assets/models on native, IndexedDB on web.
+    picked_model: Arc<Mutex<Option<(String, Vec<u8>)>>>,
+    // Lazily-loaded model bytes awaiting GPU upload on the render thread (web):
+    // (path, bytes, select-when-loaded).  A background task fetches from
+    // IndexedDB/network; a later tick uploads via load_model_from_bytes.  Feeds
+    // both browser lazy-select and scene models that weren't loaded yet.
+    #[allow(dead_code)] // web-only: native loads models synchronously.
+    pending_model_uploads: Arc<Mutex<Vec<(String, Vec<u8>, bool)>>>,
+    // Actors from a just-loaded scene whose model wasn't resolved yet (web,
+    // while its bytes are still fetching): (actor index, model display name).
+    // Reassigned when the matching model finishes uploading.
+    pending_actor_models: Vec<(usize, String)>,
     picker_state: Arc<Mutex<PickerState>>,
     // "Load Scene" plumbing: the picked JSON file's bytes land here for a later
     // tick to parse (the file dialog runs async, like the .ply picker).
@@ -944,6 +1280,56 @@ impl SplatGame {
         // throwaway thread on the future rather than stalling the frame loop.
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn(move || pollster::block_on(pick));
+    }
+
+    /// Opens the file dialog to import an image (png/jpg) as a texture
+    /// resource.  The picked file's name + bytes land in `picked_texture` for a
+    /// later tick to copy into game_assets/textures/ and load.  Native only:
+    /// the web build can't write into the project's assets folder.
+    fn open_texture_picker(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let picked = self.picked_texture.clone();
+            let dialog = rfd::AsyncFileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]);
+            let pick = async move {
+                if let Some(file) = dialog.pick_file().await {
+                    let name = file.file_name();
+                    let bytes = file.read().await;
+                    *picked.lock().unwrap() = Some((name, bytes));
+                }
+            };
+            std::thread::spawn(move || pollster::block_on(pick));
+        }
+    }
+
+    /// Opens the file dialog to import a glb model.  The picked file's name +
+    /// bytes land in `picked_model` for a later tick to register and persist
+    /// (game_assets/models on native, IndexedDB on web).  Works on both
+    /// platforms, unlike texture import (see `open_ply_picker` for the pattern).
+    fn open_model_picker(&self) {
+        let picked = self.picked_model.clone();
+        let dialog = rfd::AsyncFileDialog::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        let dialog = dialog.add_filter("Model", &["glb", "gltf"]);
+        let pick = async move {
+            if let Some(file) = dialog.pick_file().await {
+                let name = file.file_name();
+                let bytes = file.read().await;
+                *picked.lock().unwrap() = Some((name, bytes));
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(pick);
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || pollster::block_on(pick));
+    }
+
+    /// The catalog path of the model whose display name is `name`, if any.
+    fn catalog_path_for(&self, name: &str) -> Option<String> {
+        self.model_resources
+            .iter()
+            .find(|m| m.name == name)
+            .map(|m| m.path.clone())
     }
 
     /// Spawn point a few units ahead of the camera for newly added objects.
@@ -1466,6 +1852,7 @@ impl SplatGame {
                     scale: vec3_arr(a.get_scale()),
                     model: model_name(a.get_model()),
                     layer: a.get_layer().0.choice_index() as u32,
+                    shadow_catcher: a.is_shadow_catcher(),
                 })
                 .collect(),
             lights: self
@@ -1602,12 +1989,9 @@ impl SplatGame {
         model_resources: &[(String, ModelHandle)],
         renderer: &mut Renderer,
     ) {
-        let model_handle = |name: &str| -> ModelHandle {
-            model_resources
-                .iter()
-                .find(|(n, _)| n == name)
-                .map_or_else(ModelHandle::make_invalid, |(_, h)| *h)
-        };
+        // Fresh set of "waiting for its model to finish loading" actors (web
+        // lazy fetch); populated below and drained as uploads arrive.
+        self.pending_actor_models.clear();
         for dto in &scene.actors {
             let mut actor = Actor::new();
             actor.set_name(&dto.name);
@@ -1615,9 +1999,17 @@ impl SplatGame {
             actor.set_rotation(&arr_quat(dto.rotation));
             actor.set_scale(&arr_vec3(dto.scale));
             if let Some(model) = &dto.model {
-                actor.set_model(&model_handle(model));
+                match model_resources.iter().find(|(n, _)| n == model) {
+                    Some((_, handle)) => actor.set_model(handle),
+                    // Not loaded yet: leave the model unset and remember to
+                    // assign it when its bytes arrive (pending_model_uploads).
+                    None => self
+                        .pending_actor_models
+                        .push((self.scene_actors.len(), model.clone())),
+                }
             }
             actor.set_layer(&SceneLayer::from_choice_index(dto.layer as usize), &None);
+            actor.set_shadow_catcher(dto.shadow_catcher);
             renderer.add_or_update_actor(&actor);
             self.scene_actors.push(actor);
         }
@@ -1721,13 +2113,47 @@ impl SplatGame {
     fn load_scene_from_bytes(
         &mut self,
         bytes: &[u8],
-        model_resources: &[(String, ModelHandle)],
+        _model_resources: &[(String, ModelHandle)],
         renderer: &mut Renderer,
     ) -> Result<String, String> {
         let scene: SceneFile = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
 
         self.clear_scene(renderer);
-        self.apply_scene_objects(&scene, model_resources, renderer);
+
+        // Eager-load the models this scene references (a scene's own models are
+        // needed, so this isn't wasteful).  Native loads them synchronously so
+        // handles resolve before apply; web fetches in the background and the
+        // meshes pop in as they arrive (pending_model_uploads/actor_models).
+        for name in scene.actors.iter().filter_map(|a| a.model.clone()).collect::<Vec<_>>() {
+            let Some(path) = self.catalog_path_for(&name) else {
+                continue;
+            };
+            if renderer.get_model_resources().iter().any(|(p, _)| *p == path) {
+                continue; // Already loaded.
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                pollster::block_on(renderer.load_model(&path, false));
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let pending = self.pending_model_uploads.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Ok(bytes) = load_binary(&path).await {
+                        pending.lock().unwrap().push((path, bytes, false));
+                    }
+                });
+            }
+        }
+
+        // Rebuild the loaded (name -> handle) list now that native scene models
+        // are loaded, so apply_scene_objects resolves them.
+        let model_resources: Vec<(String, ModelHandle)> = renderer
+            .get_model_resources()
+            .into_iter()
+            .map(|(path, handle)| (resource_display_name(&path), handle))
+            .collect();
+        self.apply_scene_objects(&scene, &model_resources, renderer);
 
         let mut skipped_splats = 0;
         for dto in &scene.splats {
@@ -1777,14 +2203,23 @@ impl GameEngine for SplatGame {
             confirm_new_scene: false,
             has_custom_startup: editor_config::load_startup_scene().is_some(),
             selected_resource: None,
-            // Seed the particle library with the built-in presets.
+            // Seed the particle library with the built-in presets; if the user
+            // has a saved library on disk, initialize_world replaces this.
             particle_resources: PARTICLE_PRESETS
                 .iter()
                 .map(|preset| ParticleResource {
                     name: preset.to_string(),
                     params: preset_particle_params(preset),
+                    dirty: false,
+                    // Set once initialize_world seeds/loads the library.
+                    saved_name: None,
                 })
                 .collect(),
+            // Filled in initialize_world (needs the renderer to build handles).
+            material_library: Vec::new(),
+            texture_resources: Vec::new(),
+            model_resources: Vec::new(),
+            picked_texture: Arc::new(Mutex::new(None)),
             name_edit: None,
             name_edit_buffer: String::new(),
             name_edit_focus: false,
@@ -1795,9 +2230,15 @@ impl GameEngine for SplatGame {
             confirm_reset: false,
             active_tab: None,
             resources_open: false,
+            browser_category: BrowserCategory::Materials,
+            browser_filter: String::new(),
+            material_rename: None,
             resources_height: 200.0,
             next_object_num: 1,
             picked_ply: Arc::new(Mutex::new(None)),
+            picked_model: Arc::new(Mutex::new(None)),
+            pending_model_uploads: Arc::new(Mutex::new(Vec::new())),
+            pending_actor_models: Vec::new(),
             picker_state: Arc::new(Mutex::new(PickerState::Idle)),
             picked_scene: Arc::new(Mutex::new(None)),
             picked_startup: Arc::new(Mutex::new(None)),
@@ -1822,53 +2263,113 @@ impl GameEngine for SplatGame {
         log!("SplatGame::initialize_world()");
         game_config.clear_color = CgVec4::new(0.02, 0.02, 0.03, 1.0);
         renderer.set_tonemap_enabled(true);
+        // This is the PBR/lighting showcase: world actors go through the
+        // G-buffer + per-light passes (the other demos keep the forward path).
+        renderer.set_deferred_world_enabled(true);
         // Persisted shadow quality (Settings tab > Shadows).
         renderer.set_shadow_settings(&shadow_settings_from_config(&self.editor_config));
 
-        // Preload the editor's model resources (Resources tab / the Details
-        // panel's model dropdown).  Done here because loading is async.
-        for path in PRELOADED_MODELS {
-            renderer.load_model(path, false).await;
+        // Material library: load the user's saved materials from
+        // resources/materials/, or seed the built-in defaults (and write them
+        // out) the first time.  Each becomes a GPU material in the renderer
+        // plus a MaterialResource here so edits can be saved back.  (Materials
+        // are constant-only unless a texture is assigned: no texture means the
+        // built-in white, so the metallic/roughness constants pass through.
+        // Assigning one to an actor overrides its model's textures.)
+        let mut material_files = resource_library::load_materials();
+        if material_files.is_empty() {
+            material_files = default_materials();
+            for file in &material_files {
+                if let Err(e) = resource_library::save_material(&file.name, &file.desc) {
+                    log!("Couldn't seed material {}: {e}", file.name);
+                }
+            }
+        }
+        for file in material_files {
+            let handle = renderer.load_material(&file.name, &file.desc).await;
+            self.material_library.push(MaterialResource {
+                // Whether seeded or loaded, it now exists on disk under this
+                // name -- record it so a later rename can clean up the old file.
+                saved_name: Some(file.name.clone()),
+                name: file.name,
+                desc: file.desc,
+                handle,
+                dirty: false,
+            });
         }
 
-        // Starter materials for the Details panel's Material dropdown
-        // (constant-only: no texture means the built-in white, so the
-        // metallic/roughness constants pass straight through).  Assigning one
-        // to an actor overrides its model's textures in the world G-buffer
-        // pass.
-        renderer.load_material("Matte", &MaterialDesc::default()).await;
-        renderer
-            .load_material(
-                "Plastic",
-                &MaterialDesc {
-                    mr_constant: CgVec4::new(0.0, 0.35, 0.0, 0.0),
-                    ..Default::default()
-                },
-            )
-            .await;
-        renderer
-            .load_material(
-                "Chrome",
-                &MaterialDesc {
-                    mr_constant: CgVec4::new(1.0, 0.12, 0.0, 0.0),
-                    ..Default::default()
-                },
-            )
-            .await;
+        // Particle library: same pattern.  If the user has saved particle
+        // definitions, they replace the preset seeding from `new`; otherwise
+        // write the presets out as the initial library.
+        let particle_files = resource_library::load_particles();
+        if particle_files.is_empty() {
+            for resource in &mut self.particle_resources {
+                if let Err(e) = resource_library::save_particle(&resource.name, &resource.params) {
+                    log!("Couldn't seed particle {}: {e}", resource.name);
+                } else {
+                    resource.saved_name = Some(resource.name.clone());
+                }
+            }
+        } else {
+            self.particle_resources = particle_files
+                .into_iter()
+                .map(|file| ParticleResource {
+                    saved_name: Some(file.name.clone()),
+                    name: file.name,
+                    params: file.params,
+                    dirty: false,
+                })
+                .collect();
+        }
 
-        // Preload each particle preset's texture so "Add > Particle System" can
-        // spawn one synchronously from the (non-async) frame tick.
-        for preset in PARTICLE_PRESETS {
-            let texture_file = preset_particle_params(preset).texture_file;
+        // Preload each particle definition's texture so "Add > Particle System"
+        // can spawn one synchronously from the (non-async) frame tick.  Covers
+        // the whole library (presets plus any loaded from disk), so custom
+        // definitions referencing other textures work too.
+        let particle_texture_files: Vec<String> = self
+            .particle_resources
+            .iter()
+            .map(|r| r.params.texture_file.clone())
+            .collect();
+        for texture_file in particle_texture_files {
             if self
                 .particle_textures
                 .iter()
                 .any(|(path, _)| *path == texture_file)
             {
-                continue; // Presets may share a texture.
+                continue; // Definitions may share a texture.
             }
             let handle = renderer.preload_texture(&texture_file).await;
             self.particle_textures.push((texture_file, handle));
+        }
+
+        // Texture library: every image under game_assets/textures/ (imports)
+        // plus the bundled fx textures, loaded so materials can reference them.
+        for path in resource_library::scan_textures().await {
+            if self.texture_resources.iter().any(|t| t.path == path) {
+                continue;
+            }
+            let handle = renderer.preload_texture(&path).await;
+            self.texture_resources.push(TextureResource {
+                name: resource_display_name(&path),
+                path,
+                handle,
+            });
+        }
+
+        // Model catalog: every model under game_assets/models/, listed for the
+        // browser but NOT loaded here -- geometry loads lazily on first use (a
+        // browser select or a scene that references it), so a big model doesn't
+        // cost anything at startup.  Scene-referenced models are loaded just
+        // below, before the startup scene is applied.
+        for path in resource_library::scan_models().await {
+            if self.model_resources.iter().any(|m| m.path == path) {
+                continue;
+            }
+            self.model_resources.push(ModelResource {
+                name: resource_display_name(&path),
+                path,
+            });
         }
 
         // Open the startup scene: the user's saved one, or the built-in default
@@ -1895,6 +2396,14 @@ impl GameEngine for SplatGame {
                     params,
                     transform: Self::splat_dto_transform(dto),
                 });
+            }
+        }
+        // Eager-load the models this scene references (matched by display name
+        // against the catalog) so apply_scene_objects can resolve their
+        // handles.  Models the scene doesn't use stay lazy.
+        for name in scene.actors.iter().filter_map(|a| a.model.as_ref()) {
+            if let Some(path) = self.catalog_path_for(name) {
+                renderer.load_model(&path, false).await;
             }
         }
         let model_resources: Vec<(String, ModelHandle)> = renderer
@@ -1971,15 +2480,6 @@ impl GameEngine for SplatGame {
 
         let screen = ctx.content_rect();
 
-        // Scene status shown on the right of the menu bar.
-        let active_scene = self
-            .scene_splats
-            .get(self.active_splat)
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "none".to_string());
-        let scene_total = self.scene_splats.len().max(1);
-        let splat_count = renderer.active_gaussian_splat_count();
-
         let mut do_load = false;
         // Editor actions collected from the menus / Scene tab this frame and
         // applied after the egui pass (avoids borrowing self inside closures).
@@ -2011,14 +2511,63 @@ impl GameEngine for SplatGame {
             .into_iter()
             .map(|(path, handle)| (resource_display_name(&path), handle))
             .collect();
-        // Loaded materials for the Details panel's Material dropdown.
-        let material_resources: Vec<(String, MaterialHandle)> =
-            renderer.get_material_resources();
+        // The full model catalog (display name, path) for the content browser --
+        // every discovered model, loaded or not.  Unloaded ones load on click.
+        let model_catalog: Vec<(String, String)> = self
+            .model_resources
+            .iter()
+            .map(|m| (m.name.clone(), m.path.clone()))
+            .collect();
+        // Which catalog paths are currently loaded (path -> handle), so a tile
+        // can resolve to a selectable handle or fall back to a lazy load.
+        let loaded_models: std::collections::HashMap<String, ModelHandle> =
+            renderer.get_model_resources().into_iter().collect();
+        // Loaded materials for the Details panel's Material dropdown, from the
+        // owned library (the source of truth for names/handles) rather than the
+        // renderer, so it stays in step with edits and saves.
+        let material_resources: Vec<(String, MaterialHandle)> = self
+            .material_library
+            .iter()
+            .map(|m| (m.name.clone(), m.handle))
+            .collect();
         // Particle library names for the Add menus and the Resources panel.
         let particle_names: Vec<String> = self
             .particle_resources
             .iter()
             .map(|r| r.name.clone())
+            .collect();
+        // Texture library as (display name, relative path), for the material
+        // inspector's texture pickers.  Built up front so the inspector can
+        // mutably borrow material_library without also borrowing self here.
+        let texture_options: Vec<(String, String)> = self
+            .texture_resources
+            .iter()
+            .map(|t| (t.name.clone(), t.path.clone()))
+            .collect();
+        // Content-browser tile data, gathered up front so the browser closure
+        // doesn't borrow self while it also mutates selection/create flags.
+        let material_tiles: Vec<(String, MaterialHandle, bool, [f32; 3])> = self
+            .material_library
+            .iter()
+            .map(|m| {
+                let c = m.desc.color_constant;
+                (m.name.clone(), m.handle, m.dirty, [c.x, c.y, c.z])
+            })
+            .collect();
+        let particle_tiles: Vec<(String, bool)> = self
+            .particle_resources
+            .iter()
+            .map(|r| (r.name.clone(), r.dirty))
+            .collect();
+        let texture_tiles: Vec<(String, TextureHandle)> = self
+            .texture_resources
+            .iter()
+            .map(|t| (t.name.clone(), t.handle.clone()))
+            .collect();
+        let splat_names: Vec<String> = self
+            .scene_splats
+            .iter()
+            .map(|s| s.name.clone())
             .collect();
         // The model offered to the Details panel's "use selected" button (only
         // model resources apply there).
@@ -2029,6 +2578,18 @@ impl GameEngine for SplatGame {
         // Resources-panel actions, applied after the egui pass.
         let mut create_material = false;
         let mut create_particle = false;
+        let mut import_texture = false;
+        let mut import_model = false;
+        // Set to a catalog path when the user clicks a not-yet-loaded model tile
+        // in the browser; applied after the egui pass (loads it, then selects).
+        let mut model_load_request: Option<String> = None;
+        // A save requested from a browser tile's disk button (applied after the
+        // pass, where self can be borrowed mutably to read the desc/params).
+        let mut save_material_handle: Option<MaterialHandle> = None;
+        let mut save_particle_index: Option<usize> = None;
+        // A rename requested from a material tile's right-click menu (applied
+        // after the pass, where material_library can be mutably borrowed).
+        let mut rename_material: Option<(MaterialHandle, String)> = None;
         // Particle-resource edits from the Resource inspector this frame:
         // which entry changed (push params to its live emitters), and a
         // rename (propagate to scene emitters referencing the old name).
@@ -2080,13 +2641,9 @@ impl GameEngine for SplatGame {
                         if ui.button("Help").clicked() {
                             renderer.enable_help_text();
                         }
-                        // Right-aligned scene status.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!(
-                                "{active_scene}  ({}/{scene_total})   {splat_count} splats",
-                                self.active_splat + 1
-                            ));
-                        });
+                        // The loaded-splat name and splat count that used to sit
+                        // here are shown in the Resources panel's Splats column /
+                        // the Resource inspector instead.
                     });
                 });
             });
@@ -2130,6 +2687,49 @@ impl GameEngine for SplatGame {
                                     "Hotkey: {}",
                                     self.editor_config.gizmo_keys[i].name()
                                 ));
+                            }
+                            // One snap box per mode, always visible (not just
+                            // the active one) so all three can be dialed in
+                            // without switching modes back and forth. Each is
+                            // its own field on the gizmo: 0 = free
+                            // (continuous) dragging, otherwise a drag in that
+                            // mode commits in whole increments of the given
+                            // size.
+                            ui.separator();
+                            for (label, snap_value, speed, range, suffix, hover) in [
+                                (
+                                    "T",
+                                    &mut self.gizmo.translate_snap_units,
+                                    0.05,
+                                    0.0..=1000.0,
+                                    "",
+                                    "Translation snap increment, in world units (0 = free movement)",
+                                ),
+                                (
+                                    "R",
+                                    &mut self.gizmo.rotate_snap_degrees,
+                                    1.0,
+                                    0.0..=180.0,
+                                    "°",
+                                    "Rotation snap increment (0 = free rotation)",
+                                ),
+                                (
+                                    "S",
+                                    &mut self.gizmo.scale_snap_units,
+                                    0.05,
+                                    0.0..=100.0,
+                                    "",
+                                    "Scale snap increment (0 = free scaling)",
+                                ),
+                            ] {
+                                ui.label(format!("{label} snap"));
+                                ui.add(
+                                    egui::DragValue::new(snap_value)
+                                        .speed(speed)
+                                        .range(range)
+                                        .suffix(suffix),
+                                )
+                                .on_hover_text(hover);
                             }
                         });
                     });
@@ -2175,116 +2775,272 @@ impl GameEngine for SplatGame {
                                 ],
                                 egui::Stroke::new(2.0, ui.visuals().weak_text_color()),
                             );
-                            if ui
-                                .selectable_label(true, egui::RichText::new("Resources").strong())
-                                .clicked()
-                            {
-                                self.resources_open = false;
-                            }
+                            // Content browser header: collapse toggle, the
+                            // category tabs, that category's create/import
+                            // action, and a name filter.
+                            let mut pick: Option<Option<ResourceSelection>> = None;
+                            let mut open_inspector = false;
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        true,
+                                        egui::RichText::new("Resources").strong(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.resources_open = false;
+                                }
+                                ui.separator();
+                                for (cat, label) in BROWSER_CATEGORIES {
+                                    if ui
+                                        .selectable_label(self.browser_category == *cat, *label)
+                                        .clicked()
+                                    {
+                                        self.browser_category = *cat;
+                                    }
+                                }
+                                ui.separator();
+                                match self.browser_category {
+                                    BrowserCategory::Models => {
+                                        if ui
+                                            .button("Import…")
+                                            .on_hover_text("Import a .glb model")
+                                            .clicked()
+                                        {
+                                            import_model = true;
+                                        }
+                                    }
+                                    BrowserCategory::Materials => {
+                                        if ui.button("+ New").on_hover_text("New material").clicked()
+                                        {
+                                            create_material = true;
+                                        }
+                                    }
+                                    BrowserCategory::Particles => {
+                                        if ui
+                                            .button("+ New")
+                                            .on_hover_text("New particle definition")
+                                            .clicked()
+                                        {
+                                            create_particle = true;
+                                        }
+                                    }
+                                    BrowserCategory::Textures => {
+                                        if ui
+                                            .button("Import…")
+                                            .on_hover_text("Import a png/jpg into game_assets/textures")
+                                            .clicked()
+                                        {
+                                            import_texture = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                ui.separator();
+                                ui.label("Filter");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.browser_filter)
+                                        .desired_width(120.0),
+                                );
+                                if !self.browser_filter.is_empty()
+                                    && ui.small_button("×").clicked()
+                                {
+                                    self.browser_filter.clear();
+                                }
+                            });
                             ui.separator();
+
+                            let filter = self.browser_filter.to_lowercase();
+                            let current = self.selected_resource;
+                            // click = select/deselect; double-click also opens
+                            // the item in the right-hand Resource inspector.
+                            let mut on_tile = |resp: &egui::Response,
+                                               sel: ResourceSelection| {
+                                if resp.double_clicked() {
+                                    pick = Some(Some(sel));
+                                    open_inspector = true;
+                                } else if resp.clicked() {
+                                    pick = Some(if current == Some(sel) {
+                                        None
+                                    } else {
+                                        Some(sel)
+                                    });
+                                }
+                            };
                             egui::ScrollArea::vertical()
                                 .max_height(ui.available_height())
                                 .show(ui, |ui| {
-                                    // Clicking a resource highlights it and
-                                    // opens the right panel's Resource
-                                    // inspector; clicking again deselects.
-                                    let mut pick: Option<Option<ResourceSelection>> = None;
-                                    let mut resource_row =
-                                        |ui: &mut egui::Ui,
-                                         name: &str,
-                                         sel: ResourceSelection,
-                                         current: Option<ResourceSelection>| {
-                                            let is_selected = current == Some(sel);
-                                            if ui
-                                                .selectable_label(is_selected, name)
-                                                .clicked()
-                                            {
-                                                pick = Some(if is_selected {
-                                                    None
-                                                } else {
-                                                    Some(sel)
+                                    ui.horizontal_wrapped(|ui| match self.browser_category {
+                                        BrowserCategory::Models => {
+                                            for (name, path) in &model_catalog {
+                                                if !name_matches(name, &filter) {
+                                                    continue;
+                                                }
+                                                match loaded_models.get(path).copied() {
+                                                    // Loaded: a normal resource
+                                                    // tile.
+                                                    Some(handle) => {
+                                                        let sel =
+                                                            ResourceSelection::Model(handle);
+                                                        let resp = browser_tile(
+                                                            ui,
+                                                            name,
+                                                            &Thumb::Glyph("M"),
+                                                            current == Some(sel),
+                                                            false,
+                                                        );
+                                                        on_tile(&resp, sel);
+                                                    }
+                                                    // Not loaded: a click starts a
+                                                    // lazy load; it turns
+                                                    // selectable once geometry is
+                                                    // ready.
+                                                    None => {
+                                                        let resp = browser_tile(
+                                                            ui,
+                                                            name,
+                                                            &Thumb::Glyph("M"),
+                                                            false,
+                                                            false,
+                                                        );
+                                                        if resp.clicked() {
+                                                            model_load_request =
+                                                                Some(path.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        BrowserCategory::Materials => {
+                                            for (name, handle, dirty, rgb) in &material_tiles {
+                                                if !name_matches(name, &filter) {
+                                                    continue;
+                                                }
+                                                let sel = ResourceSelection::Material(*handle);
+                                                let resp = browser_tile(
+                                                    ui,
+                                                    name,
+                                                    &Thumb::Color(*rgb),
+                                                    current == Some(sel),
+                                                    *dirty,
+                                                );
+                                                if *dirty
+                                                    && tile_save_button(ui, &resp).clicked()
+                                                {
+                                                    save_material_handle = Some(*handle);
+                                                }
+                                                // Right-click to rename in place.
+                                                let menu = resp.context_menu(|ui| {
+                                                    let active = matches!(
+                                                        &self.material_rename,
+                                                        Some((h, _)) if h == handle
+                                                    );
+                                                    if !active {
+                                                        self.material_rename =
+                                                            Some((*handle, name.clone()));
+                                                    }
+                                                    ui.label("Rename material");
+                                                    if let Some((_, buf)) =
+                                                        &mut self.material_rename
+                                                    {
+                                                        let edit =
+                                                            ui.text_edit_singleline(buf);
+                                                        if !active {
+                                                            edit.request_focus();
+                                                        }
+                                                        if ui.input(|i| {
+                                                            i.key_pressed(egui::Key::Enter)
+                                                        }) {
+                                                            let new_name =
+                                                                buf.trim().to_string();
+                                                            if !new_name.is_empty() {
+                                                                rename_material =
+                                                                    Some((*handle, new_name));
+                                                            }
+                                                            self.material_rename = None;
+                                                            ui.close();
+                                                        }
+                                                    }
                                                 });
+                                                // Menu closed: drop any stale
+                                                // in-progress rename for this tile
+                                                // so a re-open re-seeds and refocuses.
+                                                if menu.is_none()
+                                                    && matches!(
+                                                        &self.material_rename,
+                                                        Some((h, _)) if h == handle
+                                                    )
+                                                {
+                                                    self.material_rename = None;
+                                                }
+                                                on_tile(&resp, sel);
                                             }
-                                        };
-                                    let current = self.selected_resource;
-                                    ui.columns(4, |columns| {
-                                        let ui = &mut columns[0];
-                                        ui.label(egui::RichText::new("Models").strong());
-                                        if model_resources.is_empty() {
-                                            ui.label("(none)");
                                         }
-                                        for (name, handle) in &model_resources {
-                                            resource_row(
-                                                ui,
-                                                name,
-                                                ResourceSelection::Model(*handle),
-                                                current,
-                                            );
-                                        }
-
-                                        let ui = &mut columns[1];
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("Materials").strong(),
-                                            );
-                                            if ui
-                                                .small_button("+")
-                                                .on_hover_text("New material")
-                                                .clicked()
+                                        BrowserCategory::Particles => {
+                                            for (i, (name, dirty)) in
+                                                particle_tiles.iter().enumerate()
                                             {
-                                                create_material = true;
+                                                if !name_matches(name, &filter) {
+                                                    continue;
+                                                }
+                                                let sel = ResourceSelection::Particle(i);
+                                                let resp = browser_tile(
+                                                    ui,
+                                                    name,
+                                                    &Thumb::Glyph("P"),
+                                                    current == Some(sel),
+                                                    *dirty,
+                                                );
+                                                if *dirty
+                                                    && tile_save_button(ui, &resp).clicked()
+                                                {
+                                                    save_particle_index = Some(i);
+                                                }
+                                                on_tile(&resp, sel);
                                             }
-                                        });
-                                        if material_resources.is_empty() {
-                                            ui.label("(none)");
                                         }
-                                        for (name, handle) in &material_resources {
-                                            resource_row(
-                                                ui,
-                                                name,
-                                                ResourceSelection::Material(*handle),
-                                                current,
-                                            );
-                                        }
-
-                                        let ui = &mut columns[2];
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("Particles").strong(),
-                                            );
-                                            if ui
-                                                .small_button("+")
-                                                .on_hover_text("New particle definition")
-                                                .clicked()
-                                            {
-                                                create_particle = true;
+                                        BrowserCategory::Textures => {
+                                            if texture_tiles.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "No textures yet — use Import…",
+                                                    )
+                                                    .weak(),
+                                                );
                                             }
-                                        });
-                                        for (i, name) in particle_names.iter().enumerate() {
-                                            resource_row(
-                                                ui,
-                                                name,
-                                                ResourceSelection::Particle(i),
-                                                current,
-                                            );
+                                            for (name, handle) in &texture_tiles {
+                                                if !name_matches(name, &filter) {
+                                                    continue;
+                                                }
+                                                let thumb = renderer
+                                                    .egui_texture_id(handle)
+                                                    .map(Thumb::Image)
+                                                    .unwrap_or(Thumb::Glyph("T"));
+                                                browser_tile(ui, name, &thumb, false, false);
+                                            }
                                         }
-
-                                        let ui = &mut columns[3];
-                                        ui.label(egui::RichText::new("Splats").strong());
-                                        if self.scene_splats.is_empty() {
-                                            ui.label("(none)");
-                                        }
-                                        for splat in &self.scene_splats {
-                                            ui.label(splat.name.as_str());
+                                        BrowserCategory::Splats => {
+                                            for name in &splat_names {
+                                                if !name_matches(name, &filter) {
+                                                    continue;
+                                                }
+                                                browser_tile(
+                                                    ui,
+                                                    name,
+                                                    &Thumb::Glyph("S"),
+                                                    false,
+                                                    false,
+                                                );
+                                            }
                                         }
                                     });
-                                    if let Some(new_selection) = pick {
-                                        self.selected_resource = new_selection;
-                                        if new_selection.is_some() {
-                                            self.active_tab = Some(EditorTab::Resource);
-                                        }
-                                    }
                                 });
+                            if let Some(new_selection) = pick {
+                                self.selected_resource = new_selection;
+                                if open_inspector {
+                                    self.active_tab = Some(EditorTab::Resource);
+                                }
+                            }
                         });
                     });
             } else {
@@ -2560,49 +3316,114 @@ impl GameEngine for SplatGame {
                                             ui.label("Models aren't editable yet.");
                                         }
                                         Some(ResourceSelection::Material(handle)) => {
-                                            let name = material_resources
-                                                .iter()
-                                                .find(|(_, h)| *h == handle)
-                                                .map_or("(unknown material)", |(n, _)| {
-                                                    n.as_str()
-                                                });
-                                            ui.label(egui::RichText::new(name).strong());
-                                            ui.separator();
-                                            if let Some((color, mr)) =
-                                                renderer.material_constants(&handle)
+                                            if let Some(mat) = self
+                                                .material_library
+                                                .iter_mut()
+                                                .find(|m| m.handle == handle)
                                             {
-                                                let (mut color, mut mr) = (color, mr);
+                                                // Title row: name, dirty marker,
+                                                // and a save-to-disk button.
+                                                if resource_header(ui, &mat.name, mat.dirty) {
+                                                    match save_material_file(mat) {
+                                                        Ok(()) => mat.dirty = false,
+                                                        Err(e) => log!("Save failed: {e}"),
+                                                    }
+                                                }
+                                                ui.separator();
+                                                // Materials are referenced by
+                                                // handle, so a rename only touches
+                                                // the display name / save file --
+                                                // no scene references to fix up.
+                                                ui.label("Name");
+                                                if ui
+                                                    .text_edit_singleline(&mut mat.name)
+                                                    .changed()
+                                                {
+                                                    mat.dirty = true;
+                                                }
+                                                ui.separator();
                                                 let mut changed = false;
                                                 ui.label("Color");
-                                                let mut rgb = [color.x, color.y, color.z];
+                                                let c = &mut mat.desc.color_constant;
+                                                let mut rgb = [c.x, c.y, c.z];
                                                 if ui
                                                     .color_edit_button_rgb(&mut rgb)
                                                     .changed()
                                                 {
-                                                    color = CgVec4::new(
-                                                        rgb[0], rgb[1], rgb[2], color.w,
+                                                    *c = CgVec4::new(
+                                                        rgb[0], rgb[1], rgb[2], c.w,
                                                     );
                                                     changed = true;
                                                 }
                                                 changed |= ui
                                                     .add(
-                                                        egui::Slider::new(&mut mr.x, 0.0..=1.0)
-                                                            .text("metallic"),
+                                                        egui::Slider::new(
+                                                            &mut mat.desc.mr_constant.x,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("metallic"),
                                                     )
                                                     .changed();
                                                 changed |= ui
                                                     .add(
-                                                        egui::Slider::new(&mut mr.y, 0.0..=1.0)
-                                                            .text("roughness"),
+                                                        egui::Slider::new(
+                                                            &mut mat.desc.mr_constant.y,
+                                                            0.0..=1.0,
+                                                        )
+                                                        .text("roughness"),
                                                     )
                                                     .changed();
                                                 if changed {
                                                     renderer.update_material(
-                                                        &handle, &color, &mr,
+                                                        &handle,
+                                                        &mat.desc.color_constant,
+                                                        &mat.desc.mr_constant,
+                                                    );
+                                                    mat.dirty = true;
+                                                }
+                                                // Texture assignment.  Changing a
+                                                // texture rebuilds the material's
+                                                // bind group (not just its
+                                                // constants), so it goes through
+                                                // reload_material rather than
+                                                // update_material.
+                                                ui.separator();
+                                                let mut tex_changed = texture_combo(
+                                                    ui,
+                                                    "mat_color_tex",
+                                                    "Color texture",
+                                                    &mut mat.desc.color_texture,
+                                                    &texture_options,
+                                                );
+                                                tex_changed |= texture_combo(
+                                                    ui,
+                                                    "mat_spec_tex",
+                                                    "Metal/rough texture",
+                                                    &mut mat.desc.spec_texture,
+                                                    &texture_options,
+                                                );
+                                                if tex_changed {
+                                                    // Native import path already
+                                                    // preloaded these; blocking
+                                                    // the reload here is fine.
+                                                    pollster::block_on(
+                                                        renderer.reload_material(
+                                                            &handle, &mat.name, &mat.desc,
+                                                        ),
+                                                    );
+                                                    mat.dirty = true;
+                                                }
+                                                if texture_options.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "Import textures in the \
+                                                             Resources panel to assign them.",
+                                                        )
+                                                        .weak(),
                                                     );
                                                 }
                                             } else {
-                                                ui.label("(missing material)");
+                                                ui.label("(unknown material)");
                                             }
                                         }
                                         Some(ResourceSelection::Particle(i)) => {
@@ -2612,6 +3433,18 @@ impl GameEngine for SplatGame {
                                             if let Some(resource) =
                                                 self.particle_resources.get_mut(i)
                                             {
+                                                // Save row (dirty marker + disk).
+                                                if resource_header(
+                                                    ui,
+                                                    &resource.name,
+                                                    resource.dirty,
+                                                ) {
+                                                    match save_particle_file(resource) {
+                                                        Ok(()) => resource.dirty = false,
+                                                        Err(e) => log!("Save failed: {e}"),
+                                                    }
+                                                }
+                                                ui.separator();
                                                 let old_name = resource.name.clone();
                                                 ui.label("Name");
                                                 if ui
@@ -2622,6 +3455,7 @@ impl GameEngine for SplatGame {
                                                         old_name,
                                                         resource.name.clone(),
                                                     ));
+                                                    resource.dirty = true;
                                                 }
                                                 ui.separator();
                                                 if draw_particle_params_ui(
@@ -2630,6 +3464,7 @@ impl GameEngine for SplatGame {
                                                     &textures,
                                                 ) {
                                                     edited_particle = Some(i);
+                                                    resource.dirty = true;
                                                 }
                                             } else {
                                                 ui.label("(missing particle resource)");
@@ -2702,6 +3537,17 @@ impl GameEngine for SplatGame {
                                                 )
                                                 .logarithmic(true)
                                                 .text("distance"),
+                                            )
+                                            .changed();
+                                        // Shadow-catcher darkness: how black the
+                                        // CG objects' shadows land on the splats.
+                                        shadows_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut self.editor_config.shadow_density,
+                                                    0.0..=4.0,
+                                                )
+                                                .text("density"),
                                             )
                                             .changed();
                                         if shadows_changed {
@@ -3258,7 +4104,17 @@ impl GameEngine for SplatGame {
         if create_material {
             self.next_object_num += 1;
             let name = format!("Material {}", self.next_object_num);
-            let handle = renderer.create_material(&name, &MaterialDesc::default());
+            let desc = MaterialDesc::default();
+            let handle = renderer.create_material(&name, &desc);
+            // New, unsaved: dirty so the browser shows its save icon until the
+            // user writes it to disk (saved_name None until then).
+            self.material_library.push(MaterialResource {
+                name,
+                desc,
+                handle,
+                dirty: true,
+                saved_name: None,
+            });
             self.selected_resource = Some(ResourceSelection::Material(handle));
             self.active_tab = Some(EditorTab::Resource);
         }
@@ -3267,10 +4123,63 @@ impl GameEngine for SplatGame {
             self.particle_resources.push(ParticleResource {
                 name: format!("Particle {}", self.next_object_num),
                 params: preset_particle_params("Fire"),
+                dirty: true,
+                saved_name: None,
             });
             self.selected_resource =
                 Some(ResourceSelection::Particle(self.particle_resources.len() - 1));
             self.active_tab = Some(EditorTab::Resource);
+        }
+        if import_texture {
+            self.open_texture_picker();
+        }
+        if import_model {
+            self.open_model_picker();
+        }
+        // A model tile clicked while still unloaded: load it now (lazy), then
+        // select it.  Native loads synchronously; web fetches in the background
+        // and the tick that finishes the upload does the select.
+        if let Some(path) = model_load_request {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let handle = pollster::block_on(renderer.load_model(&path, false));
+                self.selected_resource = Some(ResourceSelection::Model(handle));
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let pending = self.pending_model_uploads.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Ok(bytes) = load_binary(&path).await {
+                        pending.lock().unwrap().push((path, bytes, true));
+                    }
+                });
+            }
+        }
+        // Save requests from the browser tiles' disk buttons: write the file
+        // and clear the dirty flag.
+        if let Some(handle) = save_material_handle {
+            if let Some(mat) = self.material_library.iter_mut().find(|m| m.handle == handle) {
+                match save_material_file(mat) {
+                    Ok(()) => mat.dirty = false,
+                    Err(e) => log!("Save failed: {e}"),
+                }
+            }
+        }
+        if let Some(i) = save_particle_index {
+            if let Some(resource) = self.particle_resources.get_mut(i) {
+                match save_particle_file(resource) {
+                    Ok(()) => resource.dirty = false,
+                    Err(e) => log!("Save failed: {e}"),
+                }
+            }
+        }
+        // Rename requested from a material tile's right-click menu.  Materials
+        // are referenced by handle, so only the display name / save file change.
+        if let Some((handle, new_name)) = rename_material {
+            if let Some(mat) = self.material_library.iter_mut().find(|m| m.handle == handle) {
+                mat.name = new_name;
+                mat.dirty = true;
+            }
         }
         // Renaming a particle resource keeps the scene emitters that reference
         // it pointing at the new name.
@@ -3367,6 +4276,88 @@ impl GameEngine for SplatGame {
         if do_pick_startup {
             Self::open_scene_picker_into(self.picked_startup.clone());
         }
+        // Apply an imported texture once its file has been read: copy it into
+        // game_assets/textures/, load it, and add it to the texture library.
+        let picked_texture = self.picked_texture.lock().unwrap().take();
+        if let Some((file_name, bytes)) = picked_texture {
+            self.status = Some(match resource_library::import_texture(&file_name, &bytes) {
+                Ok(path) => {
+                    if self.texture_resources.iter().any(|t| t.path == path) {
+                        (format!("Texture already imported: {file_name}"), STATUS_WHITE, 4.0)
+                    } else {
+                        // Native-only import path, so a blocking load here is
+                        // fine (rfd already ran the pick off-thread).
+                        let handle = pollster::block_on(renderer.preload_texture(&path));
+                        self.texture_resources.push(TextureResource {
+                            name: resource_display_name(&path),
+                            path,
+                            handle,
+                        });
+                        (format!("Imported texture: {file_name}"), STATUS_WHITE, 4.0)
+                    }
+                }
+                Err(reason) => (format!("Couldn't import texture: {reason}"), STATUS_RED, 8.0),
+            });
+        }
+        // Apply an imported model once its file has been read: persist it and
+        // register it so it shows in the model picker this session.  Persist =
+        // game_assets/models on native, IndexedDB on web (survives reloads);
+        // registration is synchronous on both (block_on native, from-bytes web).
+        let picked_model = self.picked_model.lock().unwrap().take();
+        if let Some((file_name, bytes)) = picked_model {
+            let path = format!("game_assets/models/{file_name}");
+            if self.model_resources.iter().any(|m| m.path == path) {
+                self.status = Some((
+                    format!("Model already imported: {file_name}"),
+                    STATUS_WHITE,
+                    4.0,
+                ));
+            } else {
+                #[cfg(not(target_arch = "wasm32"))]
+                let handle = match resource_library::save_model(&file_name, &bytes) {
+                    Ok(_) => Some(pollster::block_on(renderer.load_model(&path, false))),
+                    Err(e) => {
+                        log!("Model import failed: {e}");
+                        None
+                    }
+                };
+                // Web import: only self-contained binary glb is supported (a
+                // .gltf's external buffers/textures can't be resolved without a
+                // filesystem).  Reject anything else rather than panic in the
+                // glb parser.
+                #[cfg(target_arch = "wasm32")]
+                let handle = if bytes.starts_with(b"glTF") {
+                    // Persist to IndexedDB in the background (bytes already in
+                    // hand), and upload from those bytes for this session.
+                    let (p, b) = (path.clone(), bytes.clone());
+                    wasm_bindgen_futures::spawn_local(async move {
+                        black_splat::idb::put(&p, &b).await;
+                    });
+                    Some(renderer.load_model_from_bytes(&path, &bytes, false))
+                } else {
+                    None
+                };
+
+                self.status = Some(match handle {
+                    // The model is registered in the renderer's AssetManager by
+                    // the load above; add its catalog entry so it lists too.
+                    Some(_) => {
+                        self.model_resources.push(ModelResource {
+                            name: resource_display_name(&path),
+                            path,
+                        });
+                        (format!("Imported model: {file_name}"), STATUS_WHITE, 4.0)
+                    }
+                    None => {
+                        #[cfg(target_arch = "wasm32")]
+                        let msg = format!("Couldn't import {file_name}: web import needs a binary .glb");
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let msg = format!("Couldn't import {file_name} (see log)");
+                        (msg, STATUS_RED, 8.0)
+                    }
+                });
+            }
+        }
         // Apply a loaded scene once its file has been read (async, like the .ply).
         let scene_bytes = self.picked_scene.lock().unwrap().take();
         if let Some(bytes) = scene_bytes {
@@ -3403,6 +4394,35 @@ impl GameEngine for SplatGame {
         }
         // Upload splat clouds whose .ply bytes arrived from a scene load.
         self.drain_pending_splats(renderer);
+
+        // Upload lazily-fetched model bytes that arrived this frame (web): browser
+        // selects and scene actors whose model was still loading pop in here.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let uploads: Vec<(String, Vec<u8>, bool)> =
+                std::mem::take(&mut *self.pending_model_uploads.lock().unwrap());
+            for (path, bytes, select) in uploads {
+                let handle = renderer.load_model_from_bytes(&path, &bytes, false);
+                if select {
+                    self.selected_resource = Some(ResourceSelection::Model(handle));
+                }
+                // Assign the freshly-loaded mesh to any scene actor waiting on it.
+                let name = resource_display_name(&path);
+                let mut pending = std::mem::take(&mut self.pending_actor_models);
+                pending.retain(|(idx, want)| {
+                    if *want == name {
+                        if let Some(actor) = self.scene_actors.get_mut(*idx) {
+                            actor.set_model(&handle);
+                            renderer.add_or_update_actor(actor);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.pending_actor_models = pending;
+            }
+        }
 
         // On-screen move/look touch pads (shared TouchPads controller).  Left
         // pad adds to movement, right pad turns the camera.
@@ -3506,9 +4526,18 @@ impl GameEngine for SplatGame {
         }
 
         // Splat param adjustments: keyboard nudges for the active cloud's params
-        // (a quick alternative to the Details panel drags).
+        // (a quick alternative to the Details panel drags).  Suppressed while
+        // egui has keyboard focus, so typing a value into the Settings/Details
+        // panels (e.g. a shadow distance of "300") doesn't also drive the
+        // active cloud's params through the 1-9 keys -- which is how "3" was
+        // silently shrinking Splat Scale while adjusting shadow settings.
         let adj = delta_time * PARAM_RATE;
-        if let Some(splat) = self.scene_splats.get_mut(self.active_splat) {
+        let hotkeys_ok = !ctx.egui_wants_keyboard_input();
+        if let Some(splat) = self
+            .scene_splats
+            .get_mut(self.active_splat)
+            .filter(|_| hotkeys_ok)
+        {
             let p = &mut splat.params;
             let mut changed = false;
 

@@ -110,9 +110,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // ACES tonemap in linear space before any sRGB encode (w > 0.5 enables it).
-    /*if (postprocess_buffer.time_mode_srgb_tonemap.w > 0.5) {
+    if (postprocess_buffer.time_mode_srgb_tonemap.w > 0.5) {
         outColor = vec4<f32>(tonemap_aces(outColor.rgb), outColor.a);
-    }*/
+    }
 
     // .z flags a non-sRGB surface: encode here so colors aren't displayed dark.
     if (postprocess_buffer.time_mode_srgb_tonemap.z > 0.5) {

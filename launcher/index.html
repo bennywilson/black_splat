@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>black_splat launcher</title>
+<title>Black Splat - Front End</title>
 <style>
   :root {
     --bg: #000000; --panel: #0c0c0c; --panel2: #161616; --line: #262626;
@@ -29,6 +29,11 @@
     padding: 14px; margin-bottom: 12px;
   }
   .card.active { border-color: var(--accent); }
+  .thumb {
+    display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover;
+    border-radius: 7px; margin-bottom: 10px; background: #000;
+    border: 1px solid var(--line);
+  }
   .card h2 { margin: 0 0 2px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
   .card .crate { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex: 0 0 auto; }
@@ -113,6 +118,7 @@ async function init() {
     card.className = 'card';
     card.id = 'card-' + ex.name;
     card.innerHTML = `
+      ${ex.thumbnail ? `<img class="thumb" src="/api/thumb/${ex.name}" alt="">` : ''}
       <h2><span class="dot" id="dot-${ex.name}"></span>${ex.name}</h2>
       <div class="crate">${ex.crate}</div>
       <div class="btns">

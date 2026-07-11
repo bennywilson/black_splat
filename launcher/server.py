@@ -150,10 +150,10 @@ def stop_job(example):
     return False
 
 
+# Subclass ThreadingHTTPServer.  Each request is handled in its own thread
 class QuietServer(http.server.ThreadingHTTPServer):
     def handle_error(self, request, client_address):
-        # SSE clients (browser tabs) drop connections all the time; those show
-        # up as ConnectionReset/BrokenPipe and are not worth a traceback.
+        # SSE clients (browser tabs) drop connections all the time, skip printing the traceback
         if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
             return
         super().handle_error(request, client_address)
@@ -182,10 +182,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, f.read(), "text/html; charset=utf-8")
         elif self.path == "/api/examples":
             payload = [
-                {"name": e["name"], "crate": e["crate"], "port": PORTS[e["name"]]}
+                {
+                    "name": e["name"], "crate": e["crate"], "port": PORTS[e["name"]],
+                    "thumbnail": bool(e["thumbnail"]),
+                }
                 for e in EXAMPLES
             ]
             self._send(200, json.dumps(payload))
+        elif self.path.startswith("/api/thumb/"):
+            name = self.path[len("/api/thumb/"):]
+            thumb = next((e["thumbnail"] for e in EXAMPLES if e["name"] == name), None)
+            if name not in PORTS or not thumb:
+                self._send(404, json.dumps({"error": "not found"}))
+                return
+            ctype = {
+                ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
+            }[os.path.splitext(thumb)[1]]
+            with open(os.path.join(build.EXAMPLES_DIR, name, thumb), "rb") as f:
+                self._send(200, f.read(), ctype)
         elif self.path == "/api/state":
             with JOBS_LOCK:
                 state = {
@@ -252,6 +266,7 @@ def main():
     if not EXAMPLES:
         print("No examples found under", build.EXAMPLES_DIR)
         return
+
     server = QuietServer(("127.0.0.1", CONTROL_PORT), Handler)
     url = f"http://localhost:{CONTROL_PORT}/"
     print(f"black_splat launcher on {url}")
@@ -259,9 +274,7 @@ def main():
     print("Press Ctrl+C (or close this window) to stop.")
 
     def shutdown(*_):
-        # Kill every child job (cargo/serve/tunnel) so nothing orphans when the
-        # launcher goes away -- otherwise a native run keeps its window open and
-        # a serve keeps holding its port after the launcher is gone.
+        # Kill every child job  so nothing orphans when the launcher goes away to prevent stale ports
         with JOBS_LOCK:
             for job in JOBS.values():
                 build.kill_tree(job.proc)
