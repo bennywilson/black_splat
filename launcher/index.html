@@ -21,9 +21,13 @@
   }
   header h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: .2px; }
   header .sub { color: var(--muted); font-size: 13px; }
-  main { display: grid; grid-template-columns: 380px 1fr; gap: 0; height: calc(100vh - 61px); }
-  @media (max-width: 720px) { main { grid-template-columns: 1fr; height: auto; } }
-  .examples { border-right: 1px solid var(--line); overflow-y: auto; padding: 14px; }
+  main { display: grid; grid-template-columns: 380px 6px 1fr; gap: 0; height: calc(100vh - 61px); }
+  @media (max-width: 720px) { main { grid-template-columns: 1fr; height: auto; } .splitter { display: none; } }
+  .examples { overflow-y: auto; padding: 14px; min-width: 0; min-height: 0; }
+  .splitter {
+    cursor: col-resize; background: var(--line); position: relative;
+  }
+  .splitter:hover, .splitter.dragging { background: var(--accent); }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 14px; margin-bottom: 12px;
@@ -46,7 +50,7 @@
      them); nowrap stops Stop from dropping to a second line. */
   .btns { display: flex; flex-wrap: nowrap; gap: 6px; margin-top: 12px; }
   button {
-    font: inherit; font-size: 13px; padding: 6px 11px; border-radius: 7px;
+    font: inherit; font-size: 12px; padding: 5px 9px; border-radius: 7px;
     border: 1px solid var(--line); background: var(--panel2); color: var(--text);
     cursor: pointer; white-space: nowrap;
   }
@@ -69,7 +73,7 @@
     background: #fff; padding: 8px; border-radius: 8px;
   }
   .qr .cap { color: var(--muted); font-size: 12px; margin-top: 6px; }
-  .console { display: flex; flex-direction: column; min-width: 0; }
+  .console { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .tabs { display: flex; gap: 4px; padding: 10px 14px 0; flex-wrap: wrap; }
   .tab {
     padding: 6px 12px; border: 1px solid var(--line); border-bottom: none;
@@ -78,7 +82,7 @@
   }
   .tab.active { background: var(--panel); color: var(--text); border-color: var(--line); }
   pre.log {
-    flex: 1; margin: 0; padding: 14px 16px; overflow: auto; background: #000;
+    flex: 1; min-height: 0; margin: 0; padding: 14px 16px; overflow: auto; background: #000;
     border-top: 1px solid var(--line);
     font: 12.5px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: pre; /* don't wrap long build lines; scroll horizontally instead */
@@ -95,6 +99,7 @@
 </header>
 <main>
   <section class="examples" id="examples"></section>
+  <div class="splitter" id="splitter"></div>
   <section class="console">
     <div class="tabs" id="tabs"></div>
     <pre class="log" id="log"><span class="empty">Pick an action to see build output here.</span></pre>
@@ -131,6 +136,7 @@ async function init() {
         <button onclick="act('${ex.name}','native')">Run native</button>
         <button onclick="act('${ex.name}','wasm')">Wasm</button>
         <button onclick="act('${ex.name}','tunnel')">Tunnel</button>
+        <button onclick="act('${ex.name}','clean')">Clean</button>
         <button class="stop" onclick="stop('${ex.name}')">Stop</button>
       </div>
       <div class="links" id="links-${ex.name}"></div>
@@ -261,16 +267,23 @@ function clearEmpty(log) {
   if (empty) log.innerHTML = '';
 }
 
+// Only auto-scroll if the user is already at (or near) the bottom, so
+// scrolling up to read earlier output doesn't get yanked back down.
+function isNearBottom(log) {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+}
+
 // A committed line is finalized output; it goes in above the pinned live line
 // (the progress bar), matching how a terminal scrolls text under a bottom bar.
 function appendCommitted(text) {
   const log = document.getElementById('log');
+  const stick = isNearBottom(log);
   clearEmpty(log);
   const span = document.createElement('span');
   if (text.startsWith('$ ')) span.className = 'cmd';
   span.textContent = text + '\n';
   log.insertBefore(span, log.querySelector('.live'));  // null ref => append
-  log.scrollTop = log.scrollHeight;
+  if (stick) log.scrollTop = log.scrollHeight;
 }
 
 // The live line is a single span kept last in the log; a progress-bar redraw
@@ -280,11 +293,41 @@ function renderLive(name) {
   const s = ensure(name);
   let el = log.querySelector('.live');
   if (s.live == null) { if (el) el.remove(); return; }
+  const stick = isNearBottom(log);
   clearEmpty(log);
   if (!el) { el = document.createElement('span'); el.className = 'live'; log.appendChild(el); }
   el.textContent = s.live + '\n';
-  log.scrollTop = log.scrollHeight;
+  if (stick) log.scrollTop = log.scrollHeight;
 }
+
+(function initSplitter() {
+  const main = document.querySelector('main');
+  const splitter = document.getElementById('splitter');
+  const saved = localStorage.getItem('splitWidth');
+  if (saved) main.style.gridTemplateColumns = saved + 'px 6px 1fr';
+
+  let dragging = false;
+  splitter.addEventListener('mousedown', (e) => {
+    dragging = true;
+    splitter.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const rect = main.getBoundingClientRect();
+    const width = Math.min(Math.max(e.clientX - rect.left, 200), rect.width - 200);
+    main.style.gridTemplateColumns = width + 'px 6px 1fr';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove('dragging');
+    document.body.style.userSelect = '';
+    const width = parseInt(main.style.gridTemplateColumns, 10);
+    localStorage.setItem('splitWidth', width);
+  });
+})();
 
 init();
 </script>

@@ -5,7 +5,7 @@ use cgmath::InnerSpace;
 use serde::{Deserialize, Serialize};
 
 use black_splat::{
-    egui, assets::*, config::*, editor::{self, EditorChoice, TransformGizmo}, engine::*,
+    egui, assets::*, config::*, editor::{self, EditorChoice, GizmoSpace, TransformGizmo}, engine::*,
     fly_camera::*, game_object::*, input::*, renderer::*, resource::SceneLayer, touch_pads::*,
     utils::*, log,
     passes::deferred::ShadowSettings,
@@ -1534,6 +1534,19 @@ impl SplatGame {
         }
     }
 
+    /// World-space orientation of a selected object of any kind, for the
+    /// gizmo's Local space (identity for kinds with no rotation of their own,
+    /// e.g. particles; None if stale or the kind has no transform at all).
+    fn selection_rotation(&self, sel: Selection) -> Option<CgQuat> {
+        match sel {
+            Selection::Actor(i) => self.scene_actors.get(i).map(|a| a.get_rotation()),
+            Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_rotation()),
+            Selection::Particle(i) => self.scene_particles.get(i).map(|_| CG_QUAT_IDENT),
+            Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.transform.rotation),
+            Selection::PostProcess => None,
+        }
+    }
+
     /// Moves a selected object of any kind to `pos`, pushing the change to the
     /// renderer's copy.
     fn set_selection_position(&mut self, sel: Selection, pos: &CgVec3, renderer: &mut Renderer) {
@@ -2560,6 +2573,12 @@ impl GameEngine for SplatGame {
             });
         }
 
+        // Build the splat pipeline now regardless of whether the startup scene
+        // has any splats -- tick_frame_internal is sync and can only reach the
+        // sync load_gaussian_splat_from_bytes (e.g. the [L] file picker), which
+        // errors out if the pipeline doesn't exist yet.
+        renderer.ensure_gaussian_splat_pipeline().await;
+
         // Open the startup scene: the user's saved one, or the built-in default
         // (the church) otherwise.  Since we're async here, splat clouds load
         // directly instead of through the pending queue.
@@ -2926,6 +2945,30 @@ impl GameEngine for SplatGame {
                                     "Hotkey: {}",
                                     self.editor_config.gizmo_keys[i].name()
                                 ));
+                            }
+                            ui.separator();
+                            // World/Local: fixed world axes, or the selected
+                            // object's own rotated axes (averaged across a
+                            // multi-selection).
+                            for (space, label, hover) in [
+                                (
+                                    GizmoSpace::World,
+                                    "World",
+                                    "Translate/rotate/scale along fixed world axes",
+                                ),
+                                (
+                                    GizmoSpace::Local,
+                                    "Local",
+                                    "Translate/rotate/scale along the object's own axes \
+                                     (averaged across a multi-selection)",
+                                ),
+                            ] {
+                                let resp = ui
+                                    .selectable_label(self.gizmo.space == space, label)
+                                    .on_hover_text(hover);
+                                if resp.clicked() {
+                                    self.gizmo.space = space;
+                                }
                             }
                             // One snap box per mode, always visible (not just
                             // the active one) so all three can be dialed in
@@ -4151,6 +4194,15 @@ impl GameEngine for SplatGame {
                     .iter()
                     .fold(CG_VEC3_ZERO, |acc, (_, p)| acc + *p)
                     / objects.len() as f32;
+                // Local space has no single frame for a group: each object's
+                // own local axis is averaged and renormalized (see
+                // average_local_axes), giving one representative frame.
+                let rotations: Vec<CgQuat> = self
+                    .multi_selected
+                    .iter()
+                    .filter_map(|sel| self.selection_rotation(*sel))
+                    .collect();
+                let local_axes = TransformGizmo::average_local_axes(&rotations);
                 let mut position = centroid;
                 let mut rotation = CG_QUAT_IDENT;
                 let mut scale = CG_VEC3_ONE;
@@ -4161,14 +4213,20 @@ impl GameEngine for SplatGame {
                     &mut position,
                     &mut rotation,
                     &mut scale,
+                    local_axes,
                 ) {
+                    // The axes ui() actually dragged along this call, so the
+                    // returned per-component `scale` can be decomposed back
+                    // onto the same directions (exact for an orthonormal
+                    // frame -- world axes, or Local with one shared
+                    // orientation; an approximation for a Local multi-select
+                    // whose averaged axes aren't quite orthogonal).
+                    let axes = self.gizmo.effective_axes(local_axes);
                     for (sel, old_pos) in objects {
                         let offset = old_pos - centroid;
-                        let scaled_offset = CgVec3::new(
-                            offset.x * scale.x,
-                            offset.y * scale.y,
-                            offset.z * scale.z,
-                        );
+                        let scaled_offset = axes[0] * (offset.dot(axes[0]) * scale.x)
+                            + axes[1] * (offset.dot(axes[1]) * scale.y)
+                            + axes[2] * (offset.dot(axes[2]) * scale.z);
                         let new_pos = position + rotation * scaled_offset;
                         self.apply_pivot_delta(sel, new_pos, rotation, scale, renderer);
                     }
@@ -4198,6 +4256,7 @@ impl GameEngine for SplatGame {
                     Selection::PostProcess => None,
                 };
                 if let Some((mut position, mut rotation, mut scale)) = current {
+                    let local_axes = TransformGizmo::local_axes(rotation);
                     if self.gizmo.ui(
                         &ctx,
                         &self.game_camera,
@@ -4205,6 +4264,7 @@ impl GameEngine for SplatGame {
                         &mut position,
                         &mut rotation,
                         &mut scale,
+                        local_axes,
                     ) {
                         match sel {
                             Selection::Actor(i) => {

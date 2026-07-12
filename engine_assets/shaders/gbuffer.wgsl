@@ -2,8 +2,9 @@
 // metallic/roughness for the deferred lighting pass (see light_*.wgsl).
 // model_color is the actor color multiplied by the material's color constant
 // on the CPU; spec_color.xy are the material's metallic/roughness constants,
-// multiplied by the material's metallic-roughness texture (glTF layout:
-// G = roughness, B = metallic; the built-in white when none is assigned).
+// each multiplied by an independent grayscale map (read from the red channel):
+// t_metal for metallic, t_rough for roughness (the built-in white 1x1 when a
+// map isn't assigned, so the constant passes through unchanged).
 
 struct ModelUniform {
     world: mat4x4<f32>,
@@ -57,7 +58,9 @@ var t_color: texture_2d<f32>;
 @group(0) @binding(1)
 var s_color: sampler;
 @group(0) @binding(2)
-var t_spec: texture_2d<f32>;
+var t_metal: texture_2d<f32>;
+@group(0) @binding(3)
+var t_rough: texture_2d<f32>;
 
 struct GBufferOutput {
     @location(0) color: vec4<f32>,
@@ -75,10 +78,11 @@ fn fs_main(in: VertexOutput) -> GBufferOutput {
     let normal = normalize(in.normal);
     out.normal = vec4<f32>(normal * 0.5 + 0.5, 1.0);
 
-    let mr = textureSample(t_spec, s_color, in.tex_coords);
+    let metallic = textureSample(t_metal, s_color, in.tex_coords).r;
+    let roughness = textureSample(t_rough, s_color, in.tex_coords).r;
     out.specular = vec4<f32>(
-        mr.b * model_uniform.spec_color.x,  // metallic
-        mr.g * model_uniform.spec_color.y,  // roughness
+        metallic * model_uniform.spec_color.x,  // metallic
+        roughness * model_uniform.spec_color.y,  // roughness
         0.0,
         1.0
     );

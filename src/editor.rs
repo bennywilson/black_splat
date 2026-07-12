@@ -362,6 +362,17 @@ pub enum GizmoMode {
     Scale,
 }
 
+/// Which frame the gizmo's axes are drawn and dragged along.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GizmoSpace {
+    /// Fixed world X/Y/Z, regardless of the selected object's rotation.
+    World,
+    /// The selected object's own rotated axes.  For a multi-selection there's
+    /// no single "local" frame, so each axis is averaged across the selection
+    /// and renormalized -- see [`TransformGizmo::average_local_axes`].
+    Local,
+}
+
 const GIZMO_AXES: [CgVec3; 3] = [
     CgVec3::new(1.0, 0.0, 0.0),
     CgVec3::new(0.0, 1.0, 0.0),
@@ -400,14 +411,17 @@ const GIZMO_CENTER_HANDLE: usize = 3;
 const GIZMO_ROTATE_SENSITIVITY: f32 = 1.5;
 
 /// A screen-space translate/rotate/scale gizmo drawn over the 3D view for the
-/// selected actor.  Translate shows three world-axis arrows; dragging one
-/// slides the position along that axis.  Rotate shows three axis rings;
-/// dragging one spins the rotation about that axis by the pointer's angle
-/// change around the gizmo center.  Scale shows three square-tipped axis
-/// handles plus a center square; dragging a tip scales that axis, dragging
-/// the center scales all three uniformly.
+/// selected actor.  Translate shows three axis arrows; dragging one slides
+/// the position along that axis.  Rotate shows three axis rings; dragging one
+/// spins the rotation about that axis by the pointer's angle change around
+/// the gizmo center.  Scale shows three square-tipped axis handles plus a
+/// center square; dragging a tip scales that axis, dragging the center
+/// scales all three uniformly.  The three axes are either fixed world X/Y/Z
+/// or the selected object's own rotated axes, per [`GizmoSpace`].
 pub struct TransformGizmo {
     pub mode: GizmoMode,
+    /// Which frame translate/rotate/scale act along; see [`GizmoSpace`].
+    pub space: GizmoSpace,
     /// Rotate-mode snap increment in degrees; 0 disables snapping so rotation
     /// is continuous.  When set, a rotate drag commits only in whole
     /// increments of this many degrees.
@@ -448,6 +462,7 @@ impl Default for TransformGizmo {
     fn default() -> Self {
         TransformGizmo {
             mode: GizmoMode::Translate,
+            space: GizmoSpace::World,
             rotate_snap_degrees: 0.0,
             translate_snap_units: 0.0,
             scale_snap_units: 0.0,
@@ -469,9 +484,56 @@ impl TransformGizmo {
         self.drag_axis.is_some()
     }
 
+    /// World-space direction of one orientation's local X/Y/Z axes -- what
+    /// [`GizmoSpace::Local`] means for a single selected object.  Pass the
+    /// object's own rotation.
+    pub fn local_axes(rotation: CgQuat) -> [CgVec3; 3] {
+        [
+            rotation * GIZMO_AXES[0],
+            rotation * GIZMO_AXES[1],
+            rotation * GIZMO_AXES[2],
+        ]
+    }
+
+    /// [`GizmoSpace::Local`] axes for a multi-selection: there's no single
+    /// local frame for a group, so each axis is summed across every selected
+    /// object's own local axis and renormalized, giving one representative
+    /// (not necessarily orthogonal, if the selection's orientations diverge)
+    /// frame to drag along.  Falls back to the world axis if a sum cancels to
+    /// (near) zero (e.g. two objects rotated opposite ways).  Empty input
+    /// yields the world axes.
+    pub fn average_local_axes(rotations: &[CgQuat]) -> [CgVec3; 3] {
+        std::array::from_fn(|i| {
+            let base = GIZMO_AXES[i];
+            let sum = rotations
+                .iter()
+                .fold(CgVec3::new(0.0, 0.0, 0.0), |acc, r| acc + *r * base);
+            if sum.magnitude2() > 1e-12 {
+                sum.normalize()
+            } else {
+                base
+            }
+        })
+    }
+
+    /// The axes `ui` will actually draw/drag along this call: `local_axes`
+    /// verbatim in [`GizmoSpace::Local`], otherwise the fixed world axes.
+    /// Callers that need to interpret `ui`'s returned scale (a per-axis
+    /// ratio) call this with the same `local_axes` they passed to `ui` to
+    /// learn which directions those ratios are along.
+    pub fn effective_axes(&self, local_axes: [CgVec3; 3]) -> [CgVec3; 3] {
+        match self.space {
+            GizmoSpace::World => GIZMO_AXES,
+            GizmoSpace::Local => local_axes,
+        }
+    }
+
     /// Draws the gizmo at `position` and applies any drag to
-    /// `position`/`rotation`/`scale` (depending on mode).  Returns true if it
-    /// changed them this frame.
+    /// `position`/`rotation`/`scale` (depending on mode).  `local_axes` is
+    /// the world-space direction of each local X/Y/Z axis, used in
+    /// [`GizmoSpace::Local`] (see [`Self::local_axes`] /
+    /// [`Self::average_local_axes`]); ignored in [`GizmoSpace::World`].
+    /// Returns true if it changed `position`/`rotation`/`scale` this frame.
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
@@ -480,6 +542,7 @@ impl TransformGizmo {
         position: &mut CgVec3,
         rotation: &mut CgQuat,
         scale: &mut CgVec3,
+        local_axes: [CgVec3; 3],
     ) -> bool {
         // The same view/projection the model pass renders with, so the gizmo
         // lines up with the actor on screen.
@@ -510,6 +573,10 @@ impl TransformGizmo {
 
         // Sized by camera distance so the gizmo stays constant on screen.
         let world_size = (*position - camera.get_position()).magnitude().max(0.01) * GIZMO_SCALE;
+
+        // The three directions handles are drawn/dragged along this call --
+        // fixed world axes, or (in Local space) the caller-supplied frame.
+        let axes = self.effective_axes(local_axes);
 
         // Background layer: over the 3D scene (all egui painting is) but
         // under the editor panels and menus.
@@ -581,7 +648,7 @@ impl TransformGizmo {
             }
         }
 
-        for (axis, dir) in GIZMO_AXES.iter().enumerate() {
+        for (axis, dir) in axes.iter().enumerate() {
             match self.mode {
                 GizmoMode::Translate => {
                     let Some(tip) = project(*position + *dir * world_size) else {
@@ -643,8 +710,8 @@ impl TransformGizmo {
                 GizmoMode::Rotate => {
                     // Ring in the plane perpendicular to the axis, spanned by
                     // the other two axes.
-                    let u = GIZMO_AXES[(axis + 1) % 3];
-                    let v = GIZMO_AXES[(axis + 2) % 3];
+                    let u = axes[(axis + 1) % 3];
+                    let v = axes[(axis + 2) % 3];
                     let mut points = Vec::with_capacity(49);
                     let mut min_dist = f32::MAX;
                     for i in 0..=48 {

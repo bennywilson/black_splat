@@ -1,5 +1,4 @@
 use std::{collections::HashMap, path::Path, result::Result::Ok};
-use image::GenericImageView;
 use wgpu::ShaderModule;
 
 use crate::{resource::*, log, make_handle, passes::model::*, utils::*};
@@ -73,10 +72,9 @@ make_handle!(Material, MaterialHandle, MaterialMappings);
 /// paths (a missing one falls back to the built-in 1x1 white) plus the
 /// constants each is multiplied by.  `metal_texture` and `rough_texture` are
 /// independent grayscale maps (read from their red channel) -- the material
-/// editor's separate Metallic/Roughness inputs -- packed on load into a single
-/// glTF-layout GPU texture (G = roughness, B = metallic) so the G-buffer
-/// shader only ever samples one combined texture; `mr_constant` is (x
-/// metallic multiplier, y roughness multiplier) -- with no texture the
+/// editor's separate Metallic/Roughness inputs -- each bound to its own slot
+/// in the G-buffer shader; `mr_constant` is (x metallic multiplier, y
+/// roughness multiplier) -- with no texture the built-in white (1.0) lets the
 /// constants pass through as the final PBR values.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct MaterialDesc {
@@ -102,14 +100,15 @@ impl Default for MaterialDesc {
 }
 
 /// A reusable surface description an actor can override its model's textures
-/// with: a color texture and a packed metallic-roughness texture (see
+/// with: a color texture plus independent metallic and roughness textures (see
 /// [`MaterialDesc`]), each multiplied by a constant in the G-buffer shader
 /// (output = texture * constant).  The bind group is laid out identically to
-/// a model's texture bind group (0: color texture, 1: sampler, 2: second
-/// texture), so passes can bind either interchangeably.
+/// a model's texture bind group (0: color texture, 1: sampler, 2: metallic,
+/// 3: roughness), so passes can bind either interchangeably.
 pub struct Material {
     pub color_texture: TextureHandle,
-    pub mr_texture: TextureHandle,
+    pub metal_texture: TextureHandle,
+    pub rough_texture: TextureHandle,
     pub color_constant: CgVec4,
     pub mr_constant: CgVec4,
     pub bind_group: wgpu::BindGroup,
@@ -396,9 +395,7 @@ impl AssetManager {
     // Resolves and reads the raw bytes for `file_path` the same way a texture
     // load does: native prefixes the cwd and special-cases `engine_assets`/
     // `game_assets`; wasm prefers a build-time-baked buffer (keyed by
-    // basename) and falls back to fetching. Shared with texture packing
-    // (see load_metal_rough_texture), which needs to decode bytes on the CPU
-    // rather than hand them straight to a GPU upload.
+    // basename) and falls back to fetching.
     async fn read_asset_bytes(&self, file_path: &str) -> Option<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -728,7 +725,7 @@ impl AssetManager {
 
     /// The built-in 1x1 white texture (created on first use); backs material
     /// slots that have no texture assigned, so constants pass through as-is.
-    fn white_texture(&mut self, device_resources: &DeviceResources<'_>) -> TextureHandle {
+    pub(crate) fn white_texture(&mut self, device_resources: &DeviceResources<'_>) -> TextureHandle {
         if let Some(handle) = self.white_texture {
             return handle;
         }
@@ -784,11 +781,25 @@ impl AssetManager {
         handle
     }
 
+    /// Resolves an optional texture path to a handle, falling back to the
+    /// built-in white 1x1 when absent -- so a slot with no map multiplies its
+    /// constant by 1.0 (the constant passes through unchanged).
+    async fn load_texture_or_white(
+        &mut self,
+        path: Option<&str>,
+        device_resources: &DeviceResources<'_>,
+    ) -> TextureHandle {
+        match path {
+            Some(path) => self.load_texture(path, device_resources).await,
+            None => self.white_texture(device_resources),
+        }
+    }
+
     /// Registers a named material, loading its textures (see [`MaterialDesc`]).
     /// Materials are keyed by name; loading a name again returns the existing
     /// handle.  The bind group mirrors a model's texture bind group layout
-    /// (0: color texture, 1: sampler, 2: packed metal/rough texture), so
-    /// passes can bind a material in place of the model's own textures.
+    /// (0: color texture, 1: sampler, 2: metallic, 3: roughness), so passes can
+    /// bind a material in place of the model's own textures.
     pub async fn load_material(
         &mut self,
         name: &str,
@@ -799,19 +810,23 @@ impl AssetManager {
             return *handle;
         }
 
-        let white = self.white_texture(device_resources);
-        let color_texture = match &desc.color_texture {
-            Some(path) => self.load_texture(path, device_resources).await,
-            None => white,
-        };
-        let mr_texture = self
-            .load_metal_rough_texture(
-                desc.metal_texture.as_deref(),
-                desc.rough_texture.as_deref(),
-                device_resources,
-            )
+        let color_texture = self
+            .load_texture_or_white(desc.color_texture.as_deref(), device_resources)
             .await;
-        self.build_material(name, desc, color_texture, mr_texture, device_resources)
+        let metal_texture = self
+            .load_texture_or_white(desc.metal_texture.as_deref(), device_resources)
+            .await;
+        let rough_texture = self
+            .load_texture_or_white(desc.rough_texture.as_deref(), device_resources)
+            .await;
+        self.build_material(
+            name,
+            desc,
+            color_texture,
+            metal_texture,
+            rough_texture,
+            device_resources,
+        )
     }
 
     /// Synchronous material creation for texture-less (constant-only)
@@ -829,7 +844,7 @@ impl AssetManager {
             return *handle;
         }
         let white = self.white_texture(device_resources);
-        self.build_material(name, desc, white, white, device_resources)
+        self.build_material(name, desc, white, white, white, device_resources)
     }
 
     /// Overwrites a material's color and metallic/roughness constants.  Takes
@@ -858,122 +873,26 @@ impl AssetManager {
         desc: &MaterialDesc,
         device_resources: &DeviceResources<'_>,
     ) {
-        let white = self.white_texture(device_resources);
-        let color_texture = match &desc.color_texture {
-            Some(path) => self.load_texture(path, device_resources).await,
-            None => white,
-        };
-        let mr_texture = self
-            .load_metal_rough_texture(
-                desc.metal_texture.as_deref(),
-                desc.rough_texture.as_deref(),
-                device_resources,
-            )
+        let color_texture = self
+            .load_texture_or_white(desc.color_texture.as_deref(), device_resources)
             .await;
-        let material =
-            self.make_material(name, desc, color_texture, mr_texture, device_resources);
+        let metal_texture = self
+            .load_texture_or_white(desc.metal_texture.as_deref(), device_resources)
+            .await;
+        let rough_texture = self
+            .load_texture_or_white(desc.rough_texture.as_deref(), device_resources)
+            .await;
+        let material = self.make_material(
+            name,
+            desc,
+            color_texture,
+            metal_texture,
+            rough_texture,
+            device_resources,
+        );
         self.material_mappings
             .handles_to_assets
             .insert(*handle, material);
-    }
-
-    /// Loads (or reuses) the packed glTF-layout metallic-roughness texture
-    /// (G = roughness, B = metallic) for a material's independent Metallic/
-    /// Roughness inputs.  Each side is a plain grayscale image (read from its
-    /// red channel); a missing side fills its channel with 255 so its
-    /// constant multiplier passes through unchanged, matching the built-in
-    /// white texture's no-texture behavior.  Cached by the (metal, rough)
-    /// path pair, so re-picking an already-seen combination skips the
-    /// decode/pack.  Mismatched source resolutions are resized to match (the
-    /// larger of the two) rather than left to silently misalign.
-    async fn load_metal_rough_texture(
-        &mut self,
-        metal_path: Option<&str>,
-        rough_path: Option<&str>,
-        device_resources: &DeviceResources<'_>,
-    ) -> TextureHandle {
-        if metal_path.is_none() && rough_path.is_none() {
-            return self.white_texture(device_resources);
-        }
-
-        let cache_key = format!(
-            "<mr>{}|{}",
-            metal_path.unwrap_or(""),
-            rough_path.unwrap_or("")
-        );
-        if let Some(handle) = self.texture_mappings.names_to_handles.get(&cache_key) {
-            return *handle;
-        }
-
-        let metal_img = match metal_path {
-            Some(path) => self
-                .read_asset_bytes(path)
-                .await
-                .and_then(|b| image::load_from_memory(&b).ok()),
-            None => None,
-        };
-        let rough_img = match rough_path {
-            Some(path) => self
-                .read_asset_bytes(path)
-                .await
-                .and_then(|b| image::load_from_memory(&b).ok()),
-            None => None,
-        };
-
-        let Some((width, height)) = metal_img
-            .as_ref()
-            .map(|i| i.dimensions())
-            .or_else(|| rough_img.as_ref().map(|i| i.dimensions()))
-        else {
-            log!("Metal/roughness textures missing/failed to load; using checkerboard");
-            let checker = self.checker_texture(device_resources);
-            self.texture_mappings
-                .names_to_handles
-                .insert(cache_key, checker);
-            return checker;
-        };
-        let to_gray = |img: image::DynamicImage| -> image::GrayImage {
-            if img.dimensions() == (width, height) {
-                img.to_luma8()
-            } else {
-                img.resize_exact(width, height, image::imageops::FilterType::Triangle)
-                    .to_luma8()
-            }
-        };
-        let metal_gray = metal_img.map(to_gray);
-        let rough_gray = rough_img.map(to_gray);
-
-        let mut packed = vec![0u8; (width * height * 4) as usize];
-        for i in 0..(width * height) as usize {
-            packed[i * 4 + 1] = rough_gray.as_ref().map_or(255, |g| g.as_raw()[i]);
-            packed[i * 4 + 2] = metal_gray.as_ref().map_or(255, |g| g.as_raw()[i]);
-            packed[i * 4 + 3] = 255;
-        }
-
-        let Ok(texture) = Texture::from_rgba(
-            &packed,
-            true,
-            width,
-            height,
-            device_resources,
-            Some(&cache_key),
-        ) else {
-            let checker = self.checker_texture(device_resources);
-            self.texture_mappings
-                .names_to_handles
-                .insert(cache_key, checker);
-            return checker;
-        };
-
-        let mappings = &mut self.texture_mappings;
-        if !mappings.next_handle.is_valid() {
-            mappings.next_handle.index = 0;
-        }
-        let handle = mappings.next_handle;
-        mappings.next_handle.index += 1;
-        mappings.handles_to_assets.insert(handle, texture);
-        mappings.names_to_handles.insert(cache_key, handle);
-        handle
     }
 
     // Shared tail of load_material/create_material: builds the bind group
@@ -983,11 +902,18 @@ impl AssetManager {
         name: &str,
         desc: &MaterialDesc,
         color_texture: TextureHandle,
-        mr_texture: TextureHandle,
+        metal_texture: TextureHandle,
+        rough_texture: TextureHandle,
         device_resources: &DeviceResources<'_>,
     ) -> MaterialHandle {
-        let material =
-            self.make_material(name, desc, color_texture, mr_texture, device_resources);
+        let material = self.make_material(
+            name,
+            desc,
+            color_texture,
+            metal_texture,
+            rough_texture,
+            device_resources,
+        );
         let mappings = &mut self.material_mappings;
         if !mappings.next_handle.is_valid() {
             mappings.next_handle.index = 0;
@@ -1009,44 +935,41 @@ impl AssetManager {
         name: &str,
         desc: &MaterialDesc,
         color_texture: TextureHandle,
-        mr_texture: TextureHandle,
+        metal_texture: TextureHandle,
+        rough_texture: TextureHandle,
         device_resources: &DeviceResources<'_>,
     ) -> Material {
         log!("AssetManager loading material {name}");
         let device = &device_resources.device;
+        // A plain texture-binding-layout entry -- the metallic and roughness
+        // slots (2 and 3) are the same shape as the color slot (0).
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            },
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
+                texture_entry(0),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
+                texture_entry(2),
+                texture_entry(3),
             ],
             label: Some("Material::bind_group_layout"),
         });
         let color = self.get_texture(&color_texture);
-        let mr = self.get_texture(&mr_texture);
+        let metal = self.get_texture(&metal_texture);
+        let rough = self.get_texture(&rough_texture);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &layout,
             entries: &[
@@ -1060,7 +983,11 @@ impl AssetManager {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&mr.view),
+                    resource: wgpu::BindingResource::TextureView(&metal.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&rough.view),
                 },
             ],
             label: Some(&format!("Material::{name}")),
@@ -1068,7 +995,8 @@ impl AssetManager {
 
         Material {
             color_texture,
-            mr_texture,
+            metal_texture,
+            rough_texture,
             color_constant: desc.color_constant,
             mr_constant: desc.mr_constant,
             bind_group,

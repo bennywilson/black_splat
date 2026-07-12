@@ -293,6 +293,14 @@ def run_native(example, log, on_proc=None):
     return proc.returncode
 
 
+def clean_wasm(example, log):
+    """`cargo clean` for the wasm target. Returns 0 on success."""
+    ex_dir = os.path.join(EXAMPLES_DIR, example)
+    cmd = ["cargo", "clean", "--target", "wasm32-unknown-unknown"]
+    log(f"$ {' '.join(cmd)}")
+    return stream_step(cmd, ex_dir, log, env=_cargo_env())
+
+
 def run_serve(example, out_dir, tunneled, log, on_proc=None, on_url=None, suppress_terminal_qr=False):
     """Launch serve.py / serve_tunnel.py (this same launcher/ dir) as a
     long-lived process and stream it until it exits or is killed.

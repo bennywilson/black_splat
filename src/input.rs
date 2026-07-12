@@ -169,7 +169,7 @@ impl InputManager {
             } else {
                 *key_pair = ButtonState::None;
             };
-        } else {
+        } else if state == ElementState::Pressed {
             self.key_map.insert(key_name, ButtonState::JustPressed);
         }
         true

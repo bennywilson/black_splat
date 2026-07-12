@@ -130,6 +130,10 @@ def worker(job):
                 log=job.log, on_proc=on_proc, on_url=job.url,
                 suppress_terminal_qr=True,
             )
+        elif job.action == "clean":
+            if build.clean_wasm(example, job.log) != 0:
+                job.set_status("failed")
+                return
         else:
             job.log(f"unknown action: {job.action}")
             job.set_status("failed")
@@ -247,7 +251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/action":
             data = self._body_json()
             example, action = data.get("example"), data.get("action")
-            if example not in PORTS or action not in ("native", "wasm", "tunnel"):
+            if example not in PORTS or action not in ("native", "wasm", "tunnel", "clean"):
                 self._send(400, json.dumps({"error": "bad request"}))
                 return
             start_job(example, action)

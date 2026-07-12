@@ -1111,6 +1111,18 @@ impl<'a> Renderer<'a> {
     /// it loaded (a missing/unreadable file is skipped and returns false).  Call
     /// repeatedly to preload several clouds, then cycle with `set_active_gaussian_splat`.
     pub async fn load_gaussian_splat(&mut self, file_path: &str, params: &SplatParams) -> bool {
+        self.ensure_gaussian_splat_pipeline().await;
+        let splat_pass = self.gaussian_splat_pass.as_mut().unwrap();
+        splat_pass.set_params(params);
+        splat_pass.load(file_path, &self.device_resources).await
+    }
+
+    /// Builds the splat pipeline if it doesn't exist yet. Callers that will
+    /// later need `load_gaussian_splat_from_bytes` (which is sync and can't
+    /// build the pipeline itself) should call this during their own async
+    /// startup, even if no splat is loaded yet -- otherwise the first sync
+    /// load attempt fails with "splat renderer not initialized".
+    pub async fn ensure_gaussian_splat_pipeline(&mut self) {
         if self.gaussian_splat_pass.is_none() {
             self.gaussian_splat_pass = Some(
                 GaussianSplatPass::new(&self.device_resources, &mut self.asset_manager)
@@ -1120,9 +1132,6 @@ impl<'a> Renderer<'a> {
                 SplatCompositePass::new(&self.device_resources, &mut self.asset_manager).await,
             );
         }
-        let splat_pass = self.gaussian_splat_pass.as_mut().unwrap();
-        splat_pass.set_params(params);
-        splat_pass.load(file_path, &self.device_resources).await
     }
 
     /// Parses an in-memory splat .ply (e.g. one the user picked at runtime) and

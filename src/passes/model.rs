@@ -153,13 +153,28 @@ impl Model {
                         },
                         count: None,
                     },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("Model::texture_bind_group_layout"),
             });
 
         let mut textures = Vec::<TextureHandle>::new();
         textures.push(*texture_handle);
+        // Resolve the built-in white (a &mut borrow) before the shared texture
+        // borrows below. Bound to the metallic/roughness slots (2 and 3) so
+        // this model reads as constant-only PBR through the G-buffer shader.
+        let white_handle = asset_manager.white_texture(device_resources);
         let texture = asset_manager.get_texture(&textures[0]);
+        let white = asset_manager.get_texture(&white_handle);
 
         let tex_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
@@ -174,7 +189,11 @@ impl Model {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&texture.view),
+                    resource: wgpu::BindingResource::TextureView(&white.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
                 },
             ],
             label: Some("Model::tex_bind_group"),
@@ -365,14 +384,27 @@ impl Model {
                         },
                         count: None,
                     },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("Model_texture_bind_group_layout"),
             });
 
-        // Resolve the built-in checkerboard up front (a &mut borrow of the
-        // asset manager) so that borrow is released before we take the shared
-        // &Texture below. It's cheap after the first call (cached).
+        // Resolve the built-in checkerboard and white up front (a &mut borrow of
+        // the asset manager) so those borrows are released before we take the
+        // shared &Texture below. Cheap after the first call (cached). White backs
+        // the metallic/roughness slots so an untextured model reads as
+        // constant-only PBR through the G-buffer shader.
         let checker_handle = asset_manager.checker_texture(device_resources);
+        let white_handle = asset_manager.white_texture(device_resources);
 
         // Follow the material's baseColorTexture -> texture -> image chain to
         // pick the *correct* embedded image. Blindly using gltf_images[0] binds
@@ -431,11 +463,17 @@ impl Model {
             }
         };
 
+        let white = asset_manager.get_texture(&white_handle);
+
         let mut surface_config = device_resources.surface_config.clone();
         surface_config.width = 1024;
         surface_config.height = 1024;
         let mut hole_texture = None; //
-        let mut tex_2_bind = wgpu::BindingResource::TextureView(&texture.view);
+        // Binding 2 is the metallic slot for the G-buffer shader (white =
+        // constant passes through), but the bullet-hole forward shader
+        // (model_with_holes.wgsl) samples this same slot as its hole mask -- so
+        // with holes it takes the hole render texture instead.
+        let mut tex_2_bind = wgpu::BindingResource::TextureView(&white.view);
         if use_holes {
             hole_texture = Some(
                 Texture::new_render_texture(
@@ -462,6 +500,10 @@ impl Model {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: tex_2_bind,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
                 },
             ],
             label: Some("Model::tex_bind_group"),
@@ -633,6 +675,16 @@ impl ModelPass {
                     },
                     BindGroupLayoutEntry {
                         binding: 2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 3,
                         visibility: ShaderStages::FRAGMENT,
                         ty: BindingType::Texture {
                             multisampled: false,
