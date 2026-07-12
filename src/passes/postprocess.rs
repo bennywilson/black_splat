@@ -2,6 +2,80 @@ use wgpu::util::DeviceExt;
 
 use crate::{assets::*, resource::*};
 
+/// Post-process / tonemap settings for the scene.  The tonemap curve is
+/// `y = (x(Ax+B)) / (x(Cx+D)+E)` applied to linear radiance after an `exposure`
+/// multiply; the postprocess pass runs it, and the gaussian-splat pass pre-applies
+/// its exact inverse so display-referred splats survive it unchanged.
+///
+/// The five curve params are kept *invertible* by [`enforce_invertible`], which
+/// the editor calls after every edit:
+///   * `A*D >= B*C` (highlight_scale*midtone_curve >= midtone_scale*highlight_curve)
+///     keeps the curve monotonic.  Otherwise it rolls over past a peak and the
+///     inverse grabs the wrong branch -- the "bad values when midtone is high".
+///   * `A/C >= 1` (highlight_scale/highlight_curve) keeps display white reachable,
+///     so every value in [0,1] has an inverse.
+///
+/// [`enforce_invertible`]: PostProcessSettings::enforce_invertible
+#[derive(Clone, Copy, Debug)]
+pub struct PostProcessSettings {
+    pub tonemap_enabled: bool,
+    pub exposure: f32,
+    pub highlight_scale: f32, // A
+    pub midtone_scale: f32,   // B
+    pub highlight_curve: f32, // C
+    pub midtone_curve: f32,   // D
+    pub shadow_offset: f32,   // E
+}
+
+impl Default for PostProcessSettings {
+    fn default() -> Self {
+        // Narkowicz 2015 ACES filmic constants -- already invertible
+        // (A*D = 1.48 >= B*C = 0.073, and A/C = 1.033 >= 1).
+        Self {
+            tonemap_enabled: true,
+            exposure: 1.0,
+            highlight_scale: 2.51,
+            midtone_scale: 0.03,
+            highlight_curve: 2.43,
+            midtone_curve: 0.59,
+            shadow_offset: 0.14,
+        }
+    }
+}
+
+impl PostProcessSettings {
+    /// Nudges the curve params back into the invertible region (see the struct
+    /// docs) so the midtone knob can't push the curve non-monotonic.  Raises
+    /// `midtone_curve` (D) to satisfy `A*D >= B*C` and `highlight_scale` (A) to
+    /// satisfy `A/C >= 1` -- the least-surprising nudges, since both only ever
+    /// *increase* a value the user pushed too far relative to the others.
+    pub fn enforce_invertible(&mut self) {
+        // Keep everything positive / non-degenerate first.
+        self.highlight_scale = self.highlight_scale.max(1e-3);
+        self.highlight_curve = self.highlight_curve.max(1e-3);
+        self.shadow_offset = self.shadow_offset.max(1e-4);
+        self.midtone_scale = self.midtone_scale.max(0.0);
+        self.midtone_curve = self.midtone_curve.max(0.0);
+        self.exposure = self.exposure.max(1e-3);
+
+        // A/C >= 1: display white is reachable.
+        self.highlight_scale = self.highlight_scale.max(self.highlight_curve);
+        // A*D >= B*C: curve stays monotonic (single-valued inverse).
+        let min_midtone_curve = self.midtone_scale * self.highlight_curve / self.highlight_scale;
+        self.midtone_curve = self.midtone_curve.max(min_midtone_curve);
+    }
+}
+
+crate::editor_properties!(PostProcessSettings {
+    tonemap_enabled: bool("Tonemap Enabled"),
+    exposure: float("Exposure"),
+    highlight_scale: float("Highlight Scale"),
+    midtone_scale: float("Midtone Scale"),
+    highlight_curve: float("Highlight Curve"),
+    midtone_curve: float("Midtone Curve"),
+    shadow_offset: float("Shadow Offset"),
+});
+
 pub struct PostprocessPass {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
@@ -12,7 +86,7 @@ pub struct PostprocessPass {
     pub bind_group: wgpu::BindGroup,
     pub postprocess_tex_handle: TextureHandle,
     pub scene_sampler: wgpu::Sampler,
-    pub tonemap_enabled: bool,
+    pub settings: PostProcessSettings,
 }
 
 impl PostprocessPass {
@@ -203,7 +277,7 @@ impl PostprocessPass {
             index_buffer,
             postprocess_tex_handle,
             scene_sampler,
-            tonemap_enabled: false,
+            settings: PostProcessSettings::default(),
         }
     }
 
@@ -270,9 +344,19 @@ impl PostprocessPass {
             } else {
                 1.0
             };
-        // ACES tonemap toggle (applied in linear space before the sRGB encode).
+        // Tonemap toggle + curve params (applied in linear space before the
+        // sRGB encode; the splat pass pre-applies the exact inverse of this same
+        // curve so display-referred splats pass through unchanged).
+        let s = &self.settings;
         self.postprocess_uniform.time_mode_srgb_tonemap[3] =
-            if self.tonemap_enabled { 1.0 } else { 0.0 };
+            if s.tonemap_enabled { 1.0 } else { 0.0 };
+        self.postprocess_uniform.tonemap_abcd = [
+            s.highlight_scale,
+            s.midtone_scale,
+            s.highlight_curve,
+            s.midtone_curve,
+        ];
+        self.postprocess_uniform.tonemap_e_exposure = [s.shadow_offset, s.exposure, 0.0, 0.0];
 
         device_resources.queue.write_buffer(
             &self.uniform_buffer,

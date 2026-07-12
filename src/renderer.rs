@@ -11,7 +11,7 @@ use crate::{
     log,
     passes::{
         bullet_hole::*, deferred::*, gaussian_splat::*, line::*, model::*,
-        postprocess::*, sprite::*, sunbeam::*,
+        postprocess::*, splat_composite::*, sprite::*, sunbeam::*,
     },
     PERF_SCOPE,
 };
@@ -49,6 +49,10 @@ pub struct Renderer<'a> {
     // buffers in the vertex stage, which WebGL2 can't do, so we must not create it
     // for the GL-backed 2D/3D demos.
     gaussian_splat_pass: Option<GaussianSplatPass>,
+    // Converts the splat pass's display-space composite into the linear HDR scene
+    // (see splat_composite.wgsl).  Built alongside gaussian_splat_pass -- no
+    // splats, no need for it.
+    splat_composite_pass: Option<SplatCompositePass>,
     // In-engine GUI (egui).  The context is shared with the host loop's
     // egui-winit State (which feeds it window input); games build widgets
     // against it during tick_frame, and render_frame paints the tessellated
@@ -198,6 +202,7 @@ impl<'a> Renderer<'a> {
             line_pass,
             sunbeam_pass,
             gaussian_splat_pass: None,
+            splat_composite_pass: None,
             egui_ctx,
             egui_renderer,
             egui_pass_active: false,
@@ -670,12 +675,24 @@ impl<'a> Renderer<'a> {
         // against the depth those passes wrote (without writing it), so 3D
         // geometry occludes them, and everything transparent below (lines,
         // particles, sunbeams) composites on top.  A future PBR opaque pass
-        // just needs to render above this point.
+        // just needs to render above this point.  The splat pass renders into
+        // its own scratch buffer in display space; SplatCompositePass converts
+        // the finished composite into the linear HDR scene right after, so the
+        // nonlinear sRGB/tonemap-inverse conversion runs once instead of
+        // distorting the multi-splat blend (see splat_composite.wgsl).
         let mut splats_rendered = false;
+        // Keep the composite pass's tonemap params in lockstep with the
+        // postprocess pass (covers the pass being built lazily after settings
+        // were set).
+        let pp_settings = self.postprocess_pass.settings;
         if let Some(splat_pass) = &mut self.gaussian_splat_pass {
             if splat_pass.has_model() {
                 PERF_SCOPE!("Gaussian Splats");
                 splat_pass.render(&mut ctx);
+                if let Some(composite_pass) = &mut self.splat_composite_pass {
+                    composite_pass.settings = pp_settings;
+                    composite_pass.render(&mut ctx);
+                }
                 splats_rendered = true;
             }
         }
@@ -819,7 +836,10 @@ impl<'a> Renderer<'a> {
         {
             lighting_pass.resize(&self.device_resources, shadow_pass);
         }
-        self.sunbeam_pass.resize(&mut self.device_resources, &self.asset_manager)
+        self.sunbeam_pass.resize(&mut self.device_resources, &self.asset_manager);
+        if let Some(composite_pass) = self.splat_composite_pass.as_mut() {
+            composite_pass.resize(&self.device_resources);
+        }
     }
 
     pub fn window_id(&self) -> winit::window::WindowId {
@@ -1096,6 +1116,9 @@ impl<'a> Renderer<'a> {
                 GaussianSplatPass::new(&self.device_resources, &mut self.asset_manager)
                     .await,
             );
+            self.splat_composite_pass = Some(
+                SplatCompositePass::new(&self.device_resources, &mut self.asset_manager).await,
+            );
         }
         let splat_pass = self.gaussian_splat_pass.as_mut().unwrap();
         splat_pass.set_params(params);
@@ -1319,9 +1342,22 @@ impl<'a> Renderer<'a> {
         self.active_particles
     }
 
-    /// Enables the ACES tonemap applied in the postprocess pass.
+    /// Enables the tonemap applied in the postprocess pass.  Kept in sync
+    /// with the splat pass (which inverts the same curve) by `render`.
     pub fn set_tonemap_enabled(&mut self, enabled: bool) {
-        self.postprocess_pass.tonemap_enabled = enabled;
+        self.postprocess_pass.settings.tonemap_enabled = enabled;
+    }
+
+    /// Sets the full scene post-process/tonemap settings.  The same curve is
+    /// pushed to the gaussian-splat pass each frame in `render` so splats
+    /// pre-apply its exact inverse and survive the tonemap unchanged.
+    pub fn set_post_process_settings(&mut self, settings: &PostProcessSettings) {
+        self.postprocess_pass.settings = *settings;
+    }
+
+    /// The current scene post-process/tonemap settings.
+    pub fn post_process_settings(&self) -> PostProcessSettings {
+        self.postprocess_pass.settings
     }
 
     pub async fn add_sprite_pass(

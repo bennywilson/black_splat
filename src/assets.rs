@@ -164,6 +164,10 @@ impl AssetManager {
             "gaussian_splat_radix.wgsl".to_string(),
             include_str!("../engine_assets/shaders/gaussian_splat_radix.wgsl").to_string(),
         );
+        file_to_string_buffer.insert(
+            "splat_composite.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/splat_composite.wgsl").to_string(),
+        );
         file_to_byte_buffer.insert(
             "scorch_t.png".to_string(),
             include_bytes!("../engine_assets/textures/scorch_t.png").to_vec(),

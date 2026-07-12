@@ -194,5 +194,8 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
     let output_alpha = clamp(input.color.a * falloff, 0.0, 1.0);
     let out_color = clamp(((input.color.rgb - 0.5) * u.splat_params.z) + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
 
+    // Splats are alpha-blended among themselves here in display space (matching
+    // the reference 3DGS look).  The splat_composite pass converts the finished
+    // composite into the linear HDR scene once (see splat_composite.wgsl).
     return vec4<f32>(out_color, output_alpha);
 }

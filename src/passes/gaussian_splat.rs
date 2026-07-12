@@ -453,7 +453,6 @@ impl GaussianSplatPass {
     ) -> Self {
         log!("Creating GaussianSplatPass");
         let device = &device_resources.device;
-        let surface_config = &device_resources.surface_config;
 
         let shader_handle = asset_manager
             .load_shader("/engine_assets/shaders/gaussian_splat.wgsl", device_resources)
@@ -538,7 +537,7 @@ impl GaussianSplatPass {
                 module: shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1101,12 +1100,18 @@ impl GaussianSplatPass {
         {
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Gaussian Splats"),
+                // Renders into its own scratch buffer (render_textures[2]), not the
+                // shared scene color: splats alpha-blend among themselves here in
+                // display space (the reference 3DGS look), and SplatCompositePass
+                // converts the finished composite into the linear HDR scene once,
+                // right after this pass runs -- see splat_composite.wgsl for why
+                // that has to happen on the composite rather than per fragment.
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &device_resources.render_textures[0].view,
+                    view: &device_resources.render_textures[2].view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

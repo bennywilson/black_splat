@@ -176,8 +176,13 @@ pub struct SpriteUniform {
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PostProcessUniform {
     // x: time, y: postprocess mode, z: 1.0 when the surface is non-sRGB (encode
-    // in-shader), w: 1.0 to apply the ACES tonemap.
+    // in-shader), w: 1.0 to apply the tonemap.
     pub time_mode_srgb_tonemap: [f32; 4],
+    // Tonemap curve params: x HighlightScale (A), y MidtoneScale (B),
+    // z HighlightCurve (C), w MidtoneCurve (D).  See postprocess_uber.wgsl.
+    pub tonemap_abcd: [f32; 4],
+    // x ShadowOffset (E), y exposure (pre-tonemap multiply), z/w unused.
+    pub tonemap_e_exposure: [f32; 4],
 }
 
 #[allow(dead_code)]
@@ -237,19 +242,15 @@ impl Texture {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        // Always render the offscreen scene into an sRGB target so alpha
-        // blending happens in linear space (the hardware decodes/encodes).
-        // On native the surface is already sRGB so this is a no-op; on web
-        // Chrome's canvas is non-sRGB `Bgra8Unorm`, and without this the
-        // scene would blend in gamma space -- making stacked transparent
-        // splats composite far too dark.  The postprocess pass converts back
-        // to the (possibly non-sRGB) surface on present.
-        Self::new_render_texture_with_format(
-            device,
-            surface_config.format.add_srgb_suffix(),
-            width,
-            height,
-        )
+        // The offscreen scene is a linear HDR float target (`SCENE_COLOR_FORMAT`).
+        // Storing linear radiance means alpha blending happens in linear space
+        // directly (no sRGB decode/encode round-trip needed), and lets lighting
+        // push values >1 for the tonemapper to compress.  Gaussian splats are
+        // display-referred, so they write `inverse_tonemap(srgb_to_linear(gs))`
+        // to sit in the same linear space (see gaussian_splat.wgsl); the final
+        // postprocess pass tonemaps + sRGB-encodes onto the surface on present.
+        let _ = surface_config;
+        Self::new_render_texture_with_format(device, SCENE_COLOR_FORMAT, width, height)
     }
 
     /// A render target in an explicit format -- used for the G-buffer's
@@ -481,6 +482,14 @@ pub struct RenderContext<'ctx, 'dev> {
 /// both renderable on every backend (no float-target extensions needed).
 pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 pub const GBUFFER_SPEC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Format of the offscreen scene color target (`render_textures[0]` and the
+/// `[2]` scratch).  Linear HDR float so lighting can exceed 1.0 and the
+/// postprocess tonemap has real range to compress; `Rgba16Float` is
+/// filterable on every backend (including WebGPU), so the upscale/bloom samplers
+/// work without a device feature.  Every pass that draws into the scene color
+/// must declare this as its color-target format.
+pub const SCENE_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Screen-space shadow masks (per-light temp + the multiplied accumulation
 /// texture the Gaussian-splat overlay reads): single-channel, 1 = fully lit.
 pub const SHADOW_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
@@ -510,7 +519,16 @@ impl<'a> DeviceResources<'a> {
         height: u32,
     ) -> Vec<Texture> {
         vec![
-            Texture::new_render_texture(device, surface_config, width, height).unwrap(),
+            // Albedo: display-referred [0,1] color, kept as an sRGB 8-bit target
+            // (it doesn't need the scene color's HDR float range).  Its format
+            // must match the GBufferPass pipeline's target[0] (deferred.rs).
+            Texture::new_render_texture_with_format(
+                device,
+                surface_config.format.add_srgb_suffix(),
+                width,
+                height,
+            )
+            .unwrap(),
             Texture::new_render_texture_with_format(
                 device,
                 GBUFFER_NORMAL_FORMAT,

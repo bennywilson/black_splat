@@ -967,7 +967,7 @@ impl ShadowPass {
                 module: overlay_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: device_resources.surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(overlay_blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1772,7 +1772,6 @@ impl LightingPass {
     ) -> Self {
         log!("Creating LightingPass");
         let device = &device_resources.device;
-        let surface_config = &device_resources.surface_config;
 
         // G-buffer inputs: albedo / normal / metallic-roughness / depth read
         // with textureLoad, plus the current light's screen-space shadow mask.
@@ -1923,7 +1922,7 @@ impl LightingPass {
                     module: shader,
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_config.format.add_srgb_suffix(),
+                        format: crate::resource::SCENE_COLOR_FORMAT,
                         blend: Some(additive),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],

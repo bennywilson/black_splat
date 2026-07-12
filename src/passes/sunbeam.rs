@@ -60,7 +60,6 @@ impl SunbeamPass {
         asset_manager: &mut AssetManager,
     ) -> Self {
         let device = &device_resources.device;
-        let surface_config = &device_resources.surface_config;
 
         // Post Process Pipeline
         let mask_shader_handle = asset_manager
@@ -119,7 +118,7 @@ impl SunbeamPass {
                 module: mask_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -242,7 +241,7 @@ impl SunbeamPass {
                 module: draw_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(additive_blend_state),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

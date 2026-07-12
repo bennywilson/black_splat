@@ -10,6 +10,7 @@ use black_splat::{
     utils::*, log,
     passes::deferred::ShadowSettings,
     passes::gaussian_splat::SplatParams,
+    passes::postprocess::PostProcessSettings,
 };
 
 use crate::editor_config::{self, EditorConfig, GIZMO_ACTIONS};
@@ -437,6 +438,9 @@ enum Selection {
     Light(usize),
     Particle(usize),
     Splat(usize),
+    // The scene-wide post-process settings.  A singleton (no index): one per
+    // scene for now, though it is shaped to become a per-volume list later.
+    PostProcess,
 }
 
 /// What the "Add" menu asked to create this frame (applied after the egui pass).
@@ -495,6 +499,51 @@ struct SceneFile {
     particles: Vec<ParticleDto>,
     #[serde(default)]
     splats: Vec<SplatDto>,
+    // Scene-wide post-process / tonemap.  Absent in scenes saved before it
+    // existed -- those keep the running settings on load.
+    #[serde(default)]
+    post_process: Option<PostProcessDto>,
+}
+
+/// Serialized scene-wide post-process / tonemap settings (see PostProcessSettings).
+#[derive(Serialize, Deserialize)]
+struct PostProcessDto {
+    tonemap_enabled: bool,
+    exposure: f32,
+    highlight_scale: f32,
+    midtone_scale: f32,
+    highlight_curve: f32,
+    midtone_curve: f32,
+    shadow_offset: f32,
+}
+
+impl PostProcessDto {
+    fn from_settings(s: &PostProcessSettings) -> Self {
+        Self {
+            tonemap_enabled: s.tonemap_enabled,
+            exposure: s.exposure,
+            highlight_scale: s.highlight_scale,
+            midtone_scale: s.midtone_scale,
+            highlight_curve: s.highlight_curve,
+            midtone_curve: s.midtone_curve,
+            shadow_offset: s.shadow_offset,
+        }
+    }
+
+    fn to_settings(&self) -> PostProcessSettings {
+        let mut s = PostProcessSettings {
+            tonemap_enabled: self.tonemap_enabled,
+            exposure: self.exposure,
+            highlight_scale: self.highlight_scale,
+            midtone_scale: self.midtone_scale,
+            highlight_curve: self.highlight_curve,
+            midtone_curve: self.midtone_curve,
+            shadow_offset: self.shadow_offset,
+        };
+        // A hand-edited file could carry a non-invertible curve; snap it back.
+        s.enforce_invertible();
+        s
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -642,6 +691,7 @@ fn default_startup_scene() -> SceneFile {
             rotation: ident_quat(),
             scale: ones3(),
         }],
+        post_process: None,
     }
 }
 
@@ -1104,6 +1154,11 @@ pub struct SplatGame {
     // Preloaded particle-preset textures, as (texture path, handle), so presets
     // can be spawned synchronously from the tick (see PARTICLE_PRESETS).
     particle_textures: Vec<(String, TextureHandle)>,
+    // Scene-wide post-process / tonemap settings -- the singleton "Post Process"
+    // scene object.  Pushed to the renderer each frame; the splat pass inverts
+    // the same curve so display-referred splats survive the tonemap.  A list of
+    // these (blended per volume) is the eventual shape.
+    scene_post_process: PostProcessSettings,
     // Scene-tab selection (actor / light / particle), if any.
     selected: Option<Selection>,
     // Ctrl+click multi-selection, in click order (`selected` is its last
@@ -1352,6 +1407,7 @@ impl SplatGame {
             Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_name().to_string()),
             Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.name.clone()),
             Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.name.clone()),
+            Selection::PostProcess => Some("Post Process".to_string()),
         }
     }
 
@@ -1362,6 +1418,8 @@ impl SplatGame {
             Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_position()),
             Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.position),
             Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.transform.position),
+            // The post-process singleton has no world position.
+            Selection::PostProcess => None,
         }
     }
 
@@ -1395,6 +1453,7 @@ impl SplatGame {
                     }
                 }
             }
+            Selection::PostProcess => {}
         }
     }
 
@@ -1458,6 +1517,7 @@ impl SplatGame {
                     }
                 }
             }
+            Selection::PostProcess => {}
         }
     }
 
@@ -1483,6 +1543,7 @@ impl SplatGame {
                 .scene_splats
                 .get(i)
                 .map(|s| (s.transform.position, 4.0)),
+            Selection::PostProcess => None,
         }
     }
 
@@ -1635,6 +1696,8 @@ impl SplatGame {
             // Splats have no delete button in the outliner, so this is never
             // reached; unloading a cloud from the renderer isn't supported yet.
             Selection::Splat(_) => return,
+            // The post-process singleton is always present; it can't be deleted.
+            Selection::PostProcess => return,
         }
         self.selected = selection_after_delete(self.selected, sel);
         // Deleting shifts indices; drop the multi-selection rather than remap.
@@ -1893,6 +1956,7 @@ impl SplatGame {
                     scale: vec3_arr(s.transform.scale),
                 })
                 .collect(),
+            post_process: Some(PostProcessDto::from_settings(&self.scene_post_process)),
         }
     }
 
@@ -1977,6 +2041,10 @@ impl SplatGame {
         self.context_menu = None;
         self.confirm_delete = None;
         self.name_edit = None;
+        // A fresh scene starts from the default tonemap; a loaded scene overrides
+        // it in apply_scene_objects.
+        self.scene_post_process = PostProcessSettings::default();
+        renderer.set_post_process_settings(&self.scene_post_process);
     }
 
     /// Rebuilds the editable scene objects (actors / lights / particles +
@@ -2045,6 +2113,13 @@ impl SplatGame {
             self.game_camera.set_rotation(&arr_vec3(camera.rotation));
             renderer.set_camera(&self.game_camera);
         }
+
+        // Scene-wide post-process (absent in scenes saved before it existed:
+        // keep the running settings so those scenes look unchanged).
+        if let Some(pp) = &scene.post_process {
+            self.scene_post_process = pp.to_settings();
+        }
+        renderer.set_post_process_settings(&self.scene_post_process);
     }
 
     /// The world transform a splat DTO describes (scale collapsed to uniform).
@@ -2193,6 +2268,7 @@ impl GameEngine for SplatGame {
             scene_actors: Vec::new(),
             scene_lights: Vec::new(),
             scene_particles: Vec::new(),
+            scene_post_process: PostProcessSettings::default(),
             particle_textures: Vec::new(),
             selected: None,
             multi_selected: Vec::new(),
@@ -3125,6 +3201,21 @@ impl GameEngine for SplatGame {
                                 ui.set_width(PANEL_WIDTH);
                                 match active_tab {
                                     EditorTab::Scene => {
+                                        // Always-present scene-wide post-process
+                                        // object (tonemap curve + exposure).
+                                        {
+                                            let is_selected =
+                                                self.selected == Some(Selection::PostProcess);
+                                            if ui
+                                                .selectable_label(is_selected, "⚙ Post Process")
+                                                .on_hover_text("Scene tonemap + exposure")
+                                                .clicked()
+                                            {
+                                                select_object =
+                                                    Some((Selection::PostProcess, false));
+                                            }
+                                        }
+                                        ui.separator();
                                         ui.horizontal(|ui| {
                                             ui.label(egui::RichText::new("Splats").strong());
                                             if ui
@@ -3312,6 +3403,27 @@ impl GameEngine for SplatGame {
                                                     &mut model_pick_request,
                                                 );
                                             }
+                                        }
+                                        Some(Selection::PostProcess) => {
+                                            ui.label(
+                                                egui::RichText::new("Post Process").strong(),
+                                            );
+                                            ui.separator();
+                                            let changed = editor::draw_properties(
+                                                ui,
+                                                &mut self.scene_post_process,
+                                                &model_catalog,
+                                                &material_resources,
+                                                selected_model,
+                                                &mut model_pick_request,
+                                            );
+                                            if changed {
+                                                // Keep the curve invertible so the
+                                                // splat inverse stays well-defined
+                                                // (bad values when midtone is high).
+                                                self.scene_post_process.enforce_invertible();
+                                            }
+                                            selection_edited |= changed;
                                         }
                                         None => {
                                             ui.label("Nothing selected.");
@@ -3877,6 +3989,7 @@ impl GameEngine for SplatGame {
                         let u = s.transform.scale.x;
                         (s.transform.position, s.transform.rotation, CgVec3::new(u, u, u))
                     }),
+                    Selection::PostProcess => None,
                 };
                 if let Some((mut position, mut rotation, mut scale)) = current {
                     if self.gizmo.ui(
@@ -3926,6 +4039,7 @@ impl GameEngine for SplatGame {
                                     s.transform.scale = CgVec3::new(u, u, u);
                                 }
                             }
+                            Selection::PostProcess => {}
                         }
                         selection_edited = true;
                     }
@@ -4274,6 +4388,9 @@ impl GameEngine for SplatGame {
                         renderer.set_gaussian_splat_transform(&splat.transform);
                     }
                 }
+                Some(Selection::PostProcess) => {
+                    renderer.set_post_process_settings(&self.scene_post_process);
+                }
                 _ => {}
             }
         }
@@ -4496,10 +4613,21 @@ impl GameEngine for SplatGame {
             self.frame_selected();
         }
 
+        // The [Space]/[L] shortcuts below read the keyboard directly (via
+        // input_manager, bypassing egui), so -- like the gizmo and 1-9 param
+        // keys -- they must ignore key presses while a text field has focus or a
+        // rebind is in progress.  Otherwise typing an "l" into a rename box
+        // (e.g. "Wall", "Pillar", "Floor") pops the .ply file dialog, and a
+        // space cycles the active splat.
+        let raw_hotkeys_ok = self.rebinding.is_none() && !ctx.egui_wants_keyboard_input();
+
         // Cycle to the next loaded splat cloud ([Space]), applying its params.
         // If a splat is the current selection, keep the selection on the newly
         // shown cloud so Details follows it.
-        if input_manager.get_key_state("space").just_pressed() && !self.scene_splats.is_empty() {
+        if raw_hotkeys_ok
+            && input_manager.get_key_state("space").just_pressed()
+            && !self.scene_splats.is_empty()
+        {
             let next = (self.active_splat + 1) % self.scene_splats.len();
             self.activate_splat(next, renderer);
             if matches!(self.selected, Some(Selection::Splat(_))) {
@@ -4509,7 +4637,7 @@ impl GameEngine for SplatGame {
 
         // Load a user .ply ([L] or the GUI button): opens the async file picker,
         // whose result arrives via `picked_ply` on a later tick.
-        if do_load || input_manager.get_key_state("l").just_pressed() {
+        if do_load || (raw_hotkeys_ok && input_manager.get_key_state("l").just_pressed()) {
             self.open_ply_picker();
         }
         let picked = self.picked_ply.lock().unwrap().take();

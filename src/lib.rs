@@ -31,6 +31,7 @@ pub mod passes {
     pub mod line;
     pub mod model;
     pub mod postprocess;
+    pub mod splat_composite;
     pub mod sprite;
     pub mod sunbeam;
 }

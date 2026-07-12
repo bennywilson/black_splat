@@ -577,7 +577,6 @@ impl ModelPass {
     ) -> Self {
         log!("Creating ModelPass with shader {shader_path}");
         let device = &device_resources.device;
-        let surface_config = &device_resources.surface_config;
 
         // Uniform buffer
         let uniform = ModelUniform {
@@ -702,7 +701,7 @@ impl ModelPass {
                 module: model_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend,
                     write_mask,
                 })],
@@ -750,7 +749,7 @@ impl ModelPass {
                 module: particle_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -803,7 +802,7 @@ impl ModelPass {
                 module: particle_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(additive_blend_state),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
