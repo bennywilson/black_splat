@@ -15,25 +15,23 @@ prints the URL.
 
 Usage: python3 serve_tunnel.py <directory> [port]
 """
-import functools
 import os
 import re
 import shutil
-import socketserver
 import subprocess
 import sys
 import threading
 
-from serve import NoCacheHandler  # reuse the no-cache request handler
+from serve import make_server  # reuse the no-cache server + port reclaim
 
 PORT = 8000
 URL_RE = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 
 
 def start_server(directory, port):
-    handler = functools.partial(NoCacheHandler, directory=directory)
-    # ("", port) binds all interfaces, so plain LAN http keeps working too.
-    httpd = socketserver.TCPServer(("", port), handler)
+    # make_server binds all interfaces (LAN http keeps working) and reclaims the
+    # port from a stale instance first (or exits with a hint if it's not ours).
+    httpd = make_server(directory, port)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 

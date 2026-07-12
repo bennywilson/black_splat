@@ -23,9 +23,9 @@ const TEXTURES_DIR: &str = "game_assets/textures";
 const FX_DIR: &str = "game_assets/fx";
 #[cfg(not(target_arch = "wasm32"))]
 const MODELS_DIR: &str = "game_assets/models";
-#[cfg(not(target_arch = "wasm32"))]
+// Not gated: the wasm scan also classifies IndexedDB keys by these (see the
+// wasm `scan`), so a model's own texture maps aren't listed as models.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg"];
-#[cfg(not(target_arch = "wasm32"))]
 const MODEL_EXTS: &[&str] = &["glb", "gltf"];
 
 /// One material on disk: a display name plus its full description.
@@ -135,33 +135,43 @@ mod imp {
     }
 
     /// Relative paths of every image the editor offers as a texture resource:
-    /// imports under game_assets/textures/ plus the bundled fx textures.
+    /// imports under game_assets/textures/, the bundled fx textures, and any
+    /// model's own source maps (e.g. game_assets/models/Barrel/*.jpg), so a
+    /// per-asset folder's textures show up in the browser next to its model.
+    /// Recurses like `scan_models`, since those per-asset folders nest.
     /// (async only to share a signature with the wasm build, which reads a
     /// manifest + IndexedDB; native just walks the folders.)
     pub async fn scan_textures() -> Vec<String> {
         let mut out = Vec::new();
-        for dir in [TEXTURES_DIR, FX_DIR] {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_image = path
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map_or(false, |ext| {
-                        IMAGE_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
-                    });
-                if is_image {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        out.push(format!("{dir}/{name}"));
-                    }
-                }
-            }
+        for dir in [TEXTURES_DIR, FX_DIR, MODELS_DIR] {
+            collect_images(Path::new(dir), &mut out);
         }
         out.sort();
         out.dedup();
         out
+    }
+
+    fn collect_images(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // Missing folder just means an empty library.
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_images(&path, out);
+                continue;
+            }
+            let is_image = path
+                .extension()
+                .and_then(|x| x.to_str())
+                .map_or(false, |ext| {
+                    IMAGE_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
+                });
+            if is_image {
+                // Forward slashes so paths match the wasm manifest / load keys.
+                out.push(path.to_string_lossy().replace('\\', "/"));
+            }
+        }
     }
 
     /// Copies an imported image into game_assets/textures/ and returns the
@@ -323,11 +333,25 @@ mod imp {
         }
     }
 
-    // Stored keys under any of `prefixes`, unioned with `bundled`, deduped.
-    async fn scan(bundled: Vec<String>, prefixes: &[&str]) -> Vec<String> {
+    /// Whether `path`'s extension is one of `exts` (case-insensitive).
+    fn has_ext(path: &str, exts: &[&str]) -> bool {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map_or(false, |ext| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+    }
+
+    // Stored keys under any of `prefixes` whose extension is in `exts`, unioned
+    // with `bundled`, deduped.  The extension gate is essential: load_binary
+    // caches every fetched asset into IndexedDB keyed by its full path, and a
+    // model's own texture maps live under the same game_assets/models/ prefix
+    // as the .glb -- so matching on prefix alone would list a model's cached
+    // textures as models (and cached models as textures) on the next launch.
+    // Mirrors build.py's by-extension manifest classification.
+    async fn scan(bundled: Vec<String>, prefixes: &[&str], exts: &[&str]) -> Vec<String> {
         let mut out = bundled;
         for key in black_splat::idb::keys().await {
-            if prefixes.iter().any(|p| key.starts_with(p)) {
+            if prefixes.iter().any(|p| key.starts_with(p)) && has_ext(&key, exts) {
                 out.push(key);
             }
         }
@@ -339,13 +363,19 @@ mod imp {
     pub async fn scan_textures() -> Vec<String> {
         scan(
             load_manifest().await.textures,
-            &["game_assets/textures/", "game_assets/fx/"],
+            &["game_assets/textures/", "game_assets/fx/", "game_assets/models/"],
+            IMAGE_EXTS,
         )
         .await
     }
 
     pub async fn scan_models() -> Vec<String> {
-        scan(load_manifest().await.models, &["game_assets/models/"]).await
+        scan(
+            load_manifest().await.models,
+            &["game_assets/models/"],
+            MODEL_EXTS,
+        )
+        .await
     }
 
     // Texture import copies a file into game_assets/ -- impossible in the

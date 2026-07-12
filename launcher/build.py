@@ -27,6 +27,8 @@ import sys
 import tempfile
 import time
 import tomllib
+import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -44,6 +46,12 @@ WASM_ASSETS = {
         # ** so models nested in per-asset folders (e.g. Barrel/barrel_hq.glb)
         # are found too, matching the native editor's recursive model scan.
         ("game_assets/models/**/*.glb", "rust_assets"),
+        # Same per-asset folders also hold the model's own texture maps
+        # (e.g. Barrel/barrel_stove_diff_4k.jpg) -- without these the wasm
+        # loader's fetch() 404s and the model falls back to the checkerboard.
+        ("game_assets/models/**/*.png", "rust_assets"),
+        ("game_assets/models/**/*.jpg", "rust_assets"),
+        ("game_assets/models/**/*.jpeg", "rust_assets"),
         ("game_assets/fx/*.png", "rust_assets"),
     ],
 }
@@ -60,6 +68,11 @@ ENGINE_WASM_ASSETS = [
 
 URL_RE = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 PY = sys.executable or "python3"
+
+# Every server we start stamps this header on its responses, so before we
+# reclaim a busy port we can tell one of our own stale instances (safe to kill)
+# apart from an unrelated app that merely happens to use the same port.
+IDENT_HEADER = "X-Black-Splat"
 
 
 def discover_example_projects():
@@ -232,11 +245,16 @@ def build_wasm(example, log):
         # Manifest paths are the file's real path relative to the example dir
         # (e.g. game_assets/models/Barrel/barrel_hq.glb) -- the same string the
         # app loads a model by, which its loader reduces to the served basename.
+        # Classified by extension, not folder: a model's own texture maps (e.g.
+        # Barrel/barrel_stove_diff_4k.jpg) live right next to the .glb that
+        # references them, and are listed as browsable textures too, matching
+        # native's scan_textures which recurses into game_assets/models/.
         for src in matches:
             rel = os.path.relpath(src, ex_dir).replace("\\", "/")
-            if "/models/" in rel:
+            ext = os.path.splitext(rel)[1].lower()
+            if ext in (".glb", ".gltf"):
                 manifest["models"].append(rel)
-            elif "/fx/" in rel or "/textures/" in rel:
+            elif ext in (".png", ".jpg", ".jpeg"):
                 manifest["textures"].append(rel)
 
     # Shared engine assets, served for every example (source paths are relative
@@ -418,6 +436,68 @@ def stop_port(port):
         else:
             subprocess.run(["kill", "-9", pid])
     return True
+
+
+def _port_listening(port, host="127.0.0.1"):
+    """True if something is accepting TCP connections on host:port right now.
+    (A port merely lingering in TIME_WAIT after a restart is NOT listening, so
+    this reads as free -- the bind retry rides that window out.)"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, port)) == 0
+
+
+def _served_by_us(port):
+    """Whether the HTTP server on `port` is one of ours, told by the
+    IDENT_HEADER it stamps on every response (present even on its 404/501).
+    True = ours, False = answered but not ours, None = didn't answer as HTTP."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/", method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=1.0) as r:
+            headers = r.headers
+    except urllib.error.HTTPError as e:
+        headers = e.headers  # a 404/501 body still carries our header
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return bool(headers.get(IDENT_HEADER))
+
+
+def free_port_if_ours(port, log=print):
+    """Make `port` bindable, reclaiming it *only* from a stale black_splat
+    server (one that answers with IDENT_HEADER). Returns True if the port is
+    now free (or was), False if it's held by a process that isn't ours -- which
+    is left untouched. Never kills an unidentified process."""
+    if not _port_listening(port):
+        return True  # free, or a TIME_WAIT remnant the bind retry will outlast
+    if _served_by_us(port) is not True:
+        log(f"port {port} is in use by another process (not this launcher) -- "
+            f"leaving it alone.")
+        return False
+    log(f"port {port} held by a stale launcher/server -- reclaiming it.")
+    stop_port(port)
+    for _ in range(20):  # wait for the OS to actually drop the listener
+        if not _port_listening(port):
+            return True
+        time.sleep(0.15)
+    return not _port_listening(port)
+
+
+def bind_or_reclaim(make_server, port, log=print):
+    """Build a server that binds `port`, first reclaiming the port from a stale
+    black_splat instance and riding out the brief TIME_WAIT window left by a
+    just-stopped server. `make_server` is a no-arg callable that binds and
+    returns the server. Raises the final OSError if the port stays unavailable
+    (e.g. it's held by an unrelated app -- reported, not fought over)."""
+    last = None
+    for attempt in range(12):  # ~2s of retries across a TIME_WAIT window
+        try:
+            return make_server()
+        except OSError as e:
+            last = e
+            if attempt == 0 and not free_port_if_ours(port, log):
+                raise  # not ours -- don't fight over it
+            time.sleep(0.15)
+    raise last
 
 
 def _cli():

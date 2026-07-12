@@ -6,7 +6,7 @@ use image::GenericImageView;
 use wgpu::{Device, DeviceDescriptor, Queue, SurfaceConfiguration};
 use wgpu_text::{BrushBuilder, TextBrush};
 
-use crate::{assets::*, config::*, log};
+use crate::{config::*, log};
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub enum BlendMode {
@@ -293,22 +293,6 @@ impl Texture {
             view,
             sampler,
         })
-    }
-
-    pub async fn from_file(
-        file_path: &str,
-        device_resources: &DeviceResources<'_>,
-    ) -> Result<Self> {
-        log!("Loading texture {}", file_path);
-        // Propagate a missing/unreadable file (was an unwrap) so callers can
-        // substitute a placeholder instead of panicking.
-        let texture_bytes = load_binary(file_path).await?;
-        Texture::from_bytes(
-            &device_resources.device,
-            &device_resources.queue,
-            &texture_bytes,
-            file_path,
-        )
     }
 
     pub fn from_bytes(device: &Device, queue: &Queue, bytes: &[u8], label: &str) -> Result<Self> {

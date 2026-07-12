@@ -97,9 +97,11 @@ fn save_particle_file(res: &mut ParticleResource) -> Result<(), String> {
     Ok(())
 }
 
-/// Which category the content browser is showing.  Splats/Models are
-/// read-only; Materials/Particles are editable+saveable; Textures are imported.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// A kind of content-browser asset.  Splats/Models are read-only;
+/// Materials/Particles are editable+saveable; Textures are imported.  Used as
+/// the browser's type-filter key (see `browser_filters`) and to tag each
+/// unified [`AssetEntry`], so it must be hashable.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum BrowserCategory {
     Models,
     Materials,
@@ -120,6 +122,8 @@ const BROWSER_CATEGORIES: &[(BrowserCategory, &str)] = &[
 const TILE_THUMB: f32 = 72.0;
 const TILE_W: f32 = 92.0;
 const TILE_H: f32 = TILE_THUMB + 24.0;
+// Width (points) of the content browser's left-hand folder tree.
+const FOLDER_TREE_W: f32 = 160.0;
 
 /// What a browser tile draws in its thumbnail square.
 enum Thumb {
@@ -223,6 +227,110 @@ fn browser_tile(
         ui.visuals().text_color(),
     );
     resp.on_hover_text(name)
+}
+
+/// One entry in the unified content browser: any asset (model, material,
+/// particle, texture, or scene splat) tagged with the folder it lives in, so
+/// the browser can list every kind together and narrow by folder + type + name
+/// like a file browser.
+struct AssetEntry {
+    kind: BrowserCategory,
+    name: String,
+    /// Virtual folder path ("/"-separated): the asset's on-disk directory, or a
+    /// synthetic folder for path-less items (scene splats live under "Scene").
+    folder: String,
+    payload: AssetPayload,
+}
+
+/// Per-kind data a browser tile needs to draw itself and react to clicks.
+enum AssetPayload {
+    /// (relative path, loaded handle if any).  A `None` handle draws a tile
+    /// that lazily loads the model when clicked.
+    Model {
+        path: String,
+        loaded: Option<ModelHandle>,
+    },
+    Material {
+        handle: MaterialHandle,
+        dirty: bool,
+        rgb: [f32; 3],
+    },
+    Particle {
+        index: usize,
+        dirty: bool,
+    },
+    Texture {
+        handle: TextureHandle,
+    },
+    /// A scene splat cloud (display only in the browser).
+    Splat,
+}
+
+/// The directory portion of a relative asset path (forward-slashed), or "" for
+/// a bare filename.  `game_assets/models/Barrel/x.glb` -> `game_assets/models/Barrel`.
+fn parent_dir(path: &str) -> String {
+    match path.replace('\\', "/").rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Whether an asset in `asset_folder` shows under the selected tree folder: the
+/// root ("") shows everything, otherwise the folder itself and anything nested
+/// beneath it (recursive, so a parent folder gathers all its descendants).
+fn folder_contains(selected: &str, asset_folder: &str) -> bool {
+    selected.is_empty()
+        || asset_folder == selected
+        || asset_folder.starts_with(&format!("{selected}/"))
+}
+
+/// A node in the content browser's folder tree, built from asset folder paths.
+#[derive(Default)]
+struct FolderNode {
+    children: std::collections::BTreeMap<String, FolderNode>,
+}
+
+impl FolderNode {
+    /// Adds a "/"-separated folder path, creating intermediate nodes so every
+    /// ancestor folder appears in the tree even if nothing sits directly in it.
+    fn insert(&mut self, path: &str) {
+        let mut node = self;
+        for comp in path.split('/').filter(|c| !c.is_empty()) {
+            node = node.children.entry(comp.to_string()).or_default();
+        }
+    }
+}
+
+/// Draws the folder tree recursively.  Each folder is a selectable row that sets
+/// `selected` to its full path; folders with children get a collapse triangle,
+/// leaves are indented to line up beneath them.  `prefix` is `node`'s own path.
+fn draw_folder_tree(ui: &mut egui::Ui, node: &FolderNode, prefix: &str, selected: &mut String) {
+    for (name, child) in &node.children {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let is_sel = *selected == path;
+        let label = format!("📁 {name}");
+        if child.children.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add_space(18.0); // line up with the collapsible rows' labels
+                if ui.selectable_label(is_sel, label).clicked() {
+                    *selected = path.clone();
+                }
+            });
+        } else {
+            let id = ui.make_persistent_id(("cb_folder", &path));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                .show_header(ui, |ui| {
+                    if ui.selectable_label(is_sel, label).clicked() {
+                        *selected = path.clone();
+                    }
+                })
+                .body(|ui| draw_folder_tree(ui, child, &path, selected));
+        }
+    }
 }
 
 /// A labelled dropdown for choosing a texture (or "(none)") from the library,
@@ -1232,8 +1340,11 @@ pub struct SplatGame {
     // by dragging the grab strip along its top edge.
     resources_open: bool,
     resources_height: f32,
-    // Content browser: which category is shown and the name filter text.
-    browser_category: BrowserCategory,
+    // Content browser: the type-filter set (empty = show every kind), the
+    // selected folder in the tree ("" = root / all folders), and the name
+    // search text.  Assets of all kinds show together, narrowed by these.
+    browser_filters: std::collections::HashSet<BrowserCategory>,
+    browser_folder: String,
     browser_filter: String,
     // Content browser: material being renamed via its right-click menu, and
     // the working text.  Persists while the menu is open (like name_edit_*);
@@ -2306,7 +2417,8 @@ impl GameEngine for SplatGame {
             confirm_reset: false,
             active_tab: None,
             resources_open: false,
-            browser_category: BrowserCategory::Materials,
+            browser_filters: std::collections::HashSet::new(),
+            browser_folder: String::new(),
             browser_filter: String::new(),
             material_rename: None,
             resources_height: 200.0,
@@ -2631,31 +2743,67 @@ impl GameEngine for SplatGame {
             .iter()
             .map(|t| (t.name.clone(), t.path.clone()))
             .collect();
-        // Content-browser tile data, gathered up front so the browser closure
-        // doesn't borrow self while it also mutates selection/create flags.
-        let material_tiles: Vec<(String, MaterialHandle, bool, [f32; 3])> = self
-            .material_library
-            .iter()
-            .map(|m| {
-                let c = m.desc.color_constant;
-                (m.name.clone(), m.handle, m.dirty, [c.x, c.y, c.z])
-            })
-            .collect();
-        let particle_tiles: Vec<(String, bool)> = self
-            .particle_resources
-            .iter()
-            .map(|r| (r.name.clone(), r.dirty))
-            .collect();
-        let texture_tiles: Vec<(String, TextureHandle)> = self
-            .texture_resources
-            .iter()
-            .map(|t| (t.name.clone(), t.handle.clone()))
-            .collect();
-        let splat_names: Vec<String> = self
-            .scene_splats
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
+        // Unified content-browser asset list: every asset -- model, material,
+        // particle, texture, or scene splat -- as one entry tagged with the
+        // virtual folder it lives in (its on-disk directory, or a synthetic
+        // folder for path-less scene splats).  The browser shows them all
+        // together and narrows by folder + type chips + name, like a file
+        // browser.  Gathered up front so the browser closure can read it
+        // without borrowing self while it mutates selection/create flags.
+        let mut assets: Vec<AssetEntry> = Vec::new();
+        for (name, path, loaded) in &model_catalog {
+            assets.push(AssetEntry {
+                kind: BrowserCategory::Models,
+                name: name.clone(),
+                folder: parent_dir(path),
+                payload: AssetPayload::Model {
+                    path: path.clone(),
+                    loaded: *loaded,
+                },
+            });
+        }
+        for m in &self.material_library {
+            let c = m.desc.color_constant;
+            assets.push(AssetEntry {
+                kind: BrowserCategory::Materials,
+                name: m.name.clone(),
+                folder: "resources/materials".to_string(),
+                payload: AssetPayload::Material {
+                    handle: m.handle,
+                    dirty: m.dirty,
+                    rgb: [c.x, c.y, c.z],
+                },
+            });
+        }
+        for (i, r) in self.particle_resources.iter().enumerate() {
+            assets.push(AssetEntry {
+                kind: BrowserCategory::Particles,
+                name: r.name.clone(),
+                folder: "resources/particles".to_string(),
+                payload: AssetPayload::Particle {
+                    index: i,
+                    dirty: r.dirty,
+                },
+            });
+        }
+        for t in &self.texture_resources {
+            assets.push(AssetEntry {
+                kind: BrowserCategory::Textures,
+                name: t.name.clone(),
+                folder: parent_dir(&t.path),
+                payload: AssetPayload::Texture {
+                    handle: t.handle.clone(),
+                },
+            });
+        }
+        for s in &self.scene_splats {
+            assets.push(AssetEntry {
+                kind: BrowserCategory::Splats,
+                name: s.name.clone(),
+                folder: "Scene".to_string(),
+                payload: AssetPayload::Splat,
+            });
+        }
         // The model offered to the Details panel's "use selected" button (only
         // model resources apply there).
         let selected_model = match self.selected_resource {
@@ -2866,9 +3014,10 @@ impl GameEngine for SplatGame {
                                 ],
                                 egui::Stroke::new(2.0, ui.visuals().weak_text_color()),
                             );
-                            // Content browser header: collapse toggle, the
-                            // category tabs, that category's create/import
-                            // action, and a name filter.
+                            // Content browser header: collapse toggle, an "Add"
+                            // menu (all kinds live together now, so create/import
+                            // can't hang off a per-type tab), type-filter chips,
+                            // and a name search box.
                             let mut pick: Option<Option<ResourceSelection>> = None;
                             let mut open_inspector = false;
                             ui.horizontal(|ui| {
@@ -2882,55 +3031,40 @@ impl GameEngine for SplatGame {
                                     self.resources_open = false;
                                 }
                                 ui.separator();
+                                // Create/import, gathered under one menu (buttons
+                                // auto-close it on click).
+                                ui.menu_button("➕ Add", |ui| {
+                                    if ui.button("Import Model…").clicked() {
+                                        import_model = true;
+                                    }
+                                    if ui.button("New Material").clicked() {
+                                        create_material = true;
+                                    }
+                                    if ui.button("New Particle").clicked() {
+                                        create_particle = true;
+                                    }
+                                    if ui.button("Import Texture…").clicked() {
+                                        import_texture = true;
+                                    }
+                                });
+                                ui.separator();
+                                // Type-filter chips: each toggles its kind in the
+                                // filter set.  An empty set shows every kind.
                                 for (cat, label) in BROWSER_CATEGORIES {
-                                    if ui
-                                        .selectable_label(self.browser_category == *cat, *label)
-                                        .clicked()
-                                    {
-                                        self.browser_category = *cat;
+                                    let on = self.browser_filters.contains(cat);
+                                    if ui.selectable_label(on, *label).clicked() {
+                                        if on {
+                                            self.browser_filters.remove(cat);
+                                        } else {
+                                            self.browser_filters.insert(*cat);
+                                        }
                                     }
                                 }
                                 ui.separator();
-                                match self.browser_category {
-                                    BrowserCategory::Models => {
-                                        if ui
-                                            .button("Import…")
-                                            .on_hover_text("Import a .glb model")
-                                            .clicked()
-                                        {
-                                            import_model = true;
-                                        }
-                                    }
-                                    BrowserCategory::Materials => {
-                                        if ui.button("+ New").on_hover_text("New material").clicked()
-                                        {
-                                            create_material = true;
-                                        }
-                                    }
-                                    BrowserCategory::Particles => {
-                                        if ui
-                                            .button("+ New")
-                                            .on_hover_text("New particle definition")
-                                            .clicked()
-                                        {
-                                            create_particle = true;
-                                        }
-                                    }
-                                    BrowserCategory::Textures => {
-                                        if ui
-                                            .button("Import…")
-                                            .on_hover_text("Import a png/jpg into game_assets/textures")
-                                            .clicked()
-                                        {
-                                            import_texture = true;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                ui.separator();
-                                ui.label("Filter");
+                                ui.label("🔍");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.browser_filter)
+                                        .hint_text("Search")
                                         .desired_width(120.0),
                                 );
                                 if !self.browser_filter.is_empty()
@@ -2958,174 +3092,239 @@ impl GameEngine for SplatGame {
                                     });
                                 }
                             };
-                            egui::ScrollArea::vertical()
-                                .max_height(ui.available_height())
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| match self.browser_category {
-                                        BrowserCategory::Models => {
-                                            for (name, path, loaded) in &model_catalog {
-                                                if !name_matches(name, &filter) {
+                            // Folder tree built from the folders the current
+                            // assets occupy (ancestors included, since insert
+                            // splits the path into every level).
+                            let mut tree = FolderNode::default();
+                            for a in &assets {
+                                tree.insert(&a.folder);
+                            }
+                            // Scope + filters read into locals so the grid closure
+                            // doesn't borrow self while the tree mutates
+                            // self.browser_folder (the new selection lands next
+                            // frame -- fine, like the resize strip).
+                            let folder = self.browser_folder.clone();
+                            let filters = self.browser_filters.clone();
+                            let body_height = ui.available_height();
+                            ui.horizontal_top(|ui| {
+                                // Left: the folder tree.  "All" (root) clears the
+                                // scope so every asset shows together.
+                                ui.vertical(|ui| {
+                                    ui.set_width(FOLDER_TREE_W);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("cb_tree")
+                                        .max_height(body_height)
+                                        .show(ui, |ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.browser_folder.is_empty(),
+                                                    "📂 All",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.browser_folder.clear();
+                                            }
+                                            draw_folder_tree(
+                                                ui,
+                                                &tree,
+                                                "",
+                                                &mut self.browser_folder,
+                                            );
+                                        });
+                                });
+                                ui.separator();
+                                // Right: the asset grid -- every asset under the
+                                // selected folder that passes the type + name
+                                // filters, all kinds intermixed.
+                                egui::ScrollArea::vertical()
+                                    .id_salt("cb_grid")
+                                    .max_height(body_height)
+                                    .auto_shrink(false)
+                                    .show(ui, |ui| {
+                                        let mut shown = 0usize;
+                                        ui.horizontal_wrapped(|ui| {
+                                            for a in &assets {
+                                                if !folder_contains(&folder, &a.folder) {
                                                     continue;
                                                 }
-                                                match *loaded {
-                                                    // Loaded: a normal resource
-                                                    // tile.
-                                                    Some(handle) => {
+                                                if !filters.is_empty()
+                                                    && !filters.contains(&a.kind)
+                                                {
+                                                    continue;
+                                                }
+                                                if !name_matches(&a.name, &filter) {
+                                                    continue;
+                                                }
+                                                shown += 1;
+                                                match &a.payload {
+                                                    AssetPayload::Model { path, loaded } => {
+                                                        match *loaded {
+                                                            // Loaded: a normal,
+                                                            // selectable tile.
+                                                            Some(handle) => {
+                                                                let sel =
+                                                                    ResourceSelection::Model(
+                                                                        handle,
+                                                                    );
+                                                                let resp = browser_tile(
+                                                                    ui,
+                                                                    &a.name,
+                                                                    &Thumb::Glyph("M"),
+                                                                    current == Some(sel),
+                                                                    false,
+                                                                );
+                                                                on_tile(&resp, sel);
+                                                            }
+                                                            // Not loaded: click
+                                                            // starts a lazy load;
+                                                            // it turns selectable
+                                                            // once geometry is
+                                                            // ready.
+                                                            None => {
+                                                                let resp = browser_tile(
+                                                                    ui,
+                                                                    &a.name,
+                                                                    &Thumb::Glyph("M"),
+                                                                    false,
+                                                                    false,
+                                                                );
+                                                                if resp.clicked() {
+                                                                    model_load_request =
+                                                                        Some(path.clone());
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    AssetPayload::Material {
+                                                        handle,
+                                                        dirty,
+                                                        rgb,
+                                                    } => {
                                                         let sel =
-                                                            ResourceSelection::Model(handle);
+                                                            ResourceSelection::Material(*handle);
                                                         let resp = browser_tile(
                                                             ui,
-                                                            name,
-                                                            &Thumb::Glyph("M"),
+                                                            &a.name,
+                                                            &Thumb::Color(*rgb),
                                                             current == Some(sel),
-                                                            false,
+                                                            *dirty,
                                                         );
+                                                        if *dirty
+                                                            && tile_save_button(ui, &resp)
+                                                                .clicked()
+                                                        {
+                                                            save_material_handle =
+                                                                Some(*handle);
+                                                        }
+                                                        // Right-click to rename in
+                                                        // place.
+                                                        let menu = resp.context_menu(|ui| {
+                                                            let active = matches!(
+                                                                &self.material_rename,
+                                                                Some((h, _)) if h == handle
+                                                            );
+                                                            if !active {
+                                                                self.material_rename =
+                                                                    Some((
+                                                                        *handle,
+                                                                        a.name.clone(),
+                                                                    ));
+                                                            }
+                                                            ui.label("Rename material");
+                                                            if let Some((_, buf)) =
+                                                                &mut self.material_rename
+                                                            {
+                                                                let edit =
+                                                                    ui.text_edit_singleline(
+                                                                        buf,
+                                                                    );
+                                                                if !active {
+                                                                    edit.request_focus();
+                                                                }
+                                                                if ui.input(|i| {
+                                                                    i.key_pressed(
+                                                                        egui::Key::Enter,
+                                                                    )
+                                                                }) {
+                                                                    let new_name = buf
+                                                                        .trim()
+                                                                        .to_string();
+                                                                    if !new_name.is_empty() {
+                                                                        rename_material =
+                                                                            Some((
+                                                                                *handle,
+                                                                                new_name,
+                                                                            ));
+                                                                    }
+                                                                    self.material_rename =
+                                                                        None;
+                                                                    ui.close();
+                                                                }
+                                                            }
+                                                        });
+                                                        // Menu closed: drop any
+                                                        // stale in-progress rename
+                                                        // so a re-open re-seeds and
+                                                        // refocuses.
+                                                        if menu.is_none()
+                                                            && matches!(
+                                                                &self.material_rename,
+                                                                Some((h, _)) if h == handle
+                                                            )
+                                                        {
+                                                            self.material_rename = None;
+                                                        }
                                                         on_tile(&resp, sel);
                                                     }
-                                                    // Not loaded: a click starts a
-                                                    // lazy load; it turns
-                                                    // selectable once geometry is
-                                                    // ready.
-                                                    None => {
+                                                    AssetPayload::Particle {
+                                                        index,
+                                                        dirty,
+                                                    } => {
+                                                        let sel =
+                                                            ResourceSelection::Particle(*index);
                                                         let resp = browser_tile(
                                                             ui,
-                                                            name,
-                                                            &Thumb::Glyph("M"),
+                                                            &a.name,
+                                                            &Thumb::Glyph("P"),
+                                                            current == Some(sel),
+                                                            *dirty,
+                                                        );
+                                                        if *dirty
+                                                            && tile_save_button(ui, &resp)
+                                                                .clicked()
+                                                        {
+                                                            save_particle_index = Some(*index);
+                                                        }
+                                                        on_tile(&resp, sel);
+                                                    }
+                                                    AssetPayload::Texture { handle } => {
+                                                        let thumb = renderer
+                                                            .egui_texture_id(handle)
+                                                            .map(Thumb::Image)
+                                                            .unwrap_or(Thumb::Glyph("T"));
+                                                        browser_tile(
+                                                            ui, &a.name, &thumb, false, false,
+                                                        );
+                                                    }
+                                                    AssetPayload::Splat => {
+                                                        browser_tile(
+                                                            ui,
+                                                            &a.name,
+                                                            &Thumb::Glyph("S"),
                                                             false,
                                                             false,
                                                         );
-                                                        if resp.clicked() {
-                                                            model_load_request =
-                                                                Some(path.clone());
-                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                        BrowserCategory::Materials => {
-                                            for (name, handle, dirty, rgb) in &material_tiles {
-                                                if !name_matches(name, &filter) {
-                                                    continue;
-                                                }
-                                                let sel = ResourceSelection::Material(*handle);
-                                                let resp = browser_tile(
-                                                    ui,
-                                                    name,
-                                                    &Thumb::Color(*rgb),
-                                                    current == Some(sel),
-                                                    *dirty,
-                                                );
-                                                if *dirty
-                                                    && tile_save_button(ui, &resp).clicked()
-                                                {
-                                                    save_material_handle = Some(*handle);
-                                                }
-                                                // Right-click to rename in place.
-                                                let menu = resp.context_menu(|ui| {
-                                                    let active = matches!(
-                                                        &self.material_rename,
-                                                        Some((h, _)) if h == handle
-                                                    );
-                                                    if !active {
-                                                        self.material_rename =
-                                                            Some((*handle, name.clone()));
-                                                    }
-                                                    ui.label("Rename material");
-                                                    if let Some((_, buf)) =
-                                                        &mut self.material_rename
-                                                    {
-                                                        let edit =
-                                                            ui.text_edit_singleline(buf);
-                                                        if !active {
-                                                            edit.request_focus();
-                                                        }
-                                                        if ui.input(|i| {
-                                                            i.key_pressed(egui::Key::Enter)
-                                                        }) {
-                                                            let new_name =
-                                                                buf.trim().to_string();
-                                                            if !new_name.is_empty() {
-                                                                rename_material =
-                                                                    Some((*handle, new_name));
-                                                            }
-                                                            self.material_rename = None;
-                                                            ui.close();
-                                                        }
-                                                    }
-                                                });
-                                                // Menu closed: drop any stale
-                                                // in-progress rename for this tile
-                                                // so a re-open re-seeds and refocuses.
-                                                if menu.is_none()
-                                                    && matches!(
-                                                        &self.material_rename,
-                                                        Some((h, _)) if h == handle
-                                                    )
-                                                {
-                                                    self.material_rename = None;
-                                                }
-                                                on_tile(&resp, sel);
-                                            }
-                                        }
-                                        BrowserCategory::Particles => {
-                                            for (i, (name, dirty)) in
-                                                particle_tiles.iter().enumerate()
-                                            {
-                                                if !name_matches(name, &filter) {
-                                                    continue;
-                                                }
-                                                let sel = ResourceSelection::Particle(i);
-                                                let resp = browser_tile(
-                                                    ui,
-                                                    name,
-                                                    &Thumb::Glyph("P"),
-                                                    current == Some(sel),
-                                                    *dirty,
-                                                );
-                                                if *dirty
-                                                    && tile_save_button(ui, &resp).clicked()
-                                                {
-                                                    save_particle_index = Some(i);
-                                                }
-                                                on_tile(&resp, sel);
-                                            }
-                                        }
-                                        BrowserCategory::Textures => {
-                                            if texture_tiles.is_empty() {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        "No textures yet — use Import…",
-                                                    )
-                                                    .weak(),
-                                                );
-                                            }
-                                            for (name, handle) in &texture_tiles {
-                                                if !name_matches(name, &filter) {
-                                                    continue;
-                                                }
-                                                let thumb = renderer
-                                                    .egui_texture_id(handle)
-                                                    .map(Thumb::Image)
-                                                    .unwrap_or(Thumb::Glyph("T"));
-                                                browser_tile(ui, name, &thumb, false, false);
-                                            }
-                                        }
-                                        BrowserCategory::Splats => {
-                                            for name in &splat_names {
-                                                if !name_matches(name, &filter) {
-                                                    continue;
-                                                }
-                                                browser_tile(
-                                                    ui,
-                                                    name,
-                                                    &Thumb::Glyph("S"),
-                                                    false,
-                                                    false,
-                                                );
-                                            }
+                                        });
+                                        if shown == 0 {
+                                            ui.label(
+                                                egui::RichText::new("No assets here").weak(),
+                                            );
                                         }
                                     });
-                                });
+                            });
                             if let Some(new_selection) = pick {
                                 self.selected_resource = new_selection;
                                 if open_inspector {
@@ -3528,9 +3727,16 @@ impl GameEngine for SplatGame {
                                                 );
                                                 tex_changed |= texture_combo(
                                                     ui,
-                                                    "mat_spec_tex",
-                                                    "Metal/rough texture",
-                                                    &mut mat.desc.spec_texture,
+                                                    "mat_metal_tex",
+                                                    "Metallic texture",
+                                                    &mut mat.desc.metal_texture,
+                                                    &texture_options,
+                                                );
+                                                tex_changed |= texture_combo(
+                                                    ui,
+                                                    "mat_rough_tex",
+                                                    "Roughness texture",
+                                                    &mut mat.desc.rough_texture,
                                                     &texture_options,
                                                 );
                                                 if tex_changed {

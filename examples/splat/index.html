@@ -2,12 +2,50 @@
 
 <meta name="author" content="Benny Wilson">
 <title>Black Splat - Gaussian Splats</title>
+<style>
+	body, html {
+		margin: 0;
+		padding: 0;
+		width: 100%;
+		height: 100%;
+		overflow: hidden;
+	}
+	canvas {
+		display: block;
+		width: 100%;
+		height: 100%;
+	}
+</style>
 
 <!-- All GUI (buttons, sliders, touch pads) is egui, rendered in-engine on the
      canvas -- the page is just a host for the wasm module. -->
 
 <script type="module">
 	import init from "./black_splat_splat_demo.js";
+
+	function resizeCanvas() {
+		const canvas = document.getElementById("target");
+		if (!canvas) return;
+		const dpr = window.devicePixelRatio || 1;
+		canvas.width = window.innerWidth * dpr;
+		canvas.height = window.innerHeight * dpr;
+		console.log(`Canvas resized to ${canvas.width}x${canvas.height}`);
+	}
+
+    // Resize canvas immediately when DOM is ready
+	function initCanvas() {
+		const canvas = document.getElementById("target");
+		if (canvas) {
+			resizeCanvas();
+		}
+	}
+
+	if (document.readyState === "loading") {
+		document.addEventListener("DOMContentLoaded", initCanvas);
+	} else {
+		initCanvas();
+	}
+
     window.addEventListener("load", () => {
         // Cache-bust the wasm URL so Chrome's compiled-wasm cache can't serve a
         // stale build across rebuilds (a plain reload otherwise reuses it).
@@ -18,6 +56,9 @@
             ),
         });
     });
+
+    // Handle window resize events
+    window.addEventListener("resize", resizeCanvas);
 </script>
 
-<canvas id="target" width="1920" height="1080"></canvas>
+<canvas id="target"></canvas>

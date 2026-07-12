@@ -172,6 +172,11 @@ def stop_job(example):
 
 # Subclass ThreadingHTTPServer.  Each request is handled in its own thread
 class QuietServer(http.server.ThreadingHTTPServer):
+    # Unix: reuse the address so a restart rebinds through TIME_WAIT. Windows:
+    # don't (SO_REUSEADDR there lets a live port be co-bound); a live orphan
+    # instead trips a bind error, which bind_or_reclaim turns into a reclaim.
+    allow_reuse_address = sys.platform != "win32"
+
     def handle_error(self, request, client_address):
         # SSE clients (browser tabs) drop connections all the time, skip printing the traceback
         if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
@@ -182,6 +187,12 @@ class QuietServer(http.server.ThreadingHTTPServer):
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # keep the launcher's own console quiet
+
+    def end_headers(self):
+        # Stamp our identity on every response (including error pages) so a
+        # restart can recognise and reclaim a stale dashboard on this port.
+        self.send_header(build.IDENT_HEADER, "launcher")
+        super().end_headers()
 
     def _send(self, code, body, ctype="application/json"):
         data = body.encode() if isinstance(body, str) else body
@@ -287,7 +298,14 @@ def main():
         print("No examples found under", build.EXAMPLES_DIR)
         return
 
-    server = QuietServer(("127.0.0.1", CONTROL_PORT), Handler)
+    try:
+        server = build.bind_or_reclaim(
+            lambda: QuietServer(("127.0.0.1", CONTROL_PORT), Handler), CONTROL_PORT
+        )
+    except OSError:
+        print(f"error: port {CONTROL_PORT} is in use by another process. "
+              f"Free it or run: python build.py stop {CONTROL_PORT}")
+        return
     url = f"http://localhost:{CONTROL_PORT}/"
     print(f"black_splat launcher on {url}")
     print("Examples:", ", ".join(f"{e['name']} (:{PORTS[e['name']]})" for e in EXAMPLES))

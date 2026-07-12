@@ -2,7 +2,8 @@
   "name": "Plastic",
   "desc": {
     "color_texture": null,
-    "spec_texture": null,
+    "metal_texture": null,
+    "rough_texture": null,
     "color_constant": {
       "x": 1.0,
       "y": 1.0,
