@@ -21,7 +21,7 @@
   }
   header h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: .2px; }
   header .sub { color: var(--muted); font-size: 13px; }
-  main { display: grid; grid-template-columns: 340px 1fr; gap: 0; height: calc(100vh - 61px); }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 0; height: calc(100vh - 61px); }
   @media (max-width: 720px) { main { grid-template-columns: 1fr; height: auto; } }
   .examples { border-right: 1px solid var(--line); overflow-y: auto; padding: 14px; }
   .card {
@@ -42,16 +42,21 @@
   .dot.failed { background: var(--fail); }
   .dot.stopped { background: var(--muted); }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-  .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  /* Keep Run/Wasm/Tunnel/Stop on one row (the panel above is sized to fit
+     them); nowrap stops Stop from dropping to a second line. */
+  .btns { display: flex; flex-wrap: nowrap; gap: 6px; margin-top: 12px; }
   button {
     font: inherit; font-size: 13px; padding: 6px 11px; border-radius: 7px;
     border: 1px solid var(--line); background: var(--panel2); color: var(--text);
-    cursor: pointer;
+    cursor: pointer; white-space: nowrap;
   }
   button:hover { border-color: var(--accent); }
   button.stop { color: var(--fail); }
   button:disabled { opacity: .45; cursor: default; }
   .links { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+  /* Idle cards have empty links/qr containers; their top margin is the dead
+     space under the buttons. Collapse them until they actually have content. */
+  .links:empty, .qr:empty { display: none; }
   .links a {
     color: var(--accent); text-decoration: none; font-size: 13px;
     font-family: ui-monospace, monospace; word-break: break-all;
@@ -79,6 +84,7 @@
     white-space: pre; /* don't wrap long build lines; scroll horizontally instead */
   }
   .log .cmd { color: var(--accent); }
+  .log .live { color: var(--run); }
   .empty { color: var(--muted); padding: 40px 16px; }
 </style>
 </head>
@@ -105,7 +111,7 @@ async function api(path, opts) {
 }
 
 function ensure(name) {
-  if (!state[name]) state[name] = { status: null, links: {}, log: [] };
+  if (!state[name]) state[name] = { status: null, links: {}, log: [], live: null };
   return state[name];
 }
 
@@ -173,11 +179,19 @@ function attach(name) {
     const ev = JSON.parse(e.data);
     const s = ensure(name);
     if (ev.type === 'log') {
-      s.log.push({ text: ev.line, cmd: ev.line.startsWith('$ ') });
-      if (active === name) appendLine(ev);
+      if (ev.transient) {
+        s.live = ev.line;                 // an in-place progress-bar redraw
+        if (active === name) renderLive(name);
+      } else {
+        s.log.push({ text: ev.line, cmd: ev.line.startsWith('$ ') });
+        s.live = null;                    // committed output ends the current bar frame
+        if (active === name) { renderLive(name); appendCommitted(ev.line); }
+      }
     } else if (ev.type === 'status') {
       s.status = ev.status; renderStatus(name);
       if (ev.status !== 'running') {
+        s.live = null;                    // drop the trailing bar frame
+        if (active === name) renderLive(name);
         es.close(); delete streams[name];
         // Links/QR point at a server that's no longer running -- clear them
         // so a stale "Local"/tunnel URL or QR doesn't linger on the card.
@@ -233,22 +247,42 @@ function show(name) {
   renderTabs();
   const log = document.getElementById('log');
   const s = ensure(name);
-  if (!s.log.length) {
+  if (!s.log.length && s.live == null) {
     log.innerHTML = '<span class="empty">No output yet for ' + name + '.</span>';
     return;
   }
   log.innerHTML = '';
-  for (const line of s.log) appendLine({ line: line.text });
+  for (const line of s.log) appendCommitted(line.text);
+  renderLive(name);
 }
 
-function appendLine(ev) {
-  const log = document.getElementById('log');
+function clearEmpty(log) {
   const empty = log.querySelector('.empty');
   if (empty) log.innerHTML = '';
+}
+
+// A committed line is finalized output; it goes in above the pinned live line
+// (the progress bar), matching how a terminal scrolls text under a bottom bar.
+function appendCommitted(text) {
+  const log = document.getElementById('log');
+  clearEmpty(log);
   const span = document.createElement('span');
-  if (ev.line.startsWith('$ ')) span.className = 'cmd';
-  span.textContent = ev.line + '\n';
-  log.appendChild(span);
+  if (text.startsWith('$ ')) span.className = 'cmd';
+  span.textContent = text + '\n';
+  log.insertBefore(span, log.querySelector('.live'));  // null ref => append
+  log.scrollTop = log.scrollHeight;
+}
+
+// The live line is a single span kept last in the log; a progress-bar redraw
+// overwrites it in place instead of appending a new line each frame.
+function renderLive(name) {
+  const log = document.getElementById('log');
+  const s = ensure(name);
+  let el = log.querySelector('.live');
+  if (s.live == null) { if (el) el.remove(); return; }
+  clearEmpty(log);
+  if (!el) { el = document.createElement('span'); el.className = 'live'; log.appendChild(el); }
+  el.textContent = s.live + '\n';
   log.scrollTop = log.scrollHeight;
 }
 

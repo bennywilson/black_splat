@@ -299,7 +299,9 @@ impl Texture {
         device_resources: &DeviceResources<'_>,
     ) -> Result<Self> {
         log!("Loading texture {}", file_path);
-        let texture_bytes = load_binary(file_path).await.unwrap(); //load_bytes!(file_path);
+        // Propagate a missing/unreadable file (was an unwrap) so callers can
+        // substitute a placeholder instead of panicking.
+        let texture_bytes = load_binary(file_path).await?;
         Texture::from_bytes(
             &device_resources.device,
             &device_resources.queue,

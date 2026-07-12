@@ -2460,22 +2460,31 @@ impl GameEngine for SplatGame {
         // --- GUI (egui, same on native + web) ---
         let ctx = renderer.egui_ctx().clone();
 
-        // Touch web only: on a high-DPR phone/tablet, egui's default
-        // pixels-per-point (the devicePixelRatio) leaves the fixed 1280x720
-        // canvas with very few layout "points" and the panels balloon -- pin
-        // ppp to a 480-point-tall design space instead.  Then enlarge egui's
-        // interactive sizing for finger-friendly tap targets (set on the
-        // global style so dropdown popups get it too).  Desktop web is left
-        // alone: the devicePixelRatio default mirrors the OS scaling that the
-        // native desktop build honors, so both look the same.
+        // Web pixels-per-point: egui defaults ppp to the browser's
+        // devicePixelRatio, so the UI's on-screen size swings with the user's
+        // monitor DPI / browser zoom -- on a HiDPI display (DPR 2) the fixed
+        // 1920x1080 canvas has half the layout "points" and every panel
+        // balloons, unlike native where the window is logical-sized. Pin ppp to
+        // a fixed design-space *height* instead so layout is deterministic
+        // regardless of DPR: a shorter design space = fewer points = bigger
+        // widgets. Desktop mirrors native's default 720-pt-tall window; phones
+        // and tablets get a shorter, finger-friendly space plus enlarged
+        // interactive sizing (on the global style so dropdown popups inherit
+        // it). Bump WEB_DESIGN_H down to make the desktop web UI larger.
         #[cfg(target_arch = "wasm32")]
-        if is_touch_device() {
-            ctx.set_pixels_per_point((game_config.window_height as f32 / 480.0).max(0.5));
-            ctx.all_styles_mut(|s| {
-                s.spacing.button_padding = egui::vec2(16.0, 12.0);
-                s.spacing.interact_size.y = 38.0;
-                s.spacing.item_spacing = egui::vec2(14.0, 10.0);
-            });
+        {
+            const WEB_DESIGN_H: f32 = 720.0; // desktop: match native's default
+            const TOUCH_DESIGN_H: f32 = 480.0; // phones/tablets: bigger UI
+            let touch = is_touch_device();
+            let design_h = if touch { TOUCH_DESIGN_H } else { WEB_DESIGN_H };
+            ctx.set_pixels_per_point((game_config.window_height as f32 / design_h).max(0.5));
+            if touch {
+                ctx.all_styles_mut(|s| {
+                    s.spacing.button_padding = egui::vec2(16.0, 12.0);
+                    s.spacing.interact_size.y = 38.0;
+                    s.spacing.item_spacing = egui::vec2(14.0, 10.0);
+                });
+            }
         }
 
         let screen = ctx.content_rect();
@@ -2511,17 +2520,19 @@ impl GameEngine for SplatGame {
             .into_iter()
             .map(|(path, handle)| (resource_display_name(&path), handle))
             .collect();
-        // The full model catalog (display name, path) for the content browser --
-        // every discovered model, loaded or not.  Unloaded ones load on click.
-        let model_catalog: Vec<(String, String)> = self
-            .model_resources
-            .iter()
-            .map(|m| (m.name.clone(), m.path.clone()))
-            .collect();
         // Which catalog paths are currently loaded (path -> handle), so a tile
-        // can resolve to a selectable handle or fall back to a lazy load.
+        // or dropdown row can resolve to a selectable handle or fall back to a
+        // lazy load.
         let loaded_models: std::collections::HashMap<String, ModelHandle> =
             renderer.get_model_resources().into_iter().collect();
+        // The full model catalog (display name, path, loaded handle) for the
+        // content browser and the Details-panel model dropdown -- every
+        // discovered model, loaded or not.  Unloaded ones load when picked.
+        let model_catalog: Vec<(String, String, Option<ModelHandle>)> = self
+            .model_resources
+            .iter()
+            .map(|m| (m.name.clone(), m.path.clone(), loaded_models.get(&m.path).copied()))
+            .collect();
         // Loaded materials for the Details panel's Material dropdown, from the
         // owned library (the source of truth for names/handles) rather than the
         // renderer, so it stays in step with edits and saves.
@@ -2583,6 +2594,10 @@ impl GameEngine for SplatGame {
         // Set to a catalog path when the user clicks a not-yet-loaded model tile
         // in the browser; applied after the egui pass (loads it, then selects).
         let mut model_load_request: Option<String> = None;
+        // Set to a catalog path when the user picks a not-yet-loaded model from
+        // the Details-panel dropdown; applied after the egui pass (loads it, then
+        // assigns it to the selected actor).
+        let mut model_pick_request: Option<String> = None;
         // A save requested from a browser tile's disk button (applied after the
         // pass, where self can be borrowed mutably to read the desc/params).
         let mut save_material_handle: Option<MaterialHandle> = None;
@@ -2872,11 +2887,11 @@ impl GameEngine for SplatGame {
                                 .show(ui, |ui| {
                                     ui.horizontal_wrapped(|ui| match self.browser_category {
                                         BrowserCategory::Models => {
-                                            for (name, path) in &model_catalog {
+                                            for (name, path, loaded) in &model_catalog {
                                                 if !name_matches(name, &filter) {
                                                     continue;
                                                 }
-                                                match loaded_models.get(path).copied() {
+                                                match *loaded {
                                                     // Loaded: a normal resource
                                                     // tile.
                                                     Some(handle) => {
@@ -3248,9 +3263,10 @@ impl GameEngine for SplatGame {
                                                 selection_edited |= editor::draw_properties(
                                                     ui,
                                                     actor,
-                                                    &model_resources,
+                                                    &model_catalog,
                                                     &material_resources,
                                                     selected_model,
+                                                    &mut model_pick_request,
                                                 );
                                             }
                                         }
@@ -3259,9 +3275,10 @@ impl GameEngine for SplatGame {
                                                 selection_edited |= editor::draw_properties(
                                                     ui,
                                                     light,
-                                                    &model_resources,
+                                                    &model_catalog,
                                                     &material_resources,
                                                     selected_model,
+                                                    &mut model_pick_request,
                                                 );
                                             }
                                         }
@@ -3272,9 +3289,10 @@ impl GameEngine for SplatGame {
                                                 selection_edited |= editor::draw_properties(
                                                     ui,
                                                     particle,
-                                                    &model_resources,
+                                                    &model_catalog,
                                                     &material_resources,
                                                     selected_model,
+                                                    &mut model_pick_request,
                                                 );
                                             }
                                         }
@@ -3288,9 +3306,10 @@ impl GameEngine for SplatGame {
                                                 selection_edited |= editor::draw_properties(
                                                     ui,
                                                     splat,
-                                                    &model_resources,
+                                                    &model_catalog,
                                                     &material_resources,
                                                     selected_model,
+                                                    &mut model_pick_request,
                                                 );
                                             }
                                         }
@@ -4151,6 +4170,31 @@ impl GameEngine for SplatGame {
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Ok(bytes) = load_binary(&path).await {
                         pending.lock().unwrap().push((path, bytes, true));
+                    }
+                });
+            }
+        }
+        // A model chosen from the Details-panel dropdown while still unloaded:
+        // load it and assign it to the selected actor.
+        if let (Some(path), Some(Selection::Actor(i))) = (model_pick_request, self.selected) {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let handle = pollster::block_on(renderer.load_model(&path, false));
+                if let Some(actor) = self.scene_actors.get_mut(i) {
+                    actor.set_model(&handle);
+                    renderer.add_or_update_actor(actor);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Fetch in the background; the model-upload drain assigns it to
+                // this actor once ready (matched by name via pending_actor_models).
+                self.pending_actor_models
+                    .push((i, resource_display_name(&path)));
+                let pending = self.pending_model_uploads.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Ok(bytes) = load_binary(&path).await {
+                        pending.lock().unwrap().push((path, bytes, false));
                     }
                 });
             }

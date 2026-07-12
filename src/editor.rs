@@ -142,24 +142,31 @@ macro_rules! editor_property {
 pub fn draw_properties(
     ui: &mut egui::Ui,
     object: &mut dyn EditorInspect,
-    model_resources: &[(String, ModelHandle)],
+    model_catalog: &[(String, String, Option<ModelHandle>)],
     material_resources: &[(String, MaterialHandle)],
     selected_resource: Option<ModelHandle>,
+    model_pick_request: &mut Option<String>,
 ) -> bool {
     object.inspect_properties(&mut EguiPropertyEditor {
         ui,
-        model_resources,
+        model_catalog,
         material_resources,
         selected_resource,
+        model_pick_request,
     })
 }
 
-/// The egui-widget PropertyVisitor behind [`draw_properties`].
+/// The egui-widget PropertyVisitor behind [`draw_properties`].  `model_catalog`
+/// is every discovered model as (display name, path, loaded handle) -- the
+/// dropdown lists them all, and picking one that isn't loaded yet writes its
+/// path to `model_pick_request` so the caller can lazily load it (see the
+/// editor's lazy model loading).
 struct EguiPropertyEditor<'a> {
     ui: &'a mut egui::Ui,
-    model_resources: &'a [(String, ModelHandle)],
+    model_catalog: &'a [(String, String, Option<ModelHandle>)],
     material_resources: &'a [(String, MaterialHandle)],
     selected_resource: Option<ModelHandle>,
+    model_pick_request: &'a mut Option<String>,
 }
 
 impl EguiPropertyEditor<'_> {
@@ -267,15 +274,16 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
         let selected_resource = self.selected_resource;
         let Self {
             ui,
-            model_resources,
+            model_catalog,
+            model_pick_request,
             ..
         } = self;
         let mut changed = false;
         ui.label(name);
-        let selected = model_resources
+        let selected = model_catalog
             .iter()
-            .find(|(_, handle)| handle == value)
-            .map_or("(none)", |(res_name, _)| res_name.as_str());
+            .find(|(_, _, handle)| *handle == Some(*value))
+            .map_or("(none)", |(res_name, _, _)| res_name.as_str());
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt(name)
                 .selected_text(selected)
@@ -283,10 +291,22 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
                     changed |= ui
                         .selectable_value(value, ModelHandle::make_invalid(), "(none)")
                         .changed();
-                    for (res_name, res_handle) in model_resources.iter() {
-                        changed |= ui
-                            .selectable_value(value, *res_handle, res_name.as_str())
-                            .changed();
+                    // The dropdown always lists the full catalog.  Loaded models
+                    // assign their handle directly; ones not loaded yet request a
+                    // lazy load (the caller loads + assigns to this actor).
+                    for (res_name, path, handle) in model_catalog.iter() {
+                        match handle {
+                            Some(h) => {
+                                changed |= ui
+                                    .selectable_value(value, *h, res_name.as_str())
+                                    .changed();
+                            }
+                            None => {
+                                if ui.selectable_label(false, res_name.as_str()).clicked() {
+                                    **model_pick_request = Some(path.clone());
+                                }
+                            }
+                        }
                     }
                 });
             // One-click apply of the resource browser's selection

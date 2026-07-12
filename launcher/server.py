@@ -47,24 +47,42 @@ class Job:
     def __init__(self, example, action):
         self.example = example
         self.action = action
-        self.events = []            # list of dicts: {type, ...}
+        self.events = []            # list of dicts: {type, ...} (replayed in full)
+        self.last_transient = None  # newest transient log ev, kept out of events
         self.subs = []              # list of queue.Queue for live subscribers
         self.lock = threading.Lock()
         self.proc = None            # the long-lived (serve) process, if any
         self.status = "running"     # running | ok | failed | stopped
         self.stop_requested = False
 
-    def emit(self, ev):
+    def emit(self, ev, history=True):
         with self.lock:
-            self.events.append(ev)
+            if history:
+                self.events.append(ev)
             for q in self.subs:
                 q.put(ev)
 
-    def log(self, line):
-        self.emit({"type": "log", "line": ANSI_RE.sub("", line).rstrip("\r\n")})
+    def log(self, line, transient=False):
+        # transient = an in-place progress-bar redraw. Live subscribers get every
+        # frame, but we keep only the latest out of `events` so a late/reload
+        # subscriber replays one current bar line, not thousands of stale ones.
+        ev = {"type": "log", "line": ANSI_RE.sub("", line).rstrip("\r\n"),
+              "transient": transient}
+        if transient:
+            self.last_transient = ev
+            self.emit(ev, history=False)
+        else:
+            # A committed line ends the current bar frame; a still-building step
+            # emits a fresh frame right after, so the bar clears on the last
+            # committed line of a step (e.g. cargo's "Finished") instead of a
+            # partial "[===> ]" lingering under the next step's output.
+            self.last_transient = None
+            self.emit(ev)
 
     def set_status(self, status):
         self.status = status
+        if status != "running":
+            self.last_transient = None  # no stale bar line after the job ends
         self.emit({"type": "status", "status": status})
 
     def url(self, label, url):
@@ -78,6 +96,8 @@ class Job:
         q = queue.Queue()
         with self.lock:
             history = list(self.events)
+            if self.last_transient is not None:
+                history.append(self.last_transient)  # one current bar frame
             self.subs.append(q)
         return q, history
 

@@ -369,40 +369,65 @@ impl Model {
                 label: Some("Model_texture_bind_group_layout"),
             });
 
+        // Resolve the built-in checkerboard up front (a &mut borrow of the
+        // asset manager) so that borrow is released before we take the shared
+        // &Texture below. It's cheap after the first call (cached).
+        let checker_handle = asset_manager.checker_texture(device_resources);
+
+        // Follow the material's baseColorTexture -> texture -> image chain to
+        // pick the *correct* embedded image. Blindly using gltf_images[0] binds
+        // whichever image happens to be first (often a normal/roughness map),
+        // which renders as a garbled surface.
+        let base_color_image_index = gltf_doc
+            .materials()
+            .find_map(|m| m.pbr_metallic_roughness().base_color_texture())
+            .map(|info| info.texture().source().index());
+
+        // Which embedded image to decode, if any: the material's base color if
+        // it declares one; otherwise (only when there's no explicit material to
+        // tell us) the first image as a best-effort guess.
+        let image_index = base_color_image_index.or_else(|| {
+            if gltf_doc.materials().next().is_none() && !gltf_images.is_empty() {
+                Some(0)
+            } else {
+                None
+            }
+        });
+
         let mut empty_texture = None;
+        if textures.is_empty() {
+            if let Some(image) = image_index.and_then(|i| gltf_images.get(i)) {
+                match image.format {
+                    gltf::image::Format::R8G8B8 | gltf::image::Format::R8G8B8A8 => {
+                        empty_texture = Texture::from_rgba(
+                            &image.pixels,
+                            image.format == gltf::image::Format::R8G8B8A8,
+                            image.width,
+                            image.height,
+                            device_resources,
+                            Some("gltf base color"),
+                        )
+                        .ok();
+                    }
+                    other => {
+                        log!("gltf image format {other:?} unsupported; using checkerboard");
+                    }
+                }
+            }
+        }
+
         let texture = {
             if !textures.is_empty() {
+                // A URI-referenced texture was loaded (load_texture already
+                // substitutes the checkerboard for a missing/undecodable file).
                 asset_manager.get_texture(&textures[0])
-            } else if !gltf_images.is_empty() {
-                let image = &gltf_images[0];
-                //   image.
-                empty_texture = Some(
-                    Texture::from_rgba(
-                        &gltf_images[0].pixels,
-                        image.format == gltf::image::Format::R8G8B8A8,
-                        image.width,
-                        image.height,
-                        device_resources,
-                        Some("gltf tex"),
-                    )
-                    .unwrap(),
-                );
-                empty_texture.as_ref().unwrap()
+            } else if let Some(tex) = empty_texture.as_ref() {
+                tex
             } else {
-                // Untextured model (e.g. a bare quad): fall back to a 1x1 white
-                // texture so the bind group still has something to sample.
-                empty_texture = Some(
-                    Texture::from_rgba(
-                        &[255, 255, 255, 255],
-                        true,
-                        1,
-                        1,
-                        device_resources,
-                        Some("untextured model fallback"),
-                    )
-                    .unwrap(),
-                );
-                empty_texture.as_ref().unwrap()
+                // Material references a texture we couldn't produce, or the
+                // model is untextured: show the checkerboard so it reads as an
+                // obvious placeholder rather than a garbled/blank surface.
+                asset_manager.get_texture(&checker_handle)
             }
         };
 

@@ -24,11 +24,14 @@ pub async fn load_binary(file_name: &str) -> anyhow::Result<Vec<u8>> {
             } else {
                 let base = Path::new(file_name).file_name().unwrap().to_str().unwrap();
                 let url = format_url(&format!("/rust_assets/{}", base));
-                let bytes = reqwest::get(url)
-                    .await?
-                    .bytes()
-                    .await?
-                    .to_vec();
+                let resp = reqwest::get(url).await?;
+                // A 404 still yields a body (the error page); treat non-success
+                // as an error so callers can fall back instead of decoding junk,
+                // and so we don't cache the error page under this key.
+                if !resp.status().is_success() {
+                    anyhow::bail!("fetch {base} failed: HTTP {}", resp.status());
+                }
+                let bytes = resp.bytes().await?.to_vec();
                 crate::idb::put(file_name, &bytes).await;
                 bytes
             };
@@ -113,6 +116,10 @@ pub struct AssetManager {
     // Built-in 1x1 white texture backing material slots with no texture
     // assigned (constant-only materials).  Created on first material load.
     white_texture: Option<TextureHandle>,
+    // Built-in checkerboard, used as the visible placeholder for a model with
+    // no texture or material of its own (see Model::from_bytes).  Created on
+    // first use.
+    checker_texture: Option<TextureHandle>,
 
     file_to_string_buffer: HashMap<String, String>,
     file_to_byte_buffer: HashMap<String, ByteVec>,
@@ -367,6 +374,7 @@ impl AssetManager {
             model_mappings: ModelMappings::new(),
             material_mappings: MaterialMappings::new(),
             white_texture: None,
+            checker_texture: None,
 
             file_to_string_buffer,
             file_to_byte_buffer,
@@ -378,22 +386,15 @@ impl AssetManager {
         file_path: &str,
         device_resource: &DeviceResources<'_>,
     ) -> TextureHandle {
-        let mappings = &mut self.texture_mappings;
-        if let Some(handle) = mappings.names_to_handles.get(file_path) {
+        if let Some(handle) = self.texture_mappings.names_to_handles.get(file_path) {
             return *handle;
         }
 
         log!("AssetManager loading texture {file_path}");
-        let new_handle = {
-            if !mappings.next_handle.is_valid() {
-                mappings.next_handle.index = 0;
-            }
-            let new_handle = mappings.next_handle;
-            mappings.next_handle.index += 1;
-            new_handle
-        };
 
-        let new_texture = {
+        // Attempt the load without panicking: a missing or undecodable texture
+        // yields None, and we substitute the checkerboard below.
+        let loaded: Option<Texture> = {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let mut cwd: String = "".to_string();
@@ -425,15 +426,7 @@ impl AssetManager {
                         file_path.to_string()
                     }
                 };
-                Texture::from_file(&final_file_path, device_resource)
-                    .await
-                    .unwrap()
-
-                /*let current_exe = std::env::current_exe();
-                let exe_path = current_exe.as_ref().unwrap().parent().unwrap();
-                let final_file_path = format!("{}", exe_path.to_string_lossy());
-                let final_file_path = format!("{final_file_path}/{file_path}");
-                Texture::from_file(&final_file_path, device_resource).await.unwrap()*/
+                Texture::from_file(&final_file_path, device_resource).await.ok()
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -446,20 +439,40 @@ impl AssetManager {
                 // compile in -- e.g. ones the editor loads at runtime -- are
                 // fetched from /rust_assets/ instead, the same place the splat
                 // .ply/.glb files are served from (mirrors load_model).
-                let byte_buffer = match self.file_to_byte_buffer.get(file_name) {
-                    Some(buffer) => buffer.clone(),
-                    None => load_binary(file_path).await.unwrap(),
+                let bytes = match self.file_to_byte_buffer.get(file_name) {
+                    Some(buffer) => Some(buffer.clone()),
+                    None => load_binary(file_path).await.ok(),
                 };
-                Texture::from_bytes(
-                    &device_resource.device,
-                    &device_resource.queue,
-                    &byte_buffer,
-                    file_name,
-                )
-                .unwrap()
+                bytes.and_then(|b| {
+                    Texture::from_bytes(
+                        &device_resource.device,
+                        &device_resource.queue,
+                        &b,
+                        file_name,
+                    )
+                    .ok()
+                })
             }
         };
 
+        let Some(new_texture) = loaded else {
+            // Missing or undecodable: reuse the built-in checkerboard so it reads
+            // as an obvious "missing texture" placeholder rather than sampling
+            // garbage.  Cache it under this path so we don't retry every frame.
+            log!("Texture {file_path} missing/failed to load; using checkerboard");
+            let checker = self.checker_texture(device_resource);
+            self.texture_mappings
+                .names_to_handles
+                .insert(file_path.to_string(), checker);
+            return checker;
+        };
+
+        let mappings = &mut self.texture_mappings;
+        if !mappings.next_handle.is_valid() {
+            mappings.next_handle.index = 0;
+        }
+        let new_handle = mappings.next_handle;
+        mappings.next_handle.index += 1;
         mappings.handles_to_assets.insert(new_handle, new_texture);
         mappings
             .names_to_handles
@@ -716,6 +729,35 @@ impl AssetManager {
             .names_to_handles
             .insert("<white>".to_string(), handle);
         self.white_texture = Some(handle);
+        handle
+    }
+
+    /// The built-in checkerboard texture (created on first use), an engine asset
+    /// baked in so every project has it.  Used as the visible placeholder for a
+    /// model with no texture/material, instead of leaving it garbled or blank.
+    pub fn checker_texture(&mut self, device_resources: &DeviceResources<'_>) -> TextureHandle {
+        if let Some(handle) = self.checker_texture {
+            return handle;
+        }
+        let bytes = include_bytes!("../engine_assets/textures/checker_board.png");
+        let texture = Texture::from_bytes(
+            &device_resources.device,
+            &device_resources.queue,
+            bytes,
+            "checker_board",
+        )
+        .unwrap();
+        let mappings = &mut self.texture_mappings;
+        if !mappings.next_handle.is_valid() {
+            mappings.next_handle.index = 0;
+        }
+        let handle = mappings.next_handle;
+        mappings.next_handle.index += 1;
+        mappings.handles_to_assets.insert(handle, texture);
+        mappings
+            .names_to_handles
+            .insert("<checker>".to_string(), handle);
+        self.checker_texture = Some(handle);
         handle
     }
 

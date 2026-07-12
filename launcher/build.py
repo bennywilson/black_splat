@@ -48,6 +48,16 @@ WASM_ASSETS = {
     ],
 }
 
+# black_splat/engine_assets is the shared engine asset location: served for
+# EVERY example (paths relative to the repo root, not the example) so any
+# project can load an engine asset at runtime on the web, not just the ones the
+# engine bakes in via include_bytes!.  Keeps engine assets available everywhere
+# without per-project setup.
+ENGINE_WASM_ASSETS = [
+    ("engine_assets/textures/*.png", "rust_assets"),
+    ("engine_assets/textures/*.jpg", "rust_assets"),
+]
+
 URL_RE = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 PY = sys.executable or "python3"
 
@@ -111,17 +121,71 @@ def kill_tree(proc):
             pass
 
 
-def stream_step(cmd, cwd, log):
+def _cargo_env():
+    """Env that forces cargo to draw its progress bar even though our stdout is
+    a pipe (cargo hides it when it doesn't see a terminal -- which is why a
+    build looked dead between the sparse 'Compiling X' milestone lines). Colour
+    off so no ANSI junk reaches the web <pre> or a plain CLI."""
+    return {
+        **os.environ,
+        "CARGO_TERM_PROGRESS_WHEN": "always",
+        "CARGO_TERM_PROGRESS_WIDTH": "100",
+        "CARGO_TERM_COLOR": "never",
+    }
+
+
+def _stream(proc, on_line):
+    """Stream a process's merged stdout to on_line(text, transient).
+
+    Reads raw bytes (not text mode's universal-newline translation, which would
+    fold '\\r' into '\\n' and erase the distinction) and splits on both:
+      * '\\n'  -> a committed line            -> on_line(text, transient=False)
+      * '\\r'  -> an in-place redraw (e.g. the cargo progress bar, which repaints
+                 with a bare carriage return and no newline) -> transient=True
+    A '\\r\\n' pair counts as one committed line. Splitting only ever happens on
+    the ASCII bytes 0x0A/0x0D, which never occur inside a UTF-8 multibyte
+    sequence, so decoding each segment on its own is safe."""
+    stream = getattr(proc.stdout, "buffer", proc.stdout)
+    buf = bytearray()
+    seg = None  # bytes ended by a lone '\r', held one byte to disambiguate \r\n
+    while True:
+        chunk = stream.read1(4096) if hasattr(stream, "read1") else stream.read(4096)
+        if not chunk:
+            break
+        for b in chunk:
+            if seg is not None:
+                if b == 0x0A:  # the held '\r' was really a '\r\n' line ending
+                    on_line(seg.decode("utf-8", "replace"), False)
+                    seg = None
+                    continue
+                on_line(seg.decode("utf-8", "replace"), True)  # lone '\r': a redraw
+                seg = None
+                # fall through to handle b as the start of the next segment
+            if b == 0x0A:
+                on_line(buf.decode("utf-8", "replace"), False)
+                buf.clear()
+            elif b == 0x0D:
+                seg = bytes(buf)
+                buf.clear()
+            else:
+                buf.append(b)
+    if seg is not None:
+        on_line(seg.decode("utf-8", "replace"), False)
+    if buf:
+        on_line(buf.decode("utf-8", "replace"), False)
+
+
+def stream_step(cmd, cwd, log, env=None):
     """Run a subprocess to completion, streaming merged stdout/stderr to
-    log(line). Returns the exit code (or 1 if the executable is missing)."""
+    log(line[, transient]). Returns the exit code (or 1 if the executable is
+    missing)."""
     log(f"$ {' '.join(cmd)}")
     try:
-        proc = _popen(cmd, cwd)
+        proc = _popen(cmd, cwd, env=env)
     except FileNotFoundError:
         log(f"error: '{cmd[0]}' not found on PATH")
         return 1
-    for line in proc.stdout:
-        log(line.rstrip("\n"))
+    _stream(proc, log)
     proc.wait()
     return proc.returncode
 
@@ -134,7 +198,8 @@ def build_wasm(example, log):
     rel = os.path.join("target", "wasm32-unknown-unknown", "release")
     out_dir = os.path.join(ex_dir, rel)
 
-    if stream_step(["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"], ex_dir, log):
+    if stream_step(["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"],
+                   ex_dir, log, env=_cargo_env()):
         log("cargo build failed")
         return None
 
@@ -174,6 +239,18 @@ def build_wasm(example, log):
             elif "/fx/" in rel or "/textures/" in rel:
                 manifest["textures"].append(rel)
 
+    # Shared engine assets, served for every example (source paths are relative
+    # to the repo root).  Not added to the manifest -- these are engine
+    # internals a project loads by name, not browsable project resources.
+    for pattern, subdir in ENGINE_WASM_ASSETS:
+        dest = os.path.join(out_dir, subdir)
+        os.makedirs(dest, exist_ok=True)
+        matches = globmod.glob(os.path.join(ROOT, pattern), recursive=True)
+        for src in matches:
+            shutil.copy(src, dest)
+        if matches:
+            log(f"copied {len(matches)} engine asset(s): {pattern} -> {subdir}/")
+
     if WASM_ASSETS.get(example):
         manifest_dir = os.path.join(out_dir, "rust_assets")
         os.makedirs(manifest_dir, exist_ok=True)
@@ -190,11 +267,10 @@ def run_native(example, log, on_proc=None):
     ex_dir = os.path.join(EXAMPLES_DIR, example)
     cmd = ["cargo", "run", "--release"]
     log(f"$ {' '.join(cmd)}")
-    proc = _popen(cmd, ex_dir)
+    proc = _popen(cmd, ex_dir, env=_cargo_env())
     if on_proc:
         on_proc(proc)
-    for line in proc.stdout:
-        log(line.rstrip("\n"))
+    _stream(proc, log)
     proc.wait()
     return proc.returncode
 
@@ -382,16 +458,33 @@ def _cli():
         return
 
     example, action = args.example, args.action
+
+    # Render a transient (\r) redraw in place; move off it with a newline before
+    # the next committed line, so the progress bar behaves like it does in a
+    # normal cargo run instead of scrolling every frame.
+    pending_cr = [False]
+
+    def clog(line, transient=False):
+        if transient:
+            sys.stdout.write("\r" + line)
+            sys.stdout.flush()
+            pending_cr[0] = True
+        else:
+            if pending_cr[0]:
+                sys.stdout.write("\n")
+                pending_cr[0] = False
+            print(line)
+
     proc_holder = {}
     try:
         if action == "native":
-            code = run_native(example, print, on_proc=lambda p: proc_holder.update(proc=p))
+            code = run_native(example, clog, on_proc=lambda p: proc_holder.update(proc=p))
         else:
-            out_dir = build_wasm(example, print)
+            out_dir = build_wasm(example, clog)
             if out_dir is None:
                 sys.exit(1)
             code = run_serve(
-                example, out_dir, tunneled=(action == "tunnel"), log=print,
+                example, out_dir, tunneled=(action == "tunnel"), log=clog,
                 on_proc=lambda p: proc_holder.update(proc=p),
                 on_url=lambda label, url: print(f"--- {label}: {url}"),
             )
