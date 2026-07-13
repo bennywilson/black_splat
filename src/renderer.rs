@@ -1174,6 +1174,15 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Unloads a single splat cloud (editor per-splat delete / delete-undo).
+    /// Out-of-range indices are ignored.  See
+    /// `GaussianSplatPass::remove_model`.
+    pub fn remove_gaussian_splat(&mut self, index: usize) {
+        if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+            splat_pass.remove_model(index);
+        }
+    }
+
     /// Number of gaussian splats in the currently active cloud (0 if none).
     pub fn active_gaussian_splat_count(&self) -> u32 {
         self.gaussian_splat_pass
