@@ -6,7 +6,7 @@ use image::GenericImageView;
 use wgpu::{Device, DeviceDescriptor, Queue, SurfaceConfiguration};
 use wgpu_text::{BrushBuilder, TextBrush};
 
-use crate::{assets::*, config::*, log};
+use crate::{config::*, log};
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub enum BlendMode {
@@ -28,6 +28,38 @@ pub enum SceneLayer {
     WorldCustom,
     Foreground,
     ForegroundCustom,
+}
+
+/// Editor dropdown support.  The `*Custom` layers are offered too; an actor
+/// set to one only draws once a matching custom pass handle is assigned.
+impl crate::editor::EditorChoice for SceneLayer {
+    const NAMES: &'static [&'static str] = &[
+        "World",
+        "World Hole",
+        "World Custom",
+        "Foreground",
+        "Foreground Custom",
+    ];
+
+    fn choice_index(&self) -> usize {
+        match self {
+            SceneLayer::World => 0,
+            SceneLayer::WorldHole => 1,
+            SceneLayer::WorldCustom => 2,
+            SceneLayer::Foreground => 3,
+            SceneLayer::ForegroundCustom => 4,
+        }
+    }
+
+    fn from_choice_index(index: usize) -> Self {
+        match index {
+            1 => SceneLayer::WorldHole,
+            2 => SceneLayer::WorldCustom,
+            3 => SceneLayer::Foreground,
+            4 => SceneLayer::ForegroundCustom,
+            _ => SceneLayer::World,
+        }
+    }
 }
 
 #[repr(C)]
@@ -144,8 +176,13 @@ pub struct SpriteUniform {
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PostProcessUniform {
     // x: time, y: postprocess mode, z: 1.0 when the surface is non-sRGB (encode
-    // in-shader), w: 1.0 to apply the ACES tonemap.
+    // in-shader), w: 1.0 to apply the tonemap.
     pub time_mode_srgb_tonemap: [f32; 4],
+    // Tonemap curve params: x HighlightScale (A), y MidtoneScale (B),
+    // z HighlightCurve (C), w MidtoneCurve (D).  See postprocess_uber.wgsl.
+    pub tonemap_abcd: [f32; 4],
+    // x ShadowOffset (E), y exposure (pre-tonemap multiply), z/w unused.
+    pub tonemap_e_exposure: [f32; 4],
 }
 
 #[allow(dead_code)]
@@ -205,6 +242,26 @@ impl Texture {
         width: u32,
         height: u32,
     ) -> Result<Self> {
+        // The offscreen scene is a linear HDR float target (`SCENE_COLOR_FORMAT`).
+        // Storing linear radiance means alpha blending happens in linear space
+        // directly (no sRGB decode/encode round-trip needed), and lets lighting
+        // push values >1 for the tonemapper to compress.  Gaussian splats are
+        // display-referred, so they write `inverse_tonemap(srgb_to_linear(gs))`
+        // to sit in the same linear space (see gaussian_splat.wgsl); the final
+        // postprocess pass tonemaps + sRGB-encodes onto the surface on present.
+        let _ = surface_config;
+        Self::new_render_texture_with_format(device, SCENE_COLOR_FORMAT, width, height)
+    }
+
+    /// A render target in an explicit format -- used for the G-buffer's
+    /// normal/specular attachments, which store data (not color) and so must
+    /// not be sRGB-encoded.
+    pub fn new_render_texture_with_format(
+        device: &Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Render Target"),
             size: wgpu::Extent3d {
@@ -215,14 +272,7 @@ impl Texture {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            // Always render the offscreen scene into an sRGB target so alpha
-            // blending happens in linear space (the hardware decodes/encodes).
-            // On native the surface is already sRGB so this is a no-op; on web
-            // Chrome's canvas is non-sRGB `Bgra8Unorm`, and without this the
-            // scene would blend in gamma space -- making stacked transparent
-            // splats composite far too dark.  The postprocess pass converts back
-            // to the (possibly non-sRGB) surface on present.
-            format: surface_config.format.add_srgb_suffix(),
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -232,9 +282,9 @@ impl Texture {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -245,23 +295,15 @@ impl Texture {
         })
     }
 
-    pub async fn from_file(
-        file_path: &str,
-        device_resources: &DeviceResources<'_>,
+    pub fn from_bytes(
+        device: &Device,
+        queue: &Queue,
+        bytes: &[u8],
+        label: &str,
+        filter: TextureFilter,
     ) -> Result<Self> {
-        log!("Loading texture {}", file_path);
-        let texture_bytes = load_binary(file_path).await.unwrap(); //load_bytes!(file_path);
-        Texture::from_bytes(
-            &device_resources.device,
-            &device_resources.queue,
-            &texture_bytes,
-            file_path,
-        )
-    }
-
-    pub fn from_bytes(device: &Device, queue: &Queue, bytes: &[u8], label: &str) -> Result<Self> {
         let img = image::load_from_memory(bytes)?;
-        Self::from_image(device, queue, &img, Some(label))
+        Self::from_image(device, queue, &img, Some(label), filter)
     }
 
     pub fn from_rgba(
@@ -271,6 +313,7 @@ impl Texture {
         height: u32,
         device_resources: &DeviceResources<'_>,
         label: Option<&str>,
+        filter: TextureFilter,
     ) -> Result<Self> {
         let queue = &device_resources.queue;
         let device = &device_resources.device;
@@ -322,13 +365,14 @@ impl Texture {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (tex_filter, mip_filter) = filter.modes();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mag_filter: tex_filter,
+            min_filter: tex_filter,
+            mipmap_filter: mip_filter,
             ..Default::default()
         });
 
@@ -344,6 +388,7 @@ impl Texture {
         queue: &Queue,
         img: &image::DynamicImage,
         label: Option<&str>,
+        filter: TextureFilter,
     ) -> Result<Self> {
         let dimensions = img.dimensions();
         let size = wgpu::Extent3d {
@@ -381,13 +426,14 @@ impl Texture {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (tex_filter, mip_filter) = filter.modes();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mag_filter: tex_filter,
+            min_filter: tex_filter,
+            mipmap_filter: mip_filter,
             ..Default::default()
         });
 
@@ -396,6 +442,28 @@ impl Texture {
             view,
             sampler,
         })
+    }
+}
+
+/// Texture sampling mode chosen at load time.  Sprites/pixel-art want `Nearest`
+/// so atlas cells stay crisp and don't bleed across tile edges; 3D model maps
+/// want `Linear` for bilinear filtering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureFilter {
+    Nearest,
+    Linear,
+}
+
+impl TextureFilter {
+    fn modes(self) -> (wgpu::FilterMode, wgpu::MipmapFilterMode) {
+        match self {
+            TextureFilter::Nearest => {
+                (wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest)
+            }
+            TextureFilter::Linear => {
+                (wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Linear)
+            }
+        }
     }
 }
 
@@ -425,6 +493,23 @@ pub struct RenderContext<'ctx, 'dev> {
     pub config: &'ctx crate::config::Config,
 }
 
+/// Formats of the G-buffer's normal and specular attachments.  Normals are
+/// packed `n * 0.5 + 0.5`; specular is (rgb tint, a gloss).  Rgba8Unorm keeps
+/// both renderable on every backend (no float-target extensions needed).
+pub const GBUFFER_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub const GBUFFER_SPEC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Format of the offscreen scene color target (`render_textures[0]` and the
+/// `[2]` scratch).  Linear HDR float so lighting can exceed 1.0 and the
+/// postprocess tonemap has real range to compress; `Rgba16Float` is
+/// filterable on every backend (including WebGPU), so the upscale/bloom samplers
+/// work without a device feature.  Every pass that draws into the scene color
+/// must declare this as its color-target format.
+pub const SCENE_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Screen-space shadow masks (per-light temp + the multiplied accumulation
+/// texture the Gaussian-splat overlay reads): single-channel, 1 = fully lit.
+pub const SHADOW_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
 #[allow(dead_code)]
 pub struct DeviceResources<'a> {
     pub surface: wgpu::Surface<'a>,
@@ -436,9 +521,42 @@ pub struct DeviceResources<'a> {
     pub instance_buffer: wgpu::Buffer,
     pub brush: TextBrush<FontRef<'a>>,
     pub render_textures: Vec<Texture>, // [0] is color, [1] is depth
+    // Deferred world G-buffer: [0] albedo (sRGB), [1] world normal, [2] specular.
+    // The world pass writes them; the lighting pass reads them (with the depth
+    // in render_textures[1]) and composites into render_textures[0].
+    pub gbuffer_textures: Vec<Texture>,
 }
 
 impl<'a> DeviceResources<'a> {
+    fn make_gbuffer_textures(
+        device: &Device,
+        surface_config: &SurfaceConfiguration,
+        width: u32,
+        height: u32,
+    ) -> Vec<Texture> {
+        vec![
+            // Albedo: display-referred [0,1] color, kept as an sRGB 8-bit target
+            // (it doesn't need the scene color's HDR float range).  Its format
+            // must match the GBufferPass pipeline's target[0] (deferred.rs).
+            Texture::new_render_texture_with_format(
+                device,
+                surface_config.format.add_srgb_suffix(),
+                width,
+                height,
+            )
+            .unwrap(),
+            Texture::new_render_texture_with_format(
+                device,
+                GBUFFER_NORMAL_FORMAT,
+                width,
+                height,
+            )
+            .unwrap(),
+            Texture::new_render_texture_with_format(device, GBUFFER_SPEC_FORMAT, width, height)
+                .unwrap(),
+        ]
+    }
+
     pub fn resize(&mut self, game_config: &Config) {
         assert!(game_config.window_width > 0 && game_config.window_height > 0);
 
@@ -455,6 +573,8 @@ impl<'a> DeviceResources<'a> {
             Texture::new_depth_texture(&self.device, &self.surface_config, rw, rh).unwrap();
         self.render_textures[2] =
             Texture::new_render_texture(&self.device, &self.surface_config, rw, rh).unwrap();
+        self.gbuffer_textures =
+            Self::make_gbuffer_textures(&self.device, &self.surface_config, rw, rh);
     }
 
     pub async fn new(window: Arc<winit::window::Window>, game_config: &Config) -> Self {
@@ -563,6 +683,8 @@ impl<'a> DeviceResources<'a> {
             Texture::new_render_texture(&device, &surface_config, rw, rh).unwrap();
         render_textures.push(render_texture);
 
+        let gbuffer_textures = Self::make_gbuffer_textures(&device, &surface_config, rw, rh);
+
         log!("  Creating Font");
         let brush =
             BrushBuilder::using_font_bytes(include_bytes!("../engine_assets/fonts/bold.ttf"))
@@ -584,6 +706,7 @@ impl<'a> DeviceResources<'a> {
             instance_buffer,
             brush,
             render_textures,
+            gbuffer_textures,
         }
     }
 }

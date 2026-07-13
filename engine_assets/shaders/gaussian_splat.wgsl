@@ -8,6 +8,7 @@ struct GlobalConstants {
     splat_params: vec4<f32>,
     // x: max sh degree, y: overall scale, z/w: unused
     splat_params_2: vec4<f32>,
+    model: mat4x4<f32>,
 };
 
 struct Splat {
@@ -109,9 +110,20 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
         return output;
     }
 
+    // Cloud world transform (uniform scale only): pull the scalar scale off one
+    // column and normalize the 3x3 into a pure rotation.  The rotation orients
+    // the per-splat billboard, the scale grows it with the cloud, and positions
+    // still use the full model matrix.
+    let cloud_scale = length(u.model[0].xyz);
+    let cloud_rot = mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz) * (1.0 / max(cloud_scale, 0.000001));
+
     // Note: Dynamic indexing into an array requires a var instead of let on naga/Vulkan
     var axes = quat_axes(g_splats[splat_id].rotation);
-    let splat_pos = g_splats[splat_id].position.xyz * overall_scale;
+    axes[0] = cloud_rot * axes[0];
+    axes[1] = cloud_rot * axes[1];
+    axes[2] = cloud_rot * axes[2];
+    let local_pos = g_splats[splat_id].position.xyz * overall_scale;
+    let splat_pos = (u.model * vec4<f32>(local_pos, 1.0)).xyz;
     let splat_scale = g_splats[splat_id].scale_opacity.xyz;
     let splat_opacity = g_splats[splat_id].scale_opacity.w;
 
@@ -150,7 +162,7 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
     let offset_y = corner.y * long_scale;
 
     let vertex_offset = cam_right * offset_x + long_axis * offset_y;
-    let world_pos = splat_pos + vertex_offset * u.splat_params.y * overall_scale;
+    let world_pos = splat_pos + vertex_offset * u.splat_params.y * overall_scale * cloud_scale;
     let clip_pos = u.view_proj * vec4<f32>(world_pos, 1.0);
 
     output.position = clip_pos;

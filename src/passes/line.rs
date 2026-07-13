@@ -42,7 +42,6 @@ impl LinePass {
     ) -> Self {
         log!("Creating ModelPass with shader {shader_path}");
         let device = &device_resources.device;
-        let surface_config = &device_resources.surface_config;
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("LinePass_vertex_buffer"),
@@ -111,7 +110,7 @@ impl LinePass {
                 module: model_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

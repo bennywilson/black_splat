@@ -2,8 +2,8 @@ use cgmath::InnerSpace;
 use instant::Instant;
 
 use black_splat::{
-    assets::*, collision::*, config::*, engine::*, game_object::*, input::*,
-    renderer::*, resource::*, utils::*, log,
+    assets::*, collision::*, config::*, engine::*, fly_camera::*, game_object::*, input::*,
+    renderer::*, resource::*, touch_pads::*, utils::*, log,
 };
 
 use crate::{game_actors::*, game_vfx::*};
@@ -42,7 +42,9 @@ pub struct Example3DGame {
     next_harm_time: f32,
 
     crosshair_error: f32,
-    invert_y: bool,
+    fly_camera: FlyCamera,
+    touch_pads: TouchPads,
+
     debug_collision: bool,
     pause_monsters: bool,
 
@@ -185,6 +187,16 @@ impl GameEngine for Example3DGame {
         let mut game_camera = Camera::new();
         game_camera.set_position(&CgVec3::new(0.0, 3.5, -5.0));
 
+        // Walk-style fly camera: movement flattened to the ground plane, shift
+        // slows rather than sprints, and a tighter pitch range than the viewer.
+        let mut fly_camera = FlyCamera::default();
+        fly_camera.move_rate = CAMERA_MOVE_RATE;
+        fly_camera.shift_move_multiplier = 0.45;
+        fly_camera.key_look_rate = CAMERA_ROTATION_RATE;
+        fly_camera.walk_on_plane = true;
+        fly_camera.pitch_min = -60.0;
+        fly_camera.pitch_max = 75.0;
+
         Self {
             world_actors: Vec::<Actor>::new(),
             mobs: Vec::<GameMob>::new(),
@@ -205,8 +217,15 @@ impl GameEngine for Example3DGame {
             player: None,
             crosshair_error: 0.0,
             collision_manager: CollisionManager::new(),
+            fly_camera,
+            touch_pads: {
+                // Hidden until the first touch: mouse/keyboard players (native
+                // and web-on-desktop) never see them.
+                let mut pads = TouchPads::default();
+                pads.reveal_on_touch = true;
+                pads
+            },
             debug_collision: false,
-            invert_y: false,
             pause_monsters: false,
             score: 0,
             high_score: 0,
@@ -245,83 +264,6 @@ impl GameEngine for Example3DGame {
                 uv_tiles: (1.0, 1.0),
             });
         }
-
-        // Index 4 and 5 are the virtual thumb sticks
-        self.game_objects.push(GameObject {
-            position: CgVec3::new(1.45, -0.7, 0.0),
-            scale: CgVec3::new(0.2, 0.2, 1.0),
-            direction: (1.0, 0.0, 0.0).into(),
-            velocity: (0.0, 0.0, 0.0).into(),
-            object_type: GameObjectType::Background,
-            object_state: GameObjectState::Idle,
-            next_attack_time: 0.0,
-            texture_index: 0,
-            sprite_index: 43,
-            anim_frame: 0,
-            life_start_time: Instant::now(),
-            state_start_time: Instant::now(),
-            gravity_scale: 0.0,
-            random_val: random_f32(0.0, 1000.0),
-            is_enemy: false,
-            uv_tiles: (2.0, 2.0),
-        });
-
-        self.game_objects.push(GameObject {
-            position: CgVec3::new(-1.45, -0.7, 0.0),
-            scale: CgVec3::new(0.2, 0.2, 1.0),
-            direction: (1.0, 0.0, 0.0).into(),
-            velocity: (0.0, 0.0, 0.0).into(),
-            object_type: GameObjectType::Background,
-            object_state: GameObjectState::Idle,
-            next_attack_time: 0.0,
-            texture_index: 0,
-            sprite_index: 45,
-            anim_frame: 0,
-            life_start_time: Instant::now(),
-            state_start_time: Instant::now(),
-            gravity_scale: 0.0,
-            random_val: random_f32(0.0, 1000.0),
-            is_enemy: false,
-            uv_tiles: (2.0, 2.0),
-        });
-
-        self.game_objects.push(GameObject {
-            position: CgVec3::new(-1.45, -0.7, 0.0),
-            scale: CgVec3::new(0.1, 0.1, 1.0),
-            direction: (1.0, 0.0, 0.0).into(),
-            velocity: (0.0, 0.0, 0.0).into(),
-            object_type: GameObjectType::Background,
-            object_state: GameObjectState::Idle,
-            next_attack_time: 0.0,
-            texture_index: 0,
-            sprite_index: 58,
-            anim_frame: 0,
-            life_start_time: Instant::now(),
-            state_start_time: Instant::now(),
-            gravity_scale: 0.0,
-            random_val: random_f32(0.0, 1000.0),
-            is_enemy: false,
-            uv_tiles: (1.0, 1.0),
-        });
-
-        self.game_objects.push(GameObject {
-            position: CgVec3::new(1.45, -0.7, 0.0),
-            scale: CgVec3::new(0.1, 0.1, 1.0),
-            direction: (1.0, 0.0, 0.0).into(),
-            velocity: (0.0, 0.0, 0.0).into(),
-            object_type: GameObjectType::Background,
-            object_state: GameObjectState::Idle,
-            next_attack_time: 0.0,
-            texture_index: 0,
-            sprite_index: 59,
-            anim_frame: 0,
-            life_start_time: Instant::now(),
-            state_start_time: Instant::now(),
-            gravity_scale: 0.0,
-            random_val: random_f32(0.0, 1000.0),
-            is_enemy: false,
-            uv_tiles: (1.0, 1.0),
-        });
 
         self.shotgun_model = renderer
             .load_model("game_assets/models/shotgun.glb", false)
@@ -605,55 +547,14 @@ impl GameEngine for Example3DGame {
             game_object.update(game_config.delta_time);
         }
         let delta_time = game_config.delta_time;
-        let (_s, view_dir, right_dir) = self.game_camera.calculate_view_matrix();
-        let forward_dir = CgVec3::new(view_dir.x, 0.0, view_dir.z).normalize();
+        let (forward_dir, right_dir) = self.fly_camera.basis(&self.game_camera);
         let camera_pos = self.game_camera.get_position();
         let mut camera_rot = self.game_camera.get_rotation();
 
         let mut move_vec = CG_VEC3_ZERO;
-        let touch_map_iter = input_manager.get_touch_map().iter();
-        let mut local_move_vec_move = (0.0, 0.0);
-        let mut local_move_vec_look = (0.0, 0.0);
-        for touch_pair in touch_map_iter {
-            let touch = &touch_pair.1;
 
-            // Left thumb
-            if touch.touch_state.is_down() && touch.start_pos.0 < 500.0 {
-                local_move_vec_move.0 = (touch.current_pos.0 as f32 - 118.0).clamp(-90.0, 90.0);
-                if local_move_vec_move.0 < 0.0 {
-                    local_move_vec_move.0 = (local_move_vec_move.0 + 20.0).clamp(-90.0, 0.0);
-                } else {
-                    local_move_vec_move.0 = (local_move_vec_move.0 - 20.0).clamp(0.0, 90.0);
-                }
-                local_move_vec_move.1 = (touch.current_pos.1 as f32 - 660.0).clamp(-90.0, 90.0);
-                move_vec += right_dir * local_move_vec_move.0;
-                move_vec -= forward_dir * local_move_vec_move.1;
-            }
-
-            // Right Thumb
-            if touch.start_pos.1 > 570.0 && touch.touch_state.is_down() && touch.start_pos.0 > 500.0
-            {
-                local_move_vec_look.0 = (touch.current_pos.0 as f32 - 1233.0).clamp(-90.0, 90.0);
-                local_move_vec_look.1 = (touch.current_pos.1 as f32 - 660.0).clamp(-90.0, 90.0);
-                if local_move_vec_look.0 < 0.0 {
-                    local_move_vec_look.0 = (local_move_vec_look.0 + 20.0).clamp(-90.0, 0.0);
-                } else {
-                    local_move_vec_look.0 = (local_move_vec_look.0 - 20.0).clamp(0.0, 90.0);
-                }
-
-                camera_rot.x -= 2.0 * delta_time * local_move_vec_look.0;
-                camera_rot.y += 1.0 * delta_time * local_move_vec_look.1;
-            }
-
-            // Help
-            if touch.start_pos.0 < 300.0
-                && touch.start_pos.1 < 300.0
-                && touch.touch_state.just_pressed()
-            {
-                renderer.enable_help_text();
-            }
-
-            // Help
+        // Help: tap the top-left corner to toggle the controls overlay.
+        for (_id, touch) in input_manager.get_touch_map().iter() {
             if touch.start_pos.0 < 300.0
                 && touch.start_pos.1 < 300.0
                 && touch.touch_state.just_pressed()
@@ -662,21 +563,15 @@ impl GameEngine for Example3DGame {
             }
         }
 
-        if input_manager.get_key_state("w").is_down() {
-            move_vec += forward_dir
-        }
+        let ctx = renderer.egui_ctx().clone();
+        let pads = self.touch_pads.update(&ctx, input_manager, delta_time);
+        move_vec += right_dir * pads.move_deflection.x - forward_dir * pads.move_deflection.y;
+        camera_rot.x += pads.yaw_delta_deg * 1.5;
+        camera_rot.y += pads.pitch_delta_deg * 1.5;
 
-        if input_manager.get_key_state("s").is_down() {
-            move_vec += -forward_dir;
-        }
-
-        if input_manager.get_key_state("d").is_down() {
-            move_vec += right_dir;
-        }
-
-        if input_manager.get_key_state("a").is_down() {
-            move_vec += -right_dir;
-        }
+        // Keyboard WASD adds to the touch-pad contribution above; the combined
+        // direction is then normalized and scaled (shift = slow walk).
+        move_vec += self.fly_camera.wasd_direction(&self.game_camera, input_manager);
 
         move_vec = move_vec.normalize();
         if input_manager.get_key_state("left_shift").is_down() {
@@ -715,26 +610,11 @@ impl GameEngine for Example3DGame {
                 (self.crosshair_error - delta_time * CROSSHAIR_ERROR_RATE).clamp(0.0, 1.0);
         }
 
-        let x_radians = delta_time * CAMERA_ROTATION_RATE;
-        let y_radians = if self.invert_y {
-            -delta_time * CAMERA_ROTATION_RATE
-        } else {
-            delta_time * CAMERA_ROTATION_RATE
-        };
-
-        if input_manager.get_key_state("left_arrow").is_down() {
-            camera_rot.x += x_radians;
-        }
-        if input_manager.get_key_state("right_arrow").is_down() {
-            camera_rot.x -= x_radians;
-        }
-        if input_manager.get_key_state("up_arrow").is_down() {
-            camera_rot.y -= y_radians;
-        }
-        if input_manager.get_key_state("down_arrow").is_down() {
-            camera_rot.y += y_radians
-        }
-        camera_rot.y = camera_rot.y.clamp(-60.0, 75.0);
+        // Arrow-key look (touch right-thumb already applied to camera_rot above);
+        // clamp pitch once, after every look source.
+        self.fly_camera
+            .apply_key_look(&mut camera_rot, input_manager, delta_time);
+        self.fly_camera.clamp_pitch(&mut camera_rot);
 
         self.game_camera.set_rotation(&camera_rot);
         renderer.set_camera(&self.game_camera);
@@ -1019,7 +899,9 @@ impl GameEngine for Example3DGame {
                     positions[i] + (positions[i] - center).normalize() * self.crosshair_error * 0.1;
                 self.game_objects[i].scale = scale;
             }
-            //self.game_objects.truncate(8);
+            // Keep only the persistent HUD (crosshair, indices 0-3); drop last
+            // frame's ammo sprites before re-adding this frame's.
+            self.game_objects.truncate(4);
 
             let ammo_count = player.get_ammo_count();
             let mut position = CgVec3::new(1.65, 0.0, 0.0);
@@ -1049,22 +931,13 @@ impl GameEngine for Example3DGame {
             }
         }
 
-        // Virtual sticks
-        self.game_objects[6].position.x = (-1.45 + local_move_vec_move.0 * 0.001).clamp(-1.6, -1.4);
-        self.game_objects[6].position.y =
-            (-0.7 - local_move_vec_move.1 * 0.001).clamp(-0.85, -0.65);
-
-        self.game_objects[7].position.x = (1.45 + local_move_vec_look.0 * 0.001).clamp(1.4, 1.6);
-        self.game_objects[7].position.y =
-            (-0.7 - local_move_vec_look.1 * 0.001).clamp(-0.85, -0.65);
-
         // Debug
         if input_manager.get_key_state("i").just_pressed() {
             self.debug_collision = !self.debug_collision;
         }
 
         if input_manager.get_key_state("y").just_pressed() {
-            self.invert_y = !self.invert_y;
+            self.fly_camera.invert_pitch = !self.fly_camera.invert_pitch;
         }
 
         if input_manager.get_key_state("m").just_pressed() {

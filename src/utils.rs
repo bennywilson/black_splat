@@ -15,6 +15,33 @@ macro_rules! log {
     };
 }
 
+/// Polls `fut` once with a no-op waker, returning its output if it is already
+/// ready (or `None` if it would suspend).  For futures that never actually
+/// await real async work -- e.g. glb parsing on wasm, which does no I/O -- this
+/// drives them to completion synchronously, letting the non-async frame tick
+/// register a runtime-imported model without blocking (impossible on wasm).
+#[cfg(target_arch = "wasm32")]
+pub fn now_or_never<F: std::future::Future>(fut: F) -> Option<F::Output> {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_raw_waker() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            noop_raw_waker()
+        }
+        let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
+        RawWaker::new(std::ptr::null(), vtable)
+    }
+
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = Box::pin(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
 pub fn random_f32(min_val: f32, max_val: f32) -> f32 {
     let mut buf: [u8; 4] = [0, 0, 0, 0];
     let _ = getrandom::getrandom(&mut buf);
@@ -107,6 +134,12 @@ macro_rules! make_handle {
                     handles_to_assets,
                     next_handle,
                 }
+            }
+
+            /// Name -> handle view of every loaded asset, for editor
+            /// resource lists.
+            pub fn get_names_to_handles(&self) -> &HashMap<String, $handle_type> {
+                &self.names_to_handles
             }
         }
     };

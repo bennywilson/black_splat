@@ -34,9 +34,14 @@ var s_diffuse: sampler;
 var t_scene_color: texture_2d<f32>;
 
 struct PostProcessUniform {
-    // x: time, y: postprocess mode, z: 1.0 when surface is non-sRGB, w: tonemap
-    // operator (0 none, 1 Reinhard, 2 ACES).
+    // x: time, y: postprocess mode, z: 1.0 when surface is non-sRGB, w: 1.0 to
+    // apply the tonemap.
     time_mode_srgb_tonemap: vec4<f32>,
+    // Tonemap curve: x A (HighlightScale), y B (MidtoneScale),
+    // z C (HighlightCurve), w D (MidtoneCurve).
+    tonemap_abcd: vec4<f32>,
+    // x E (ShadowOffset), y exposure (pre-tonemap multiply).
+    tonemap_e_exposure: vec4<f32>,
 };
 @group(1) @binding(0)
 var<uniform> postprocess_buffer: PostProcessUniform;
@@ -62,18 +67,23 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(higher, lower, c < vec3<f32>(0.0031308));
 }
 
-// Narkowicz 2015 ACES filmic approximation, applied to linear color before the
-// sRGB encode.
-fn tonemap_aces(in_c: vec3<f32>) -> vec3<f32> {
-    let exposure = 0.2f;
-    let c = in_c * exposure;
+// Parameterized rational tonemap: y = (x(Ax+B)) / (x(Cx+D)+E), applied per
+// channel to linear radiance after an exposure multiply, before the sRGB
+// encode.  The CPU keeps the params invertible (A*D >= B*C and A/C >= 1) so
+// SplatCompositePass can pre-apply the exact inverse and pass splats through
+// unchanged (see splat_composite.wgsl).
+fn tonemap(in_c: vec3<f32>) -> vec3<f32> {
+    let a = postprocess_buffer.tonemap_abcd.x;
+    let b = postprocess_buffer.tonemap_abcd.y;
+    let c = postprocess_buffer.tonemap_abcd.z;
+    let d = postprocess_buffer.tonemap_abcd.w;
+    let e = postprocess_buffer.tonemap_e_exposure.x;
+    let exposure = postprocess_buffer.tonemap_e_exposure.y;
 
-    let a = 2.51;
-    let b = 0.03;
-    let d = 2.43;
-    let e = 0.59;
-    let f = 0.14;
-    return clamp((c * (a * c + b)) / (c * (d * c + e) + f), vec3<f32>(0.0), vec3<f32>(1.0));
+    let x = in_c * exposure;
+    let num = x * (a * x + b);
+    let denom = x * (c * x + d) + e;
+    return clamp(num / denom, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 @fragment
@@ -109,10 +119,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         outColor = textureSample(t_scene_color, s_diffuse, uv_offset);
     }
 
-    // ACES tonemap in linear space before any sRGB encode (w > 0.5 enables it).
-    /*if (postprocess_buffer.time_mode_srgb_tonemap.w > 0.5) {
-        outColor = vec4<f32>(tonemap_aces(outColor.rgb), outColor.a);
-    }*/
+    // Tonemap in linear space before any sRGB encode (w > 0.5 enables it).
+    if (postprocess_buffer.time_mode_srgb_tonemap.w > 0.5) {
+        outColor = vec4<f32>(tonemap(outColor.rgb), outColor.a);
+    }
 
     // .z flags a non-sRGB surface: encode here so colors aren't displayed dark.
     if (postprocess_buffer.time_mode_srgb_tonemap.z > 0.5) {

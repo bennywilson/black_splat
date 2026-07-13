@@ -107,7 +107,7 @@ Each example uses a config file that controls several parameters. There is an ex
 - [Learn wgpu](https://sotrh.github.io/learn-wgpu/#what-is-wgpu)
 - [Vulkan 1.3 specification](https://registry.khronos.org/vulkan/specs/1.3/html/vkspec.html)
 - [Tracy profiler](https://github.com/wolfpld/tracy)
-
+- [3D Gaussian Splatting for Real-Time Radiance Field Rendering + datasets](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/)
 ---
 
 Benny Wilson

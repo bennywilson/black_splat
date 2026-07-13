@@ -2,12 +2,71 @@
 
 <meta name="author" content="Benny Wilson">
 <title>Black Splat - Gaussian Splats</title>
+<style>
+	body, html {
+		margin: 0;
+		padding: 0;
+		width: 100%;
+		height: 100%;
+		overflow: hidden;
+	}
+	canvas {
+		display: block;
+		width: 100%;
+		height: 100%;
+	}
+</style>
 
 <!-- All GUI (buttons, sliders, touch pads) is egui, rendered in-engine on the
      canvas -- the page is just a host for the wasm module. -->
 
 <script type="module">
 	import init from "./black_splat_splat_demo.js";
+
+	function viewportSize() {
+		// visualViewport reflects the actual visible area on mobile (accounts
+		// for the URL bar sliding in/out and pinch-zoom); fall back to the
+		// window inner size where it isn't available.
+		const vv = window.visualViewport;
+		return {
+			width: vv ? vv.width : window.innerWidth,
+			height: vv ? vv.height : window.innerHeight,
+		};
+	}
+
+	function resizeCanvas() {
+		const canvas = document.getElementById("target");
+		if (!canvas) return;
+		const dpr = window.devicePixelRatio || 1;
+		const { width, height } = viewportSize();
+		// Always size the drawing buffer as a landscape (wide) view: the longer
+		// viewport edge is the width, the shorter is the height. Because
+		// rotating a device just swaps its two viewport dimensions, max/min
+		// yields the same buffer size in portrait and landscape -- so rotation
+		// no longer re-lays-out the scene or leaves it not fitting. The app is
+		// meant to be used in landscape; held in actual portrait the view is
+		// stretched by the canvas's 100%/100% CSS.
+		const long = Math.max(width, height);
+		const short = Math.min(width, height);
+		canvas.width = Math.round(long * dpr);
+		canvas.height = Math.round(short * dpr);
+		console.log(`Canvas resized to ${canvas.width}x${canvas.height}`);
+	}
+
+    // Resize canvas immediately when DOM is ready
+	function initCanvas() {
+		const canvas = document.getElementById("target");
+		if (canvas) {
+			resizeCanvas();
+		}
+	}
+
+	if (document.readyState === "loading") {
+		document.addEventListener("DOMContentLoaded", initCanvas);
+	} else {
+		initCanvas();
+	}
+
     window.addEventListener("load", () => {
         // Cache-bust the wasm URL so Chrome's compiled-wasm cache can't serve a
         // stale build across rebuilds (a plain reload otherwise reuses it).
@@ -18,6 +77,15 @@
             ),
         });
     });
+
+    // Handle window resize events. We no longer special-case orientation
+    // changes: the landscape-assumed buffer size is the same before and after
+    // a rotation, so a plain resize/visualViewport listener is enough (and
+    // catches genuine size changes like the mobile URL bar reflowing).
+    window.addEventListener("resize", resizeCanvas);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", resizeCanvas);
+    }
 </script>
 
-<canvas id="target" width="1280" height="720"></canvas>
+<canvas id="target"></canvas>

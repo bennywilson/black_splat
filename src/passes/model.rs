@@ -21,6 +21,9 @@ pub struct ModelUniform {
     pub model_color: [f32; 4],
     pub custom_data_1: [f32; 4],
     pub sun_color: [f32; 4],
+    // Material specular constant: rgb tint, a gloss (0..1).  Appended last so
+    // shaders declaring the older, shorter struct still bind this buffer.
+    pub spec_color: [f32; 4],
 }
 pub const MAX_UNIFORMS: usize = 100;
 
@@ -83,6 +86,23 @@ impl Model {
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
+        // Loading the texture is the only async step; the GPU resources are all
+        // built synchronously in `new_particle_with_texture`.
+        let texture_handle = asset_manager
+            .load_texture(texture_file_path, device_resources, TextureFilter::Linear)
+            .await;
+        Self::new_particle_with_texture(&texture_handle, device_resources, asset_manager)
+    }
+
+    /// Builds a particle model from an already-loaded texture (see
+    /// `AssetManager::load_texture`).  Synchronous, so callers outside an async
+    /// context (e.g. the frame tick) can spawn particles once the texture has
+    /// been preloaded.
+    pub fn new_particle_with_texture(
+        texture_handle: &TextureHandle,
+        device_resources: &DeviceResources<'_>,
+        asset_manager: &mut AssetManager,
+    ) -> Self {
         let device = &device_resources.device;
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -133,16 +153,27 @@ impl Model {
                         },
                         count: None,
                     },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("Model::texture_bind_group_layout"),
             });
 
-        let mut textures = Vec::<TextureHandle>::new();
-        let texture_handle = asset_manager
-            .load_texture(texture_file_path, device_resources)
-            .await;
-        textures.push(texture_handle);
+        let textures = vec![*texture_handle];
+        // Resolve the built-in white (a &mut borrow) before the shared texture
+        // borrows below. Bound to the metallic/roughness slots (2 and 3) so
+        // this model reads as constant-only PBR through the G-buffer shader.
+        let white_handle = asset_manager.white_texture(device_resources);
         let texture = asset_manager.get_texture(&textures[0]);
+        let white = asset_manager.get_texture(&white_handle);
 
         let tex_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
@@ -157,7 +188,11 @@ impl Model {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&texture.view),
+                    resource: wgpu::BindingResource::TextureView(&white.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
                 },
             ],
             label: Some("Model::tex_bind_group"),
@@ -247,7 +282,7 @@ impl Model {
                     if let Ok(dir) = std::env::current_dir() {
                         let file_path = format!("{}\\game_assets\\{}", dir.display(), uri);
                         let texture_handle = asset_manager
-                            .load_texture(&file_path, device_resources)
+                            .load_texture(&file_path, device_resources, TextureFilter::Linear)
                             .await;
                         textures.push(texture_handle);
                     }
@@ -348,37 +383,97 @@ impl Model {
                         },
                         count: None,
                     },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("Model_texture_bind_group_layout"),
             });
 
+        // Resolve the built-in checkerboard and white up front (a &mut borrow of
+        // the asset manager) so those borrows are released before we take the
+        // shared &Texture below. Cheap after the first call (cached). White backs
+        // the metallic/roughness slots so an untextured model reads as
+        // constant-only PBR through the G-buffer shader.
+        let checker_handle = asset_manager.checker_texture(device_resources);
+        let white_handle = asset_manager.white_texture(device_resources);
+
+        // Follow the material's baseColorTexture -> texture -> image chain to
+        // pick the *correct* embedded image. Blindly using gltf_images[0] binds
+        // whichever image happens to be first (often a normal/roughness map),
+        // which renders as a garbled surface.
+        let base_color_image_index = gltf_doc
+            .materials()
+            .find_map(|m| m.pbr_metallic_roughness().base_color_texture())
+            .map(|info| info.texture().source().index());
+
+        // Which embedded image to decode, if any: the material's base color if
+        // it declares one; otherwise (only when there's no explicit material to
+        // tell us) the first image as a best-effort guess.
+        let image_index = base_color_image_index.or_else(|| {
+            if gltf_doc.materials().next().is_none() && !gltf_images.is_empty() {
+                Some(0)
+            } else {
+                None
+            }
+        });
+
         let mut empty_texture = None;
+        if textures.is_empty() {
+            if let Some(image) = image_index.and_then(|i| gltf_images.get(i)) {
+                match image.format {
+                    gltf::image::Format::R8G8B8 | gltf::image::Format::R8G8B8A8 => {
+                        empty_texture = Texture::from_rgba(
+                            &image.pixels,
+                            image.format == gltf::image::Format::R8G8B8A8,
+                            image.width,
+                            image.height,
+                            device_resources,
+                            Some("gltf base color"),
+                            TextureFilter::Linear,
+                        )
+                        .ok();
+                    }
+                    other => {
+                        log!("gltf image format {other:?} unsupported; using checkerboard");
+                    }
+                }
+            }
+        }
+
         let texture = {
             if !textures.is_empty() {
+                // A URI-referenced texture was loaded (load_texture already
+                // substitutes the checkerboard for a missing/undecodable file).
                 asset_manager.get_texture(&textures[0])
+            } else if let Some(tex) = empty_texture.as_ref() {
+                tex
             } else {
-                let image = &gltf_images[0];
-                //   image.
-                empty_texture = Some(
-                    Texture::from_rgba(
-                        &gltf_images[0].pixels,
-                        image.format == gltf::image::Format::R8G8B8A8,
-                        image.width,
-                        image.height,
-                        device_resources,
-                        Some("gltf tex"),
-                    )
-                    .unwrap(),
-                );
-                empty_texture.as_ref().unwrap()
+                // Material references a texture we couldn't produce, or the
+                // model is untextured: show the checkerboard so it reads as an
+                // obvious placeholder rather than a garbled/blank surface.
+                asset_manager.get_texture(&checker_handle)
             }
         };
+
+        let white = asset_manager.get_texture(&white_handle);
 
         let mut surface_config = device_resources.surface_config.clone();
         surface_config.width = 1024;
         surface_config.height = 1024;
         let mut hole_texture = None; //
-        let mut tex_2_bind = wgpu::BindingResource::TextureView(&texture.view);
+        // Binding 2 is the metallic slot for the G-buffer shader (white =
+        // constant passes through), but the bullet-hole forward shader
+        // (model_with_holes.wgsl) samples this same slot as its hole mask -- so
+        // with holes it takes the hole render texture instead.
+        let mut tex_2_bind = wgpu::BindingResource::TextureView(&white.view);
         if use_holes {
             hole_texture = Some(
                 Texture::new_render_texture(
@@ -405,6 +500,10 @@ impl Model {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: tex_2_bind,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
                 },
             ],
             label: Some("Model::tex_bind_group"),
@@ -520,7 +619,6 @@ impl ModelPass {
     ) -> Self {
         log!("Creating ModelPass with shader {shader_path}");
         let device = &device_resources.device;
-        let surface_config = &device_resources.surface_config;
 
         // Uniform buffer
         let uniform = ModelUniform {
@@ -577,6 +675,16 @@ impl ModelPass {
                     },
                     BindGroupLayoutEntry {
                         binding: 2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 3,
                         visibility: ShaderStages::FRAGMENT,
                         ty: BindingType::Texture {
                             multisampled: false,
@@ -645,7 +753,7 @@ impl ModelPass {
                 module: model_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend,
                     write_mask,
                 })],
@@ -693,7 +801,7 @@ impl ModelPass {
                 module: particle_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -746,7 +854,7 @@ impl ModelPass {
                 module: particle_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format.add_srgb_suffix(),
+                    format: crate::resource::SCENE_COLOR_FORMAT,
                     blend: Some(additive_blend_state),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -906,20 +1014,18 @@ impl ModelPass {
             if actor_layer == SceneLayer::ForegroundCustom
                 || actor_layer == SceneLayer::WorldCustom
             {
-                match custom_pass_handle {
-                    None => {
-                        continue;
-                    }
-                    Some(h) => {
-                        if h != pass_handle.unwrap() {
-                            continue;
-                        }
-                    }
+                // Custom-layer actors only draw in their matching custom pass;
+                // ones without a pass handle assigned yet don't draw at all.
+                if custom_pass_handle.is_none() || custom_pass_handle != pass_handle {
+                    continue;
                 }
             }
             let actor = actor_key_value.1;
             let model_handle = actor.get_model();
-            let model = asset_manager.get_model(&model_handle).unwrap();
+            // Editor-placed actors can exist before a model is assigned.
+            let Some(model) = asset_manager.get_model(&model_handle) else {
+                continue;
+            };
 
             if !models_to_render.contains(&model_handle) {
                 models_to_render.push(model_handle);
@@ -937,7 +1043,13 @@ impl ModelPass {
                     actor.get_scale().z,
                 );
             uniform_data.world = world_matrix.into();
-            uniform_data.inv_world = world_matrix.invert().unwrap().into();
+            // A zero scale on any axis (easy to hit while dragging the editor's
+            // Scale field) makes the matrix singular: render the degenerate
+            // frame with an identity inverse instead of panicking.
+            uniform_data.inv_world = world_matrix
+                .invert()
+                .unwrap_or_else(cgmath::Matrix4::identity)
+                .into();
             uniform_data.mvp_matrix = (proj_matrix * view_matrix * world_matrix).into();
             uniform_data.view_proj = (proj_matrix * view_matrix).into();
             uniform_data.camera_dir = [view_dir.x, view_dir.y, view_dir.z, 0.0];
@@ -1085,7 +1197,11 @@ impl ModelPass {
             let mut uniform = ModelUniform {
                 ..Default::default()
             };
-            uniform.inv_world = world_matrix.invert().unwrap().into();
+            // Same zero-scale guard as the actor path above.
+            uniform.inv_world = world_matrix
+                .invert()
+                .unwrap_or_else(cgmath::Matrix4::identity)
+                .into();
             uniform.mvp_matrix = (view_proj_matrix * world_matrix).into();
             uniform.view_proj = (proj_matrix * view_matrix).into();
             uniform.camera_pos = view_pos;

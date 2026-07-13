@@ -11,6 +11,9 @@ pollster = "0.3"
 # Native + browser file-open dialog for the "load your own .ply" button.  On
 # wasm it wraps an HTML file input, so the picked file never leaves the device.
 rfd = "0.14"
+# Scene save/load (JSON).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 black_splat = { path = "../../" }
 
@@ -20,6 +23,12 @@ fs_extra = "1.2"
 glob = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4.42"
+# Untyped JS interop for the File System Access API save dialog (the typed
+# web-sys bindings for it sit behind the unstable-APIs cfg flag).
+js-sys = "0.3"
 # The engine's log! macro expands to web_sys::console at the call site.
-web-sys =  { version = "0.3.69", features = [] }
+# Window/Navigator are for the touch-device check (GUI sizing); Storage is the
+# localStorage that persists the startup scene.
+web-sys =  { version = "0.3.69", features = ["Window", "Navigator", "Storage"] }

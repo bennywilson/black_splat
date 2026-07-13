@@ -74,7 +74,7 @@ impl BulletHolePass {
         });
 
         let scorch_texture = asset_manager
-            .load_texture("/engine_assets/textures/scorch_t.png", device_resources)
+            .load_texture("/engine_assets/textures/scorch_t.png", device_resources, TextureFilter::Linear)
             .await;
         let scorch_tex = asset_manager.get_texture(&scorch_texture);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

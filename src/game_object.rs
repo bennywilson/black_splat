@@ -48,14 +48,14 @@ pub struct ParticleHandle {
 
 pub const INVALID_PARTICLE_HANDLE: ParticleHandle = ParticleHandle { index: u32::MAX };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ParticleBlendMode {
     Additive,
     AlphaBlend,
 }
 
 #[allow(dead_code)]
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParticleParams {
     pub texture_file: String,
     pub blend_mode: ParticleBlendMode,
@@ -137,8 +137,36 @@ impl ParticleActor {
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> Self {
+        // The only async step is fetching the texture; the model itself is built
+        // synchronously.  Split out so an already-loaded texture can be spawned
+        // from a non-async context (see `from_texture` / the editor).
+        let texture_handle = asset_manager
+            .load_texture(&params.texture_file, device_resources, TextureFilter::Nearest)
+            .await;
+        Self::from_texture(
+            transform,
+            particle_handle,
+            params,
+            &texture_handle,
+            device_resources,
+            asset_manager,
+        )
+    }
+
+    /// Builds a particle actor from a texture that's already loaded (see
+    /// `AssetManager::load_texture`).  Fully synchronous, so it can run inside
+    /// the frame tick -- the editor uses this to spawn particle systems on the
+    /// fly after preloading their texture.
+    pub fn from_texture(
+        transform: &ActorTransform,
+        particle_handle: &ParticleHandle,
+        params: &ParticleParams,
+        texture_handle: &TextureHandle,
+        device_resources: &DeviceResources<'_>,
+        asset_manager: &mut AssetManager,
+    ) -> Self {
         let model =
-            Model::new_particle(&params.texture_file, device_resources, asset_manager).await;
+            Model::new_particle_with_texture(texture_handle, device_resources, asset_manager);
         let spawn_rate = random_f32(params.min_start_spawn_rate, params.max_start_spawn_rate);
         let params = (*params).clone();
         let start_time = instant::Instant::now();
@@ -297,6 +325,7 @@ impl ParticleActor {
 #[derive(Debug, Clone)]
 pub struct Actor {
     pub id: u32,
+    name: String,
     position: CgVec3,
     rotation: CgQuat,
     scale: CgVec3,
@@ -307,7 +336,30 @@ pub struct Actor {
     custom_pass_handle: Option<usize>,
 
     model_handle: ModelHandle,
+    // Optional material override: when valid, the world G-buffer pass binds
+    // this material's textures/constants instead of the model's own textures.
+    material_handle: MaterialHandle,
+
+    // When true this actor is an invisible shadow-catcher proxy: it is skipped
+    // by the G-buffer (never shaded) and by the shadow casters, and instead
+    // renders only into the catcher depth so the deferred pass can project the
+    // inserted CG objects' shadows onto it and darken the Gaussian splats
+    // behind it -- grounding those objects in the splat scene.
+    shadow_catcher: bool,
 }
+
+// Editor markup: the fields the editor's Details panel shows and how each is
+// edited (see crate::editor).  Lives here because the fields are private.
+crate::editor_properties!(Actor {
+    name: text("Name"),
+    position: vec3("Position"),
+    rotation: rotation("Rotation"),
+    scale: vec3("Scale"),
+    layer: choice("Scene Layer"),
+    model_handle: model("Model"),
+    material_handle: material("Material"),
+    shadow_catcher: bool("Shadow Catcher"),
+});
 
 impl Default for Actor {
     fn default() -> Self {
@@ -317,20 +369,32 @@ impl Default for Actor {
 
 impl Actor {
     pub fn new() -> Self {
-        unsafe {
+        let id = unsafe {
             NEXT_ACTOR_ID += 1;
-            Actor {
-                id: NEXT_ACTOR_ID,
-                position: CG_VEC3_ZERO,
-                rotation: (0.0, 0.0, 0.0, 1.0).into(),
-                scale: CG_VEC3_ONE,
-                color: CG_VEC4_ONE,
-                custom_data_1: CG_VEC4_ZERO,
-                layer: SceneLayer::World,
-                custom_pass_handle: None,
-                model_handle: ModelHandle::make_invalid(),
-            }
+            NEXT_ACTOR_ID
+        };
+        Actor {
+            id,
+            name: format!("Actor {id}"),
+            position: CG_VEC3_ZERO,
+            rotation: (0.0, 0.0, 0.0, 1.0).into(),
+            scale: CG_VEC3_ONE,
+            color: CG_VEC4_ONE,
+            custom_data_1: CG_VEC4_ZERO,
+            layer: SceneLayer::World,
+            custom_pass_handle: None,
+            model_handle: ModelHandle::make_invalid(),
+            material_handle: MaterialHandle::make_invalid(),
+            shadow_catcher: false,
         }
+    }
+
+    pub fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
     }
 
     pub fn set_position(&mut self, position: &CgVec3) {
@@ -365,6 +429,14 @@ impl Actor {
         self.model_handle
     }
 
+    pub fn set_material(&mut self, new_material: &MaterialHandle) {
+        self.material_handle = *new_material;
+    }
+
+    pub fn get_material(&self) -> MaterialHandle {
+        self.material_handle
+    }
+
     pub fn set_layer(
         &mut self,
         new_layer: &SceneLayer,
@@ -393,6 +465,203 @@ impl Actor {
 
     pub fn get_custom_data_1(&self) -> CgVec4 {
         self.custom_data_1
+    }
+
+    pub fn set_shadow_catcher(&mut self, shadow_catcher: bool) {
+        self.shadow_catcher = shadow_catcher;
+    }
+
+    pub fn is_shadow_catcher(&self) -> bool {
+        self.shadow_catcher
+    }
+}
+
+static mut NEXT_LIGHT_ID: u32 = 0;
+
+/// The kind of light, selectable in the editor.  Directional and spot lights
+/// use the light's rotation as their direction; point lights are
+/// omnidirectional.  A skylight is an ambient hemisphere: it lights every
+/// surface by blending its top color (`color`) and bottom color (`color2`)
+/// on the world normal's up-ness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightType {
+    Directional,
+    Point,
+    Spot,
+    Skylight,
+}
+
+impl crate::editor::EditorChoice for LightType {
+    const NAMES: &'static [&'static str] = &["Directional", "Point", "Spot", "Skylight"];
+
+    fn choice_index(&self) -> usize {
+        match self {
+            LightType::Directional => 0,
+            LightType::Point => 1,
+            LightType::Spot => 2,
+            LightType::Skylight => 3,
+        }
+    }
+
+    fn from_choice_index(index: usize) -> Self {
+        match index {
+            0 => LightType::Directional,
+            2 => LightType::Spot,
+            3 => LightType::Skylight,
+            _ => LightType::Point,
+        }
+    }
+}
+
+/// A scene light, sampled by the deferred lighting pass (see
+/// `passes::deferred::LightingPass`).  `color2` is only used by skylights (the
+/// bottom hemisphere color); `range` only by point/spot lights; `spot_angle`
+/// (the cone's half-angle, degrees) only by spot lights.  No shadows yet --
+/// `casts_shadow` is carried for a future shadow pass.
+#[derive(Debug, Clone)]
+pub struct Light {
+    pub id: u32,
+    name: String,
+    position: CgVec3,
+    rotation: CgQuat,
+    light_type: LightType,
+    color: CgVec3,
+    color2: CgVec3,
+    intensity: f32,
+    range: f32,
+    spot_angle: f32,
+    casts_shadow: bool,
+}
+
+// Editor markup: the fields the Details panel shows and how each is edited.
+crate::editor_properties!(Light {
+    name: text("Name"),
+    position: vec3("Position"),
+    rotation: rotation("Rotation"),
+    light_type: choice("Type"),
+    color: color("Color"),
+    color2: color("Bottom Color"),
+    intensity: float("Intensity"),
+    range: float("Range"),
+    spot_angle: float("Spot Angle"),
+    casts_shadow: bool("Casts Shadow"),
+});
+
+impl Default for Light {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
+impl Light {
+    pub fn new() -> Self {
+        let id = unsafe {
+            NEXT_LIGHT_ID += 1;
+            NEXT_LIGHT_ID
+        };
+        Light {
+            id,
+            name: format!("Light {id}"),
+            position: CG_VEC3_ZERO,
+            rotation: CG_QUAT_IDENT,
+            light_type: LightType::Point,
+            color: CG_VEC3_ONE,
+            color2: CgVec3::new(0.25, 0.22, 0.2),
+            intensity: 1.0,
+            range: 10.0,
+            spot_angle: 30.0,
+            casts_shadow: true,
+        }
+    }
+
+    pub fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn set_position(&mut self, position: &CgVec3) {
+        self.position = *position;
+    }
+
+    pub fn get_position(&self) -> CgVec3 {
+        self.position
+    }
+
+    pub fn set_rotation(&mut self, rotation: &CgQuat) {
+        self.rotation = *rotation;
+    }
+
+    pub fn get_rotation(&self) -> CgQuat {
+        self.rotation
+    }
+
+    pub fn set_light_type(&mut self, light_type: LightType) {
+        self.light_type = light_type;
+    }
+
+    pub fn get_light_type(&self) -> LightType {
+        self.light_type
+    }
+
+    pub fn set_color(&mut self, color: CgVec3) {
+        self.color = color;
+    }
+
+    pub fn get_color(&self) -> CgVec3 {
+        self.color
+    }
+
+    /// The skylight's bottom-hemisphere color (`color` is the top).
+    pub fn set_color2(&mut self, color: CgVec3) {
+        self.color2 = color;
+    }
+
+    pub fn get_color2(&self) -> CgVec3 {
+        self.color2
+    }
+
+    pub fn set_intensity(&mut self, intensity: f32) {
+        self.intensity = intensity;
+    }
+
+    pub fn get_intensity(&self) -> f32 {
+        self.intensity
+    }
+
+    /// Point/spot falloff distance: no light beyond this range.
+    pub fn set_range(&mut self, range: f32) {
+        self.range = range;
+    }
+
+    pub fn get_range(&self) -> f32 {
+        self.range
+    }
+
+    /// Spot cone half-angle in degrees.
+    pub fn set_spot_angle(&mut self, degrees: f32) {
+        self.spot_angle = degrees;
+    }
+
+    pub fn get_spot_angle(&self) -> f32 {
+        self.spot_angle
+    }
+
+    /// The direction the light points (its rotated +Z axis), used by
+    /// directional and spot lights and the editor's icon arrow.
+    pub fn get_direction(&self) -> CgVec3 {
+        self.rotation * CgVec3::new(0.0, 0.0, 1.0)
+    }
+
+    pub fn set_casts_shadow(&mut self, casts_shadow: bool) {
+        self.casts_shadow = casts_shadow;
+    }
+
+    pub fn casts_shadow(&self) -> bool {
+        self.casts_shadow
     }
 }
 

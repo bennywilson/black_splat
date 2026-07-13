@@ -109,6 +109,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 	var edge_alpha_y: f32 = min( smoothstep( 0.0, 0.25, uvs.y ), 1.0 - smoothstep( 0.75, 1.0, uvs.y ) );
     var edge_alpha: f32 = min( edge_alpha_x, edge_alpha_y );
     var cloud_alpha: f32 = textureSample(t_noise, s_diffuse, uvs).b * 1.61 * smoothstep(0.0, 0.6, noise_color);
-    outColor.a = cloud_alpha - (outColor.r * 0.6);//smoothstep(0.0, 1.0, cloud_alpha);
+    outColor.a = saturate(cloud_alpha - (outColor.r * 0.6));
     return outColor;
 }

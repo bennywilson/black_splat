@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Black Splat - Front End</title>
+<style>
+  :root {
+    --bg: #000000; --panel: #0c0c0c; --panel2: #161616; --line: #262626;
+    --text: #ffffff; --muted: #9aa0aa; --accent: #5b9dff; --ok: #3fb950;
+    --fail: #f85149; --run: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    padding: 18px 22px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: 380px 6px 1fr; gap: 0; height: calc(100vh - 61px); }
+  @media (max-width: 720px) { main { grid-template-columns: 1fr; height: auto; } .splitter { display: none; } }
+  .examples { overflow-y: auto; padding: 14px; min-width: 0; min-height: 0; }
+  .splitter {
+    cursor: col-resize; background: var(--line); position: relative;
+  }
+  .splitter:hover, .splitter.dragging { background: var(--accent); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px; margin-bottom: 12px;
+  }
+  .card.active { border-color: var(--accent); }
+  .thumb {
+    display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover;
+    border-radius: 7px; margin-bottom: 10px; background: #000;
+    border: 1px solid var(--line);
+  }
+  .card h2 { margin: 0 0 2px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .card .crate { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex: 0 0 auto; }
+  .dot.running { background: var(--run); animation: pulse 1.1s infinite; }
+  .dot.ok { background: var(--ok); }
+  .dot.failed { background: var(--fail); }
+  .dot.stopped { background: var(--muted); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  /* Keep Run/Wasm/Tunnel/Stop on one row (the panel above is sized to fit
+     them); nowrap stops Stop from dropping to a second line. */
+  .btns { display: flex; flex-wrap: nowrap; gap: 6px; margin-top: 12px; }
+  button {
+    font: inherit; font-size: 12px; padding: 5px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--panel2); color: var(--text);
+    cursor: pointer; white-space: nowrap;
+  }
+  button:hover { border-color: var(--accent); }
+  button.stop { color: var(--fail); }
+  button:disabled { opacity: .45; cursor: default; }
+  .links { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+  /* Idle cards have empty links/qr containers; their top margin is the dead
+     space under the buttons. Collapse them until they actually have content. */
+  .links:empty, .qr:empty { display: none; }
+  .links a {
+    color: var(--accent); text-decoration: none; font-size: 13px;
+    font-family: ui-monospace, monospace; word-break: break-all;
+  }
+  .links a:hover { text-decoration: underline; }
+  .links .lbl { color: var(--muted); font-family: inherit; margin-right: 6px; }
+  .qr { margin-top: 12px; }
+  .qr svg {
+    width: 168px; height: 168px; display: block;
+    background: #fff; padding: 8px; border-radius: 8px;
+  }
+  .qr .cap { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .console { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .tabs { display: flex; gap: 4px; padding: 10px 14px 0; flex-wrap: wrap; }
+  .tab {
+    padding: 6px 12px; border: 1px solid var(--line); border-bottom: none;
+    border-radius: 8px 8px 0 0; background: var(--panel2); color: var(--muted);
+    cursor: pointer; font-size: 13px;
+  }
+  .tab.active { background: var(--panel); color: var(--text); border-color: var(--line); }
+  pre.log {
+    flex: 1; min-height: 0; margin: 0; padding: 14px 16px; overflow: auto; background: #000;
+    border-top: 1px solid var(--line);
+    font: 12.5px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre; /* don't wrap long build lines; scroll horizontally instead */
+  }
+  .log .cmd { color: var(--accent); }
+  .log .live { display: none; }  /* hidden in scrollable log; shown in fixed bar below */
+  .progress-bar {
+    padding: 8px 16px; background: #000; border-top: 1px solid var(--line);
+    font: 12.5px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--run); white-space: pre; overflow-x: auto; min-height: 1.5em;
+  }
+  .progress-bar:empty {
+    display: none; border-top: none; padding: 0; min-height: 0;
+  }
+  .empty { color: var(--muted); padding: 40px 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>black_splat launcher</h1>
+  <span class="sub">build &amp; run the samples</span>
+</header>
+<main>
+  <section class="examples" id="examples"></section>
+  <div class="splitter" id="splitter"></div>
+  <section class="console">
+    <div class="tabs" id="tabs"></div>
+    <pre class="log" id="log"><span class="empty">Pick an action to see build output here.</span></pre>
+    <div class="progress-bar" id="progress"></div>
+  </section>
+</main>
+<script>
+const state = {};      // name -> { status, links: {label:url}, log: [ {cmd,text} ] }
+let active = null;     // currently shown example tab
+const streams = {};    // name -> EventSource
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  return r.json();
+}
+
+function ensure(name) {
+  if (!state[name]) state[name] = { status: null, links: {}, log: [], live: null };
+  return state[name];
+}
+
+async function init() {
+  const examples = await api('/api/examples');
+  const host = document.getElementById('examples');
+  for (const ex of examples) {
+    ensure(ex.name);
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = 'card-' + ex.name;
+    card.innerHTML = `
+      ${ex.thumbnail ? `<img class="thumb" src="/api/thumb/${ex.name}" alt="">` : ''}
+      <h2><span class="dot" id="dot-${ex.name}"></span>${ex.name}</h2>
+      <div class="crate">${ex.crate}</div>
+      <div class="btns">
+        <button onclick="act('${ex.name}','native')">Run native</button>
+        <button onclick="act('${ex.name}','wasm')">Wasm</button>
+        <button onclick="act('${ex.name}','tunnel')">Tunnel</button>
+        <button onclick="act('${ex.name}','clean')">Clean</button>
+        <button class="stop" onclick="stop('${ex.name}')">Stop</button>
+      </div>
+      <div class="links" id="links-${ex.name}"></div>
+      <div class="qr" id="qr-${ex.name}"></div>`;
+    card.querySelector('h2').style.cursor = 'pointer';
+    card.querySelector('h2').onclick = () => show(ex.name);
+    host.appendChild(card);
+  }
+  // re-attach to anything already running (survives page reloads)
+  const st = await api('/api/state');
+  let first = null;
+  for (const name in st) {
+    ensure(name).status = st[name].status;
+    renderStatus(name);
+    if (st[name].status === 'running') { attach(name); first = first || name; }
+  }
+  if (first) show(first);
+  else if (examples[0]) active = examples[0].name;
+  renderTabs();
+}
+
+async function act(name, action) {
+  const s = ensure(name);
+  s.log = []; s.links = {}; s.qr = null; s.status = 'running';
+  renderLinks(name); renderQr(name); renderStatus(name);
+  show(name);
+  await api('/api/action', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ example: name, action }),
+  });
+  attach(name);
+}
+
+async function stop(name) {
+  await api('/api/stop', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ example: name }),
+  });
+}
+
+function attach(name) {
+  if (streams[name]) streams[name].close();
+  const es = new EventSource('/api/events?job=' + encodeURIComponent(name));
+  streams[name] = es;
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    const s = ensure(name);
+    if (ev.type === 'log') {
+      if (ev.transient) {
+        s.live = ev.line;                 // an in-place progress-bar redraw
+        if (active === name) renderLive(name);
+      } else {
+        s.log.push({ text: ev.line, cmd: ev.line.startsWith('$ ') });
+        if (active === name) appendCommitted(ev.line);
+        // Keep the progress bar across ordinary committed lines (the "Compiling
+        // X" milestones interleave with the bar's frames), but drop it when
+        // cargo signals the build itself is done: it prints a committed
+        // "Finished" line (success) or an "error" line (failure), after which
+        // no more progress frames arrive. The job stays "running" here -- the
+        // native window / dev server lives on -- so the status event won't fire
+        // to clear it; this is the real build-complete signal.
+        const t = ev.line.trimStart();
+        if (t.startsWith('Finished') || t.startsWith('error')) {
+          s.live = null;
+          if (active === name) renderLive(name);
+        }
+      }
+    } else if (ev.type === 'status') {
+      s.status = ev.status; renderStatus(name);
+      if (ev.status !== 'running') {
+        s.live = null;                    // drop the trailing bar frame
+        if (active === name) renderLive(name);  // immediately clear if viewing this tab
+        es.close(); delete streams[name];
+        // Links/QR point at a server that's no longer running -- clear them
+        // so a stale "Local"/tunnel URL or QR doesn't linger on the card.
+        s.links = {}; s.qr = null;
+        renderLinks(name); renderQr(name);
+      }
+    } else if (ev.type === 'url') {
+      s.links[ev.label] = ev.url; renderLinks(name);
+    } else if (ev.type === 'qr') {
+      s.qr = ev.svg; renderQr(name);
+    }
+  };
+  es.onerror = () => { es.close(); delete streams[name]; };
+}
+
+function renderStatus(name) {
+  const dot = document.getElementById('dot-' + name);
+  if (dot) dot.className = 'dot ' + (ensure(name).status || '');
+  const card = document.getElementById('card-' + name);
+  if (card) card.classList.toggle('active', ensure(name).status === 'running');
+}
+
+function renderLinks(name) {
+  const host = document.getElementById('links-' + name);
+  if (!host) return;
+  const links = ensure(name).links;
+  host.innerHTML = Object.entries(links)
+    .map(([lbl, url]) => `<a href="${url}" target="_blank"><span class="lbl">${lbl}</span>${url}</a>`)
+    .join('');
+}
+
+function renderQr(name) {
+  const host = document.getElementById('qr-' + name);
+  if (!host) return;
+  const svg = ensure(name).qr;
+  host.innerHTML = svg ? svg + '<div class="cap">scan to open on your phone</div>' : '';
+}
+
+function renderTabs() {
+  const host = document.getElementById('tabs');
+  host.innerHTML = '';
+  for (const name in state) {
+    const t = document.createElement('div');
+    t.className = 'tab' + (active === name ? ' active' : '');
+    t.textContent = name;
+    t.onclick = () => show(name);
+    host.appendChild(t);
+  }
+}
+
+function show(name) {
+  active = name;
+  renderTabs();
+  const log = document.getElementById('log');
+  const s = ensure(name);
+  if (!s.log.length && s.live == null) {
+    log.innerHTML = '<span class="empty">No output yet for ' + name + '.</span>';
+    return;
+  }
+  log.innerHTML = '';
+  for (const line of s.log) appendCommitted(line.text);
+  renderLive(name);
+}
+
+function clearEmpty(log) {
+  const empty = log.querySelector('.empty');
+  if (empty) log.innerHTML = '';
+}
+
+// Only auto-scroll if the user is already at (or near) the bottom, so
+// scrolling up to read earlier output doesn't get yanked back down.
+function isNearBottom(log) {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+}
+
+// A committed line is finalized output; it goes into the log.
+function appendCommitted(text) {
+  const log = document.getElementById('log');
+  const stick = isNearBottom(log);
+  clearEmpty(log);
+  const span = document.createElement('span');
+  if (text.startsWith('$ ')) span.className = 'cmd';
+  span.textContent = text + '\n';
+  log.appendChild(span);
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+
+// The progress bar is shown in a fixed bar at the bottom, not scrollable.
+function renderLive(name) {
+  const progress = document.getElementById('progress');
+  const s = ensure(name);
+  // Always show the current live text in the progress bar, or clear if none
+  progress.textContent = s.live ? s.live + '\n' : '';
+}
+
+(function initSplitter() {
+  const main = document.querySelector('main');
+  const splitter = document.getElementById('splitter');
+  const saved = localStorage.getItem('splitWidth');
+  if (saved) main.style.gridTemplateColumns = saved + 'px 6px 1fr';
+
+  let dragging = false;
+  splitter.addEventListener('mousedown', (e) => {
+    dragging = true;
+    splitter.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const rect = main.getBoundingClientRect();
+    const width = Math.min(Math.max(e.clientX - rect.left, 200), rect.width - 200);
+    main.style.gridTemplateColumns = width + 'px 6px 1fr';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove('dragging');
+    document.body.style.userSelect = '';
+    const width = parseInt(main.style.gridTemplateColumns, 10);
+    localStorage.setItem('splitWidth', width);
+  });
+})();
+
+init();
+</script>
+</body>
+</html>

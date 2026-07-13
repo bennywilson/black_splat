@@ -11,18 +11,27 @@ pub use egui;
 pub mod assets;
 pub mod collision;
 pub mod config;
+pub mod editor;
 pub mod engine;
+pub mod fly_camera;
 pub mod game_object;
+#[cfg(target_arch = "wasm32")]
+pub mod idb;
 pub mod input;
 pub mod renderer;
 pub mod resource;
+#[cfg(target_arch = "wasm32")]
+pub mod text_agent;
+pub mod touch_pads;
 pub mod utils;
 pub mod passes {
     pub mod bullet_hole;
+    pub mod deferred;
     pub mod gaussian_splat;
     pub mod line;
     pub mod model;
     pub mod postprocess;
+    pub mod splat_composite;
     pub mod sprite;
     pub mod sunbeam;
 }
@@ -104,6 +113,10 @@ where
     #[cfg(target_arch = "wasm32")]
     {
         use winit::platform::web::EventLoopExtWebSys;
+        // Mobile keyboards only appear while a real DOM editable is focused,
+        // so a hidden input mirrors egui's text focus and feeds keystrokes
+        // back in (see text_agent.rs).
+        let text_agent = crate::text_agent::TextAgent::install();
         // Closure-based loop (winit 0.30 prefers ApplicationHandler; see the
         // create_window note above).
         #[allow(deprecated)]
@@ -133,6 +146,9 @@ where
                             // Driven by requestAnimationFrame (see ResumeTimeReached).
                             hack_wait += 1;
                             if hack_wait > 6 {
+                                if let Some(agent) = &text_agent {
+                                    agent.drain_into(egui_state.egui_input_mut());
+                                }
                                 game_renderer
                                     .begin_egui_pass(egui_state.take_egui_input(&window));
                                 game_engine.tick_frame(
@@ -140,6 +156,11 @@ where
                                     &mut input_manager,
                                     &mut game_config,
                                 );
+                                if let Some(agent) = &text_agent {
+                                    agent.set_focus(
+                                        game_renderer.egui_ctx().egui_wants_keyboard_input(),
+                                    );
+                                }
                             }
                             if hack_wait > 8 {
                                 game_renderer
@@ -210,6 +231,15 @@ where
                                 if input_manager.get_key_state("h").just_pressed() {
                                     game_renderer.enable_help_text();
                                 }
+                            } else if event.state == ElementState::Released {
+                                // Always forward releases, even when egui
+                                // consumed them (e.g. a field grabbed focus
+                                // mid-hold): swallowing a release leaves the
+                                // key stuck "down" in the game -- held-key
+                                // actions (splat param nudges) run forever.
+                                input_manager.set_key_state(event.physical_key, event.state);
+                            }
+                            if !egui_consumed {
 
                                 if input_manager.get_key_state("v").just_pressed() {
                                     game_config.vsync = !game_config.vsync;
@@ -366,8 +396,17 @@ where
                                 if input_manager.get_key_state("h").just_pressed() {
                                     game_renderer.enable_help_text();
                                 }
+                            } else if event.state == ElementState::Released {
+                                // Always forward releases, even when egui
+                                // consumed them (e.g. a field grabbed focus
+                                // mid-hold): swallowing a release leaves the
+                                // key stuck "down" in the game -- held-key
+                                // actions (splat param nudges) run forever.
+                                input_manager.set_key_state(event.physical_key, event.state);
+                            }
+                            if !egui_consumed
 
-                                if input_manager.get_key_state("v").just_pressed() {
+                                && input_manager.get_key_state("v").just_pressed() {
                                     game_config.vsync = !game_config.vsync;
 
                                     if game_config.vsync {
@@ -379,7 +418,6 @@ where
                                         control_flow.set_control_flow(ControlFlow::Poll);
                                     }
                                 }
-                            }
                         }
 
                         _ => {}
