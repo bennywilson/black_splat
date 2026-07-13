@@ -149,6 +149,7 @@ impl InputManager {
             PhysicalKey::Code(KeyCode::KeyL) => "l",
             PhysicalKey::Code(KeyCode::KeyM) => "m",
             PhysicalKey::Code(KeyCode::KeyY) => "y",
+            PhysicalKey::Code(KeyCode::KeyZ) => "z",
             PhysicalKey::Code(KeyCode::KeyV) => "v",
             PhysicalKey::Code(KeyCode::ShiftLeft) => "left_shift",
             _ => "none",

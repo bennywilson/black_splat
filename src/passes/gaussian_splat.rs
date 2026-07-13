@@ -700,6 +700,25 @@ impl GaussianSplatPass {
         self.active_model = 0;
     }
 
+    /// Unloads a single cloud (its GPU buffers drop with it), keeping the
+    /// others and renumbering `active_model` so it still points at the same
+    /// logical cloud (or the next one, if the active cloud itself was
+    /// removed).  Out-of-range indices are ignored.  Used by the editor's
+    /// per-splat delete (and delete-undo).
+    pub fn remove_model(&mut self, index: usize) {
+        if index >= self.models.len() {
+            return;
+        }
+        self.models.remove(index);
+        if self.models.is_empty() {
+            self.active_model = 0;
+        } else if index < self.active_model {
+            self.active_model -= 1;
+        } else if index == self.active_model {
+            self.active_model = self.active_model.min(self.models.len() - 1);
+        }
+    }
+
     /// Number of gaussian splats in the currently active cloud (0 if none).
     pub fn active_splat_count(&self) -> u32 {
         self.models.get(self.active_model).map_or(0, |m| m.num_splats)

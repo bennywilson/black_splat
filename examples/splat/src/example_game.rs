@@ -548,6 +548,85 @@ enum Selection {
     PostProcess,
 }
 
+// ---- Undo/redo ---------------------------------------------------------
+// Command-based: every mutation the editor makes (transform, property edit,
+// create, delete) pushes an `UndoAction` describing how to reverse and
+// reapply it.  Actions are keyed by `ObjectRef` (a stable id/handle/name),
+// never by `Selection`'s raw Vec index -- indices shift as other objects are
+// inserted/removed elsewhere in the same list, which would silently corrupt
+// any older pending entry if it stored a plain `usize`.
+
+/// Stable reference to a scene object, independent of its current position in
+/// `scene_actors`/etc.  Resolved back to a `Selection` (i.e. a live index) at
+/// undo/redo time via `SplatGame::resolve_ref`.
+#[derive(Clone, PartialEq)]
+enum ObjectRef {
+    Actor(u32),
+    Light(u32),
+    Particle(ParticleHandle),
+    // By name: splats have no other stable id, and can't be deleted/recreated
+    // in the same synchronous frame as other list edits, so name collisions
+    // aren't a practical concern here.
+    Splat(String),
+    PostProcess,
+}
+
+/// A full clone of one scene object's editable state: what an undo/redo entry
+/// restores, and what a pending edit is diffed against once its gesture ends.
+#[derive(Clone)]
+enum ObjectSnapshot {
+    Actor(Actor),
+    Light(Light),
+    Particle(SceneParticle),
+    Splat(SceneSplat),
+    PostProcess(PostProcessSettings),
+}
+
+/// One undoable editor action.  `Edit` covers both gizmo-transform drags and
+/// Details-panel property edits (including rename) -- both are just "restore
+/// this object's full state," so they share one variant.
+enum UndoAction {
+    Edit {
+        obj: ObjectRef,
+        before: ObjectSnapshot,
+        after: ObjectSnapshot,
+    },
+    Create {
+        obj: ObjectRef,
+        snapshot: ObjectSnapshot,
+        index_hint: usize,
+    },
+    Delete {
+        obj: ObjectRef,
+        snapshot: ObjectSnapshot,
+        index_hint: usize,
+    },
+    /// Several edits committed as one gesture (a multi-selection gizmo drag);
+    /// undone/redone together.
+    Batch(Vec<UndoAction>),
+}
+
+/// Caps memory: an editing session doesn't need unbounded undo history.
+const UNDO_STACK_MAX: usize = 100;
+
+/// Two LIFO stacks.  Pushing a new action always clears `redo` -- the
+/// standard "any new edit invalidates the redo branch" rule.
+#[derive(Default)]
+struct UndoStack {
+    undo: Vec<UndoAction>,
+    redo: Vec<UndoAction>,
+}
+
+impl UndoStack {
+    fn push(&mut self, action: UndoAction) {
+        self.undo.push(action);
+        if self.undo.len() > UNDO_STACK_MAX {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+}
+
 /// What the "Add" menu asked to create this frame (applied after the egui pass).
 #[derive(Clone, Copy)]
 enum AddKind {
@@ -560,6 +639,7 @@ enum AddKind {
 /// A loaded splat cloud as a scene object: a display name plus its own render
 /// params (shown in the Details panel when selected).  Index-aligned with the
 /// renderer's splat clouds.
+#[derive(Clone)]
 struct SceneSplat {
     name: String,
     // Where the .ply came from (stored in saved scenes so they can reload it).
@@ -1068,6 +1148,7 @@ fn draw_particle_params_ui(
 /// renderer (keyed by `handle`); its name and transform are mirrored here so the
 /// outliner, Details panel and gizmo can edit it -- transform edits are pushed
 /// back with Renderer::update_particle_transform.
+#[derive(Clone)]
 struct SceneParticle {
     name: String,
     handle: ParticleHandle,
@@ -1264,6 +1345,20 @@ pub struct SplatGame {
     // the same curve so display-referred splats survive the tonemap.  A list of
     // these (blended per volume) is the eventual shape.
     scene_post_process: PostProcessSettings,
+    // Undo/redo history for transforms, property edits, and create/delete.
+    undo_stack: UndoStack,
+    // "Before" snapshot(s) for a transform/property gesture in progress,
+    // captured on its first changed frame and committed to `undo_stack` once
+    // the gesture ends (gizmo release / a frame with no further change).  A
+    // single-selection gizmo drag or a Details edit uses a 1-element Vec; a
+    // multi-selection gizmo drag uses one entry per dragged object (committed
+    // as an `UndoAction::Batch`).
+    pending_gizmo_edit: Option<Vec<(Selection, ObjectRef, ObjectSnapshot)>>,
+    pending_property_edit: Option<(Selection, ObjectRef, ObjectSnapshot)>,
+    // Splat names currently being (re)loaded because of an undo/redo (rather
+    // than a user Add/Load), so `drain_pending_splats` knows not to push
+    // another Create action for them when they land.
+    undo_pending_splat_loads: std::collections::HashSet<String>,
     // Scene-tab selection (actor / light / particle), if any.
     selected: Option<Selection>,
     // Ctrl+click multi-selection, in click order (`selected` is its last
@@ -1692,7 +1787,15 @@ impl SplatGame {
 
         self.next_object_num += 1;
         self.scene_actors.push(actor);
-        self.select_after_add(Selection::Actor(self.scene_actors.len() - 1));
+        let index = self.scene_actors.len() - 1;
+        self.select_after_add(Selection::Actor(index));
+        if let Some((obj, snapshot)) = self.snapshot_object(Selection::Actor(index)) {
+            self.undo_stack.push(UndoAction::Create {
+                obj,
+                snapshot,
+                index_hint: index,
+            });
+        }
     }
 
     /// Drops a new light of the given type into the scene ahead of the camera
@@ -1708,7 +1811,15 @@ impl SplatGame {
         }
         renderer.add_or_update_light(&light);
         self.scene_lights.push(light);
-        self.select_after_add(Selection::Light(self.scene_lights.len() - 1));
+        let index = self.scene_lights.len() - 1;
+        self.select_after_add(Selection::Light(index));
+        if let Some((obj, snapshot)) = self.snapshot_object(Selection::Light(index)) {
+            self.undo_stack.push(UndoAction::Create {
+                obj,
+                snapshot,
+                index_hint: index,
+            });
+        }
     }
 
     /// The skylight every new scene starts with (deletable like any light).
@@ -1785,45 +1896,470 @@ impl SplatGame {
         let name = format!("{preset_name} {}", self.next_object_num);
         let spawn_pos = self.spawn_point();
         if self.spawn_particle(&preset_name, name, spawn_pos, CG_VEC3_ONE, renderer) {
-            self.select_after_add(Selection::Particle(self.scene_particles.len() - 1));
+            let index = self.scene_particles.len() - 1;
+            self.select_after_add(Selection::Particle(index));
+            if let Some((obj, snapshot)) = self.snapshot_object(Selection::Particle(index)) {
+                self.undo_stack.push(UndoAction::Create {
+                    obj,
+                    snapshot,
+                    index_hint: index,
+                });
+            }
         }
     }
 
     /// Removes the selected object from its list and the renderer, keeping the
-    /// Scene-tab selection valid.
+    /// Scene-tab selection valid.  Pushes an undo entry (see `UndoAction::Delete`)
+    /// unless nothing was actually removed.
     fn delete_selected(&mut self, sel: Selection, renderer: &mut Renderer) {
-        match sel {
+        // Snapshot before removal so Ctrl+Z can restore it.
+        let before = self.snapshot_object(sel);
+        let removed_index = match sel {
             Selection::Actor(i) => {
                 if i >= self.scene_actors.len() {
-                    return;
+                    None
+                } else {
+                    let actor = self.scene_actors.remove(i);
+                    renderer.remove_actor(&actor);
+                    Some(i)
                 }
-                let actor = self.scene_actors.remove(i);
-                renderer.remove_actor(&actor);
             }
             Selection::Light(i) => {
                 if i >= self.scene_lights.len() {
-                    return;
+                    None
+                } else {
+                    let light = self.scene_lights.remove(i);
+                    renderer.remove_light(&light);
+                    Some(i)
                 }
-                let light = self.scene_lights.remove(i);
-                renderer.remove_light(&light);
             }
             Selection::Particle(i) => {
                 if i >= self.scene_particles.len() {
-                    return;
+                    None
+                } else {
+                    let particle = self.scene_particles.remove(i);
+                    renderer.remove_particle_actor(&particle.handle);
+                    Some(i)
                 }
-                let particle = self.scene_particles.remove(i);
-                renderer.remove_particle_actor(&particle.handle);
             }
-            // Splats have no delete button in the outliner, so this is never
-            // reached; unloading a cloud from the renderer isn't supported yet.
-            Selection::Splat(_) => return,
+            Selection::Splat(i) => {
+                if i >= self.scene_splats.len() {
+                    None
+                } else {
+                    self.scene_splats.remove(i);
+                    renderer.remove_gaussian_splat(i);
+                    // Mirror the active-cloud renumbering GaussianSplatPass::
+                    // remove_model applied on the renderer side.
+                    if self.scene_splats.is_empty() {
+                        self.active_splat = 0;
+                    } else if i < self.active_splat {
+                        self.active_splat -= 1;
+                    } else if i == self.active_splat {
+                        self.active_splat = self.active_splat.min(self.scene_splats.len() - 1);
+                        renderer.set_active_gaussian_splat(self.active_splat);
+                        if let Some(active) = self.scene_splats.get(self.active_splat) {
+                            renderer.set_gaussian_splat_params(&active.params);
+                            renderer.set_gaussian_splat_transform(&active.transform);
+                        }
+                    }
+                    Some(i)
+                }
+            }
             // The post-process singleton is always present; it can't be deleted.
-            Selection::PostProcess => return,
+            Selection::PostProcess => None,
+        };
+        let Some(index) = removed_index else {
+            return;
+        };
+        if let Some((obj, snapshot)) = before {
+            self.undo_stack.push(UndoAction::Delete {
+                obj,
+                snapshot,
+                index_hint: index,
+            });
         }
         self.selected = selection_after_delete(self.selected, sel);
         // Deleting shifts indices; drop the multi-selection rather than remap.
         self.multi_selected.clear();
         self.context_menu = None;
+    }
+
+    /// Captures a stable reference + full clone of the given selection's
+    /// current state, for the undo stack.  `None` if the index is stale.
+    fn snapshot_object(&self, sel: Selection) -> Option<(ObjectRef, ObjectSnapshot)> {
+        match sel {
+            Selection::Actor(i) => self
+                .scene_actors
+                .get(i)
+                .map(|a| (ObjectRef::Actor(a.id), ObjectSnapshot::Actor(a.clone()))),
+            Selection::Light(i) => self
+                .scene_lights
+                .get(i)
+                .map(|l| (ObjectRef::Light(l.id), ObjectSnapshot::Light(l.clone()))),
+            Selection::Particle(i) => self.scene_particles.get(i).map(|p| {
+                (
+                    ObjectRef::Particle(p.handle.clone()),
+                    ObjectSnapshot::Particle(p.clone()),
+                )
+            }),
+            Selection::Splat(i) => self
+                .scene_splats
+                .get(i)
+                .map(|s| (ObjectRef::Splat(s.name.clone()), ObjectSnapshot::Splat(s.clone()))),
+            Selection::PostProcess => Some((
+                ObjectRef::PostProcess,
+                ObjectSnapshot::PostProcess(self.scene_post_process),
+            )),
+        }
+    }
+
+    /// Finds the current `Selection` (i.e. live Vec index) a stable
+    /// `ObjectRef` refers to.  `None` if that object no longer exists.
+    fn resolve_ref(&self, obj: &ObjectRef) -> Option<Selection> {
+        match obj {
+            ObjectRef::Actor(id) => self
+                .scene_actors
+                .iter()
+                .position(|a| a.id == *id)
+                .map(Selection::Actor),
+            ObjectRef::Light(id) => self
+                .scene_lights
+                .iter()
+                .position(|l| l.id == *id)
+                .map(Selection::Light),
+            ObjectRef::Particle(h) => self
+                .scene_particles
+                .iter()
+                .position(|p| &p.handle == h)
+                .map(Selection::Particle),
+            ObjectRef::Splat(name) => self
+                .scene_splats
+                .iter()
+                .position(|s| &s.name == name)
+                .map(Selection::Splat),
+            ObjectRef::PostProcess => Some(Selection::PostProcess),
+        }
+    }
+
+    /// Overwrites the object `obj` currently refers to with `snapshot`'s data
+    /// and pushes the change to the renderer -- the same call an interactive
+    /// edit would make.  Used to apply both sides of an `UndoAction::Edit`
+    /// (before = undo, after = redo).  A no-op if the object no longer exists.
+    fn restore_snapshot(
+        &mut self,
+        obj: &ObjectRef,
+        snapshot: &ObjectSnapshot,
+        renderer: &mut Renderer,
+    ) {
+        let Some(sel) = self.resolve_ref(obj) else {
+            return;
+        };
+        match (sel, snapshot) {
+            (Selection::Actor(i), ObjectSnapshot::Actor(a)) => {
+                if let Some(slot) = self.scene_actors.get_mut(i) {
+                    *slot = a.clone();
+                    renderer.add_or_update_actor(slot);
+                }
+            }
+            (Selection::Light(i), ObjectSnapshot::Light(l)) => {
+                if let Some(slot) = self.scene_lights.get_mut(i) {
+                    *slot = l.clone();
+                    renderer.add_or_update_light(slot);
+                }
+            }
+            (Selection::Particle(i), ObjectSnapshot::Particle(p)) => {
+                if let Some(slot) = self.scene_particles.get_mut(i) {
+                    // Keep the live handle -- the snapshot's is only an
+                    // ObjectRef identity, not a different live emitter.
+                    let handle = slot.handle.clone();
+                    *slot = p.clone();
+                    slot.handle = handle;
+                    renderer.update_particle_transform(
+                        &slot.handle,
+                        &slot.position,
+                        &Some(slot.scale),
+                    );
+                }
+            }
+            (Selection::Splat(i), ObjectSnapshot::Splat(s)) => {
+                if let Some(slot) = self.scene_splats.get_mut(i) {
+                    *slot = s.clone();
+                    if i == self.active_splat {
+                        renderer.set_gaussian_splat_params(&slot.params);
+                        renderer.set_gaussian_splat_transform(&slot.transform);
+                    }
+                }
+            }
+            (Selection::PostProcess, ObjectSnapshot::PostProcess(pp)) => {
+                self.scene_post_process = *pp;
+                renderer.set_post_process_settings(&self.scene_post_process);
+            }
+            // Kind mismatch shouldn't happen: an ObjectRef always resolves to
+            // the same kind of Selection its own snapshot variant carries.
+            _ => {}
+        }
+        self.selected = Some(sel);
+    }
+
+    /// Removes the object `obj` currently refers to from its list and the
+    /// renderer.  Used by undo-of-create and redo-of-delete; splats route
+    /// through the same active-cloud renumbering as `delete_selected`.
+    fn remove_by_ref(&mut self, obj: &ObjectRef, renderer: &mut Renderer) {
+        let Some(sel) = self.resolve_ref(obj) else {
+            return;
+        };
+        match sel {
+            Selection::Actor(i) => {
+                let actor = self.scene_actors.remove(i);
+                renderer.remove_actor(&actor);
+            }
+            Selection::Light(i) => {
+                let light = self.scene_lights.remove(i);
+                renderer.remove_light(&light);
+            }
+            Selection::Particle(i) => {
+                let particle = self.scene_particles.remove(i);
+                renderer.remove_particle_actor(&particle.handle);
+            }
+            Selection::Splat(i) => {
+                self.scene_splats.remove(i);
+                renderer.remove_gaussian_splat(i);
+                if self.scene_splats.is_empty() {
+                    self.active_splat = 0;
+                } else if i < self.active_splat {
+                    self.active_splat -= 1;
+                } else if i == self.active_splat {
+                    self.active_splat = self.active_splat.min(self.scene_splats.len() - 1);
+                    renderer.set_active_gaussian_splat(self.active_splat);
+                    if let Some(active) = self.scene_splats.get(self.active_splat) {
+                        renderer.set_gaussian_splat_params(&active.params);
+                        renderer.set_gaussian_splat_transform(&active.transform);
+                    }
+                }
+            }
+            Selection::PostProcess => {}
+        }
+        self.selected = selection_after_delete(self.selected, sel);
+        self.multi_selected.clear();
+    }
+
+    /// Recreates `snapshot` (undo-of-delete / redo-of-create) and selects it.
+    /// Actor/Light/Particle recreate synchronously; a splat's GPU data isn't
+    /// retained after removal, so it re-queues an async reload from its
+    /// stored path (same path scene load uses) -- if that's empty (a
+    /// browser-picked cloud with no re-readable source), recreation can't
+    /// happen and this is a no-op, matching the same documented limitation
+    /// scene save/load already has for such clouds.
+    ///
+    /// Returns `Some((old_handle, new_handle))` when recreating a particle
+    /// issued a fresh renderer handle, so the caller can repoint the action
+    /// currently being processed (not yet back on either stack, so
+    /// `remap_particle_handle` -- called internally for every OTHER pending
+    /// entry -- can't reach it).
+    fn recreate_snapshot(
+        &mut self,
+        snapshot: &ObjectSnapshot,
+        renderer: &mut Renderer,
+    ) -> Option<(ParticleHandle, ParticleHandle)> {
+        match snapshot {
+            ObjectSnapshot::Actor(a) => {
+                renderer.add_or_update_actor(a);
+                self.scene_actors.push(a.clone());
+                self.select_after_add(Selection::Actor(self.scene_actors.len() - 1));
+                None
+            }
+            ObjectSnapshot::Light(l) => {
+                renderer.add_or_update_light(l);
+                self.scene_lights.push(l.clone());
+                self.select_after_add(Selection::Light(self.scene_lights.len() - 1));
+                None
+            }
+            ObjectSnapshot::Particle(p) => {
+                // Re-spawns through the normal path (issues a NEW renderer
+                // handle) rather than trying to resurrect the old one.
+                if self.spawn_particle(&p.preset, p.name.clone(), p.position, p.scale, renderer) {
+                    let new_index = self.scene_particles.len() - 1;
+                    let new_handle = self.scene_particles[new_index].handle.clone();
+                    self.select_after_add(Selection::Particle(new_index));
+                    if new_handle != p.handle {
+                        self.remap_particle_handle(&p.handle, &new_handle);
+                        return Some((p.handle.clone(), new_handle));
+                    }
+                }
+                None
+            }
+            ObjectSnapshot::Splat(s) => {
+                if s.path.is_empty() {
+                    self.status = Some((
+                        format!("Can't restore '{}': no reloadable source", s.name),
+                        STATUS_RED,
+                        5.0,
+                    ));
+                    return None;
+                }
+                self.undo_pending_splat_loads.insert(s.name.clone());
+                self.queue_splat_load(SplatDto {
+                    name: s.name.clone(),
+                    path: s.path.clone(),
+                    params: SplatParamsDto::from_params(&s.params),
+                    position: vec3_arr(s.transform.position),
+                    rotation: quat_arr(s.transform.rotation),
+                    scale: vec3_arr(s.transform.scale),
+                });
+                // Lands asynchronously via drain_pending_splats, which selects
+                // it once the reload completes.
+                None
+            }
+            // The singleton is never deleted/recreated, only edited.
+            ObjectSnapshot::PostProcess(_) => None,
+        }
+    }
+
+    /// After a particle is respawned with a NEW renderer handle, repoints any
+    /// OTHER pending stack entry that still references the OLD handle --
+    /// otherwise it would resolve to nothing the next time it's applied.
+    /// (The action currently being processed isn't in either stack yet; its
+    /// caller patches that one separately using this function's return --
+    /// see `recreate_snapshot`.)
+    fn remap_particle_handle(&mut self, old: &ParticleHandle, new: &ParticleHandle) {
+        fn remap(action: &mut UndoAction, old: &ParticleHandle, new: &ParticleHandle) {
+            match action {
+                UndoAction::Edit { obj, .. }
+                | UndoAction::Create { obj, .. }
+                | UndoAction::Delete { obj, .. } => {
+                    if let ObjectRef::Particle(h) = obj {
+                        if h == old {
+                            *h = new.clone();
+                        }
+                    }
+                }
+                UndoAction::Batch(actions) => {
+                    for a in actions {
+                        remap(a, old, new);
+                    }
+                }
+            }
+        }
+        for action in self
+            .undo_stack
+            .undo
+            .iter_mut()
+            .chain(self.undo_stack.redo.iter_mut())
+        {
+            remap(action, old, new);
+        }
+    }
+
+    /// Applies the "undo" side of `action` and returns it (patched if a
+    /// particle recreate inside it issued a new renderer handle) for the
+    /// caller to push onto the redo stack.
+    fn apply_undo(&mut self, action: UndoAction, renderer: &mut Renderer) -> UndoAction {
+        match action {
+            UndoAction::Edit { obj, before, after } => {
+                self.restore_snapshot(&obj, &before, renderer);
+                UndoAction::Edit { obj, before, after }
+            }
+            UndoAction::Create {
+                obj,
+                snapshot,
+                index_hint,
+            } => {
+                self.remove_by_ref(&obj, renderer);
+                UndoAction::Create {
+                    obj,
+                    snapshot,
+                    index_hint,
+                }
+            }
+            UndoAction::Delete {
+                obj,
+                snapshot,
+                index_hint,
+            } => {
+                let obj = match self.recreate_snapshot(&snapshot, renderer) {
+                    Some((old, new)) if matches!(&obj, ObjectRef::Particle(h) if *h == old) => {
+                        ObjectRef::Particle(new)
+                    }
+                    _ => obj,
+                };
+                UndoAction::Delete {
+                    obj,
+                    snapshot,
+                    index_hint,
+                }
+            }
+            UndoAction::Batch(actions) => UndoAction::Batch(
+                actions
+                    .into_iter()
+                    .map(|a| self.apply_undo(a, renderer))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Applies the "redo" side of `action` and returns it (patched if a
+    /// particle recreate inside it issued a new renderer handle) for the
+    /// caller to push back onto the undo stack.
+    fn apply_redo(&mut self, action: UndoAction, renderer: &mut Renderer) -> UndoAction {
+        match action {
+            UndoAction::Edit { obj, before, after } => {
+                self.restore_snapshot(&obj, &after, renderer);
+                UndoAction::Edit { obj, before, after }
+            }
+            UndoAction::Create {
+                obj,
+                snapshot,
+                index_hint,
+            } => {
+                let obj = match self.recreate_snapshot(&snapshot, renderer) {
+                    Some((old, new)) if matches!(&obj, ObjectRef::Particle(h) if *h == old) => {
+                        ObjectRef::Particle(new)
+                    }
+                    _ => obj,
+                };
+                UndoAction::Create {
+                    obj,
+                    snapshot,
+                    index_hint,
+                }
+            }
+            UndoAction::Delete {
+                obj,
+                snapshot,
+                index_hint,
+            } => {
+                self.remove_by_ref(&obj, renderer);
+                UndoAction::Delete {
+                    obj,
+                    snapshot,
+                    index_hint,
+                }
+            }
+            UndoAction::Batch(actions) => UndoAction::Batch(
+                actions
+                    .into_iter()
+                    .map(|a| self.apply_redo(a, renderer))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Ctrl+Z: reverses the most recent action, if any.
+    fn undo(&mut self, renderer: &mut Renderer) {
+        let Some(action) = self.undo_stack.undo.pop() else {
+            return;
+        };
+        let action = self.apply_undo(action, renderer);
+        self.undo_stack.redo.push(action);
+    }
+
+    /// Ctrl+Shift+Z / Ctrl+Y: reapplies the most recently undone action, if any.
+    fn redo(&mut self, renderer: &mut Renderer) {
+        let Some(action) = self.undo_stack.redo.pop() else {
+            return;
+        };
+        let action = self.apply_redo(action, renderer);
+        self.undo_stack.undo.push(action);
     }
 
     /// Makes splat `i` the rendered cloud and pushes its params to the renderer.
@@ -2288,8 +2824,27 @@ impl SplatGame {
                         params,
                         transform: Self::splat_dto_transform(&dto),
                     });
-                    if self.scene_splats.len() == 1 {
-                        self.activate_splat(0, renderer);
+                    let index = self.scene_splats.len() - 1;
+                    if self.undo_pending_splat_loads.remove(&dto.name) {
+                        // Queued by undo/redo (see recreate_snapshot), not a
+                        // user Add/Load: select/activate it so the effect is
+                        // visible, but don't push another Create action --
+                        // that would duplicate/loop the history.
+                        self.select_after_add(Selection::Splat(index));
+                        self.activate_splat(index, renderer);
+                    } else {
+                        if self.scene_splats.len() == 1 {
+                            self.activate_splat(0, renderer);
+                        }
+                        if let Some((obj, snapshot)) =
+                            self.snapshot_object(Selection::Splat(index))
+                        {
+                            self.undo_stack.push(UndoAction::Create {
+                                obj,
+                                snapshot,
+                                index_hint: index,
+                            });
+                        }
                     }
                 }
                 Err(reason) => {
@@ -2390,6 +2945,10 @@ impl GameEngine for SplatGame {
             scene_lights: Vec::new(),
             scene_particles: Vec::new(),
             scene_post_process: PostProcessSettings::default(),
+            undo_stack: UndoStack::default(),
+            pending_gizmo_edit: None,
+            pending_property_edit: None,
+            undo_pending_splat_loads: std::collections::HashSet::new(),
             particle_textures: Vec::new(),
             selected: None,
             multi_selected: Vec::new(),
@@ -2885,6 +3444,28 @@ impl GameEngine for SplatGame {
                             do_load_scene |= ui.button("Load Scene…").clicked();
                             ui.separator();
                             do_load |= ui.button("Load .ply…").clicked();
+                        });
+                        ui.menu_button("Edit", |ui| {
+                            let can_undo = !self.undo_stack.undo.is_empty();
+                            let can_redo = !self.undo_stack.redo.is_empty();
+                            if ui
+                                .add_enabled(
+                                    can_undo,
+                                    egui::Button::new("Undo").shortcut_text("Ctrl+Z"),
+                                )
+                                .clicked()
+                            {
+                                self.undo(renderer);
+                            }
+                            if ui
+                                .add_enabled(
+                                    can_redo,
+                                    egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z"),
+                                )
+                                .clicked()
+                            {
+                                self.redo(renderer);
+                            }
                         });
                         ui.menu_button("Add", |ui| {
                             add_menu_ui(ui, &mut do_add, &particle_names);
@@ -3587,10 +4168,28 @@ impl GameEngine for SplatGame {
                                             },
                                         );
                                     }
-                                    EditorTab::Details => match self.selected {
+                                    EditorTab::Details => {
+                                        // Speculative "before" snapshot: taken
+                                        // only when no gesture is already in
+                                        // progress, so it captures the PRE-edit
+                                        // state.  Promoted to
+                                        // pending_property_edit below only if
+                                        // this turns out to be the first
+                                        // changed frame of a new gesture.
+                                        let speculative_snapshot =
+                                            if self.pending_property_edit.is_none() {
+                                                self.selected.and_then(|sel| {
+                                                    self.snapshot_object(sel)
+                                                        .map(|(obj, snap)| (sel, obj, snap))
+                                                })
+                                            } else {
+                                                None
+                                            };
+                                        let mut details_edited = false;
+                                        match self.selected {
                                         Some(Selection::Actor(i)) => {
                                             if let Some(actor) = self.scene_actors.get_mut(i) {
-                                                selection_edited |= editor::draw_properties(
+                                                let changed = editor::draw_properties(
                                                     ui,
                                                     actor,
                                                     &model_catalog,
@@ -3598,11 +4197,13 @@ impl GameEngine for SplatGame {
                                                     selected_model,
                                                     &mut model_pick_request,
                                                 );
+                                                selection_edited |= changed;
+                                                details_edited |= changed;
                                             }
                                         }
                                         Some(Selection::Light(i)) => {
                                             if let Some(light) = self.scene_lights.get_mut(i) {
-                                                selection_edited |= editor::draw_properties(
+                                                let changed = editor::draw_properties(
                                                     ui,
                                                     light,
                                                     &model_catalog,
@@ -3610,13 +4211,15 @@ impl GameEngine for SplatGame {
                                                     selected_model,
                                                     &mut model_pick_request,
                                                 );
+                                                selection_edited |= changed;
+                                                details_edited |= changed;
                                             }
                                         }
                                         Some(Selection::Particle(i)) => {
                                             if let Some(particle) =
                                                 self.scene_particles.get_mut(i)
                                             {
-                                                selection_edited |= editor::draw_properties(
+                                                let changed = editor::draw_properties(
                                                     ui,
                                                     particle,
                                                     &model_catalog,
@@ -3624,6 +4227,8 @@ impl GameEngine for SplatGame {
                                                     selected_model,
                                                     &mut model_pick_request,
                                                 );
+                                                selection_edited |= changed;
+                                                details_edited |= changed;
                                             }
                                         }
                                         Some(Selection::Splat(i)) => {
@@ -3633,7 +4238,7 @@ impl GameEngine for SplatGame {
                                                         .strong(),
                                                 );
                                                 ui.separator();
-                                                selection_edited |= editor::draw_properties(
+                                                let changed = editor::draw_properties(
                                                     ui,
                                                     splat,
                                                     &model_catalog,
@@ -3641,6 +4246,8 @@ impl GameEngine for SplatGame {
                                                     selected_model,
                                                     &mut model_pick_request,
                                                 );
+                                                selection_edited |= changed;
+                                                details_edited |= changed;
                                             }
                                         }
                                         Some(Selection::PostProcess) => {
@@ -3663,12 +4270,34 @@ impl GameEngine for SplatGame {
                                                 self.scene_post_process.enforce_invertible();
                                             }
                                             selection_edited |= changed;
+                                            details_edited |= changed;
                                         }
                                         None => {
                                             ui.label("Nothing selected.");
                                             ui.label("Pick something in the Scene tab.");
                                         }
-                                    },
+                                        }
+                                        // Changed-edge commit: the first changed
+                                        // frame promotes the speculative snapshot
+                                        // to a pending gesture; a not-changed
+                                        // frame while one is pending means the
+                                        // gesture just ended, so commit it.
+                                        if details_edited {
+                                            if self.pending_property_edit.is_none() {
+                                                self.pending_property_edit = speculative_snapshot;
+                                            }
+                                        } else if let Some((sel, obj, before)) =
+                                            self.pending_property_edit.take()
+                                        {
+                                            if let Some((_, after)) = self.snapshot_object(sel) {
+                                                self.undo_stack.push(UndoAction::Edit {
+                                                    obj,
+                                                    before,
+                                                    after,
+                                                });
+                                            }
+                                        }
+                                    }
                                     // Resource inspector: edits the resource
                                     // highlighted in the bottom Resources
                                     // panel.  Material constants apply live
@@ -4180,6 +4809,14 @@ impl GameEngine for SplatGame {
         // each frame, so what comes back is this frame's delta -- positions
         // orbit/scale about the centroid, and the rotation/scale compose onto
         // each object's own transform (see apply_pivot_delta).
+        //
+        // Undo capture is edge-triggered off the gizmo's active state (see the
+        // commit block after this if/else): `gizmo_was_active` is its state at
+        // the START of this frame, and `drag_candidate` holds the pre-drag
+        // snapshot(s) taken speculatively while NOT dragging -- promoted to the
+        // pending gesture only if a drag actually starts this frame.
+        let gizmo_was_active = self.gizmo.is_active();
+        let mut drag_candidate: Option<Vec<(Selection, ObjectRef, ObjectSnapshot)>> = None;
         if editor && self.multi_selected.len() >= 2 {
             let objects: Vec<(Selection, CgVec3)> = self
                 .multi_selected
@@ -4203,6 +4840,21 @@ impl GameEngine for SplatGame {
                 let mut position = centroid;
                 let mut rotation = CG_QUAT_IDENT;
                 let mut scale = CG_VEC3_ONE;
+                // Speculative pre-drag snapshot of every selected object (only
+                // while not already dragging); promoted to the pending gesture
+                // below if a drag starts this frame.
+                if !gizmo_was_active {
+                    let snaps: Vec<(Selection, ObjectRef, ObjectSnapshot)> = self
+                        .multi_selected
+                        .iter()
+                        .filter_map(|sel| {
+                            self.snapshot_object(*sel).map(|(obj, snap)| (*sel, obj, snap))
+                        })
+                        .collect();
+                    if !snaps.is_empty() {
+                        drag_candidate = Some(snaps);
+                    }
+                }
                 if self.gizmo.ui(
                     &ctx,
                     &self.game_camera,
@@ -4254,6 +4906,14 @@ impl GameEngine for SplatGame {
                 };
                 if let Some((mut position, mut rotation, mut scale)) = current {
                     let local_axes = TransformGizmo::local_axes(rotation);
+                    // Speculative pre-drag snapshot (only while not already
+                    // dragging); promoted to the pending gesture below if a
+                    // drag starts this frame.
+                    if !gizmo_was_active {
+                        if let Some((obj, snap)) = self.snapshot_object(sel) {
+                            drag_candidate = Some(vec![(sel, obj, snap)]);
+                        }
+                    }
                     if self.gizmo.ui(
                         &ctx,
                         &self.game_camera,
@@ -4306,6 +4966,33 @@ impl GameEngine for SplatGame {
                         }
                         selection_edited = true;
                     }
+                }
+            }
+        }
+
+        // Commit undo history on gizmo-drag *edges* only -- never on idle
+        // frames, which would otherwise flood the stack with no-op edits and
+        // evict the real ones:
+        //   * drag start (was inactive, now active): stash the pre-drag
+        //     snapshot(s) captured above as the pending gesture.
+        //   * drag end (was active, now inactive): diff each object against its
+        //     current state and push one Edit (or a Batch for multi-select).
+        let gizmo_now_active = self.gizmo.is_active();
+        if !gizmo_was_active && gizmo_now_active {
+            self.pending_gizmo_edit = drag_candidate;
+        } else if gizmo_was_active && !gizmo_now_active {
+            if let Some(pending) = self.pending_gizmo_edit.take() {
+                let edits: Vec<UndoAction> = pending
+                    .into_iter()
+                    .filter_map(|(sel, obj, before)| {
+                        self.snapshot_object(sel)
+                            .map(|(_, after)| UndoAction::Edit { obj, before, after })
+                    })
+                    .collect();
+                match edits.len() {
+                    0 => {}
+                    1 => self.undo_stack.push(edits.into_iter().next().unwrap()),
+                    _ => self.undo_stack.push(UndoAction::Batch(edits)),
                 }
             }
         }
@@ -4883,6 +5570,24 @@ impl GameEngine for SplatGame {
         // (e.g. "Wall", "Pillar", "Floor") pops the .ply file dialog, and a
         // space cycles the active splat.
         let raw_hotkeys_ok = self.rebinding.is_none() && !ctx.egui_wants_keyboard_input();
+
+        // Undo / redo ([Ctrl+Z] / [Ctrl+Shift+Z] or [Ctrl+Y]).  Gated the same
+        // as the other raw hotkeys so typing "z"/"y" into a rename box or a
+        // Details text field doesn't trigger it.
+        if raw_hotkeys_ok {
+            let (ctrl, shift) = ctx.input(|i| {
+                (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift)
+            });
+            if ctrl && input_manager.get_key_state("z").just_pressed() {
+                if shift {
+                    self.redo(renderer);
+                } else {
+                    self.undo(renderer);
+                }
+            } else if ctrl && input_manager.get_key_state("y").just_pressed() {
+                self.redo(renderer);
+            }
+        }
 
         // Cycle to the next loaded splat cloud ([Space]), applying its params.
         // If a splat is the current selection, keep the selection on the newly
