@@ -42,12 +42,9 @@ pub struct Example3DGame {
     next_harm_time: f32,
 
     crosshair_error: f32,
-    // Shared keyboard fly-camera (WASD walk + arrow look).  Movement is still run
-    // through collision + arena clamp below; only the input-to-vector/rotation
-    // math is shared.  Pitch-invert lives on the fly camera (toggled with [Y]).
     fly_camera: FlyCamera,
-    // Shared on-screen touch pads (left = move, right = look), shown by default.
     touch_pads: TouchPads,
+
     debug_collision: bool,
     pause_monsters: bool,
 
@@ -192,7 +189,6 @@ impl GameEngine for Example3DGame {
 
         // Walk-style fly camera: movement flattened to the ground plane, shift
         // slows rather than sprints, and a tighter pitch range than the viewer.
-        // Movement is still applied through collision + arena clamp in the tick.
         let mut fly_camera = FlyCamera::default();
         fly_camera.move_rate = CAMERA_MOVE_RATE;
         fly_camera.shift_move_multiplier = 0.45;
@@ -224,7 +220,7 @@ impl GameEngine for Example3DGame {
             fly_camera,
             touch_pads: {
                 // Hidden until the first touch: mouse/keyboard players (native
-                // and web-on-desktop) never see them, phones still get them.
+                // and web-on-desktop) never see them.
                 let mut pads = TouchPads::default();
                 pads.reveal_on_touch = true;
                 pads
@@ -268,10 +264,6 @@ impl GameEngine for Example3DGame {
                 uv_tiles: (1.0, 1.0),
             });
         }
-
-        // Movement/look are handled by the shared on-screen TouchPads (drawn with
-        // egui), so there are no sprite-based virtual thumb sticks here anymore --
-        // the crosshair (indices 0-3) is the only persistent HUD game object.
 
         self.shotgun_model = renderer
             .load_model("game_assets/models/shotgun.glb", false)
@@ -555,8 +547,6 @@ impl GameEngine for Example3DGame {
             game_object.update(game_config.delta_time);
         }
         let delta_time = game_config.delta_time;
-        // Ground-plane forward/right basis (walk_on_plane), shared with the touch
-        // thumbsticks below and the keyboard movement further down.
         let (forward_dir, right_dir) = self.fly_camera.basis(&self.game_camera);
         let camera_pos = self.game_camera.get_position();
         let mut camera_rot = self.game_camera.get_rotation();
@@ -573,9 +563,6 @@ impl GameEngine for Example3DGame {
             }
         }
 
-        // On-screen touch pads (shared TouchPads, drawn with egui): left pad adds
-        // to movement, right pad turns the camera.  Same controller the splat
-        // viewer uses; shown by default here.
         let ctx = renderer.egui_ctx().clone();
         let pads = self.touch_pads.update(&ctx, input_manager, delta_time);
         move_vec += right_dir * pads.move_deflection.x - forward_dir * pads.move_deflection.y;

@@ -16,9 +16,6 @@ use black_splat::{
 use crate::editor_config::{self, EditorConfig, GIZMO_ACTIONS};
 use crate::resource_library::{self, MaterialFile};
 
-// No clouds are hardcoded: startup opens the user's saved startup scene, or
-// `default_startup_scene()` (the church) if none is saved yet.
-
 // How far in front of the camera a newly added game object is dropped.
 const ADD_OBJECT_DISTANCE: f32 = 5.0;
 

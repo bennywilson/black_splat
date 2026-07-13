@@ -404,9 +404,9 @@ where
                                 // actions (splat param nudges) run forever.
                                 input_manager.set_key_state(event.physical_key, event.state);
                             }
-                            if !egui_consumed {
+                            if !egui_consumed
 
-                                if input_manager.get_key_state("v").just_pressed() {
+                                && input_manager.get_key_state("v").just_pressed() {
                                     game_config.vsync = !game_config.vsync;
 
                                     if game_config.vsync {
@@ -418,7 +418,6 @@ where
                                         control_flow.set_control_flow(ControlFlow::Poll);
                                     }
                                 }
-                            }
                         }
 
                         _ => {}

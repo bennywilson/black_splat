@@ -746,8 +746,8 @@ impl ShadowPass {
 
         let mut mask_shader_handles = Vec::new();
         for path in [
-            "/engine_assets/shaders/shadow_mask_cascades.wgsl",
-            "/engine_assets/shaders/shadow_mask_spot.wgsl",
+            "/engine_assets/shaders/projected_shadow_directional.wgsl",
+            "/engine_assets/shaders/projected_shadow_spot.wgsl",
         ] {
             mask_shader_handles.push(asset_manager.load_shader(path, device_resources).await);
         }

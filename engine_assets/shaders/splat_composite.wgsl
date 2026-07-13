@@ -1,11 +1,3 @@
-// Composites the gaussian-splat layer into the linear HDR scene color.
-//
-// Splats are rendered display-referred into their own buffer and alpha-blended
-// among themselves there (matching the reference 3DGS look).  This pass converts
-// the *finished* composite once -- sRGB-decode to linear, and, when the tonemap
-// is enabled, the exact inverse of the postprocess tonemap -- then alpha-composites
-// it into the scene.  Doing the nonlinear conversion here (once, on the composite)
-// instead of per gaussian is what avoids distorting the multi-splat blend.
 
 struct VSOut {
     @builtin(position) clip: vec4<f32>,

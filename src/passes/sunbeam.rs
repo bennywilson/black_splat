@@ -184,7 +184,7 @@ impl SunbeamPass {
             });
 
         let flare_tex_handle = asset_manager
-            .load_texture("/engine_assets/textures/lens_flare.png", device_resources)
+            .load_texture("/engine_assets/textures/lens_flare.png", device_resources, TextureFilter::Linear)
             .await;
         let flare_tex = asset_manager.get_texture(&flare_tex_handle);
         let tex_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

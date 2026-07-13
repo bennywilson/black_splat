@@ -221,6 +221,7 @@ impl PostprocessPass {
             .load_texture(
                 "/engine_assets/textures/postprocess_filter.png",
                 device_resources,
+                TextureFilter::Linear,
             )
             .await;
         // Linear filtering so a sub-native render_scale upscales smoothly onto the

@@ -66,13 +66,14 @@ impl SpritePass {
                 label: Some("SpritePass: texture_bind_group_layout"),
             });
         let sprite_tex_handle = asset_manager
-            .load_texture(&texture_file, device_resources)
+            .load_texture(&texture_file, device_resources, TextureFilter::Nearest)
             .await;
 
         let postprocess_tex_handle = asset_manager
             .load_texture(
                 "/engine_assets/textures/postprocess_filter.png",
                 device_resources,
+                TextureFilter::Nearest,
             )
             .await;
 

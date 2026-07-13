@@ -252,12 +252,12 @@ impl AssetManager {
             include_str!("../engine_assets/shaders/shadow_depth.wgsl").to_string(),
         );
         file_to_string_buffer.insert(
-            "shadow_mask_cascades.wgsl".to_string(),
-            include_str!("../engine_assets/shaders/shadow_mask_cascades.wgsl").to_string(),
+            "projected_shadow_directional.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/projected_shadow_directional.wgsl").to_string(),
         );
         file_to_string_buffer.insert(
-            "shadow_mask_spot.wgsl".to_string(),
-            include_str!("../engine_assets/shaders/shadow_mask_spot.wgsl").to_string(),
+            "projected_shadow_spot.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/projected_shadow_spot.wgsl").to_string(),
         );
         file_to_string_buffer.insert(
             "shadow_catcher_overlay.wgsl".to_string(),
@@ -452,6 +452,7 @@ impl AssetManager {
         &mut self,
         file_path: &str,
         device_resource: &DeviceResources<'_>,
+        filter: TextureFilter,
     ) -> TextureHandle {
         if let Some(handle) = self.texture_mappings.names_to_handles.get(file_path) {
             return *handle;
@@ -471,6 +472,7 @@ impl AssetManager {
                 &device_resource.queue,
                 &bytes,
                 label,
+                filter,
             )
             .ok()
         });
@@ -555,6 +557,7 @@ impl AssetManager {
                         file_path.to_string()
                     }
                 };
+ 
                 load_string(&final_file_path).await.unwrap()
             }
             #[cfg(target_arch = "wasm32")]
@@ -736,6 +739,7 @@ impl AssetManager {
             1,
             device_resources,
             Some("white 1x1"),
+            TextureFilter::Linear,
         )
         .unwrap();
         let mappings = &mut self.texture_mappings;
@@ -765,6 +769,7 @@ impl AssetManager {
             &device_resources.queue,
             bytes,
             "checker_board",
+            TextureFilter::Nearest,
         )
         .unwrap();
         let mappings = &mut self.texture_mappings;
@@ -788,9 +793,10 @@ impl AssetManager {
         &mut self,
         path: Option<&str>,
         device_resources: &DeviceResources<'_>,
+        filter: TextureFilter,
     ) -> TextureHandle {
         match path {
-            Some(path) => self.load_texture(path, device_resources).await,
+            Some(path) => self.load_texture(path, device_resources, filter).await,
             None => self.white_texture(device_resources),
         }
     }
@@ -811,13 +817,25 @@ impl AssetManager {
         }
 
         let color_texture = self
-            .load_texture_or_white(desc.color_texture.as_deref(), device_resources)
+            .load_texture_or_white(
+                desc.color_texture.as_deref(),
+                device_resources,
+                TextureFilter::Linear,
+            )
             .await;
         let metal_texture = self
-            .load_texture_or_white(desc.metal_texture.as_deref(), device_resources)
+            .load_texture_or_white(
+                desc.metal_texture.as_deref(),
+                device_resources,
+                TextureFilter::Linear,
+            )
             .await;
         let rough_texture = self
-            .load_texture_or_white(desc.rough_texture.as_deref(), device_resources)
+            .load_texture_or_white(
+                desc.rough_texture.as_deref(),
+                device_resources,
+                TextureFilter::Linear,
+            )
             .await;
         self.build_material(
             name,
@@ -874,13 +892,25 @@ impl AssetManager {
         device_resources: &DeviceResources<'_>,
     ) {
         let color_texture = self
-            .load_texture_or_white(desc.color_texture.as_deref(), device_resources)
+            .load_texture_or_white(
+                desc.color_texture.as_deref(),
+                device_resources,
+                TextureFilter::Linear,
+            )
             .await;
         let metal_texture = self
-            .load_texture_or_white(desc.metal_texture.as_deref(), device_resources)
+            .load_texture_or_white(
+                desc.metal_texture.as_deref(),
+                device_resources,
+                TextureFilter::Linear,
+            )
             .await;
         let rough_texture = self
-            .load_texture_or_white(desc.rough_texture.as_deref(), device_resources)
+            .load_texture_or_white(
+                desc.rough_texture.as_deref(),
+                device_resources,
+                TextureFilter::Linear,
+            )
             .await;
         let material = self.make_material(
             name,

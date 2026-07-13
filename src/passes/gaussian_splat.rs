@@ -441,8 +441,6 @@ pub struct GaussianSplatPass {
     models: Vec<SplatModel>,
     active_model: usize,
     params: SplatParams,
-    // World transform applied to the active cloud (editor gizmo); identity by
-    // default.  Folded into the depth-sort key and the vertex/cull math.
     model_transform: cgmath::Matrix4<f32>,
 }
 
@@ -552,12 +550,7 @@ impl GaussianSplatPass {
                 unclipped_depth: false,
                 conservative: false,
             },
-            // Splats are sorted back-to-front and alpha-composited among
-            // themselves, but they depth-test against the depth the opaque 3D
-            // passes wrote so scene geometry occludes them.  They never WRITE
-            // depth: a splat's quad extends past its visible falloff, and
-            // writing it would punch invisible holes in anything drawn later
-            // (particles, and eventually PBR transparents).
+
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(false),
@@ -683,7 +676,6 @@ impl GaussianSplatPass {
         self.params = *params;
     }
 
-    /// Sets the world transform applied to the active cloud (editor gizmo).
     pub fn set_transform(&mut self, transform: cgmath::Matrix4<f32>) {
         self.model_transform = transform;
     }
@@ -752,7 +744,7 @@ impl GaussianSplatPass {
     /// clamp instead of a buffer-creation panic.
     fn device_max_splats(&self, device_resources: &DeviceResources<'_>) -> usize {
         let limits = device_resources.device.limits();
-        let device_cap = (limits.max_storage_buffer_binding_size as u64)
+        let device_cap = limits.max_storage_buffer_binding_size
             .min(limits.max_buffer_size)
             / size_of::<SplatInstance>() as u64;
         MAX_SPLATS.min(device_cap as usize)

@@ -141,10 +141,16 @@ impl GameEngine for Example2DGame {
 
     async fn initialize_world(
         &mut self,
-        _renderer: &mut Renderer<'_>,
+        renderer: &mut Renderer<'_>,
         _game_config: &mut Config,
     ) {
         log!("GameEngine::initialize_world() caled...");
+
+        // The sprite art is display-referred, so it must reach the surface
+        // untouched.  The filmic tonemap is for the HDR-lit 3D/splat scenes;
+        // running it over 2D sprites shifts colors (a pink cast) and makes the
+        // anti-aliased sprite edges pop.
+        renderer.set_tonemap_enabled(false);
 
         // Create Player
         self.game_objects.push(GameObject {

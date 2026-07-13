@@ -88,7 +88,15 @@
     white-space: pre; /* don't wrap long build lines; scroll horizontally instead */
   }
   .log .cmd { color: var(--accent); }
-  .log .live { color: var(--run); }
+  .log .live { display: none; }  /* hidden in scrollable log; shown in fixed bar below */
+  .progress-bar {
+    padding: 8px 16px; background: #000; border-top: 1px solid var(--line);
+    font: 12.5px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--run); white-space: pre; overflow-x: auto; min-height: 1.5em;
+  }
+  .progress-bar:empty {
+    display: none; border-top: none; padding: 0; min-height: 0;
+  }
   .empty { color: var(--muted); padding: 40px 16px; }
 </style>
 </head>
@@ -103,6 +111,7 @@
   <section class="console">
     <div class="tabs" id="tabs"></div>
     <pre class="log" id="log"><span class="empty">Pick an action to see build output here.</span></pre>
+    <div class="progress-bar" id="progress"></div>
   </section>
 </main>
 <script>
@@ -190,14 +199,25 @@ function attach(name) {
         if (active === name) renderLive(name);
       } else {
         s.log.push({ text: ev.line, cmd: ev.line.startsWith('$ ') });
-        s.live = null;                    // committed output ends the current bar frame
-        if (active === name) { renderLive(name); appendCommitted(ev.line); }
+        if (active === name) appendCommitted(ev.line);
+        // Keep the progress bar across ordinary committed lines (the "Compiling
+        // X" milestones interleave with the bar's frames), but drop it when
+        // cargo signals the build itself is done: it prints a committed
+        // "Finished" line (success) or an "error" line (failure), after which
+        // no more progress frames arrive. The job stays "running" here -- the
+        // native window / dev server lives on -- so the status event won't fire
+        // to clear it; this is the real build-complete signal.
+        const t = ev.line.trimStart();
+        if (t.startsWith('Finished') || t.startsWith('error')) {
+          s.live = null;
+          if (active === name) renderLive(name);
+        }
       }
     } else if (ev.type === 'status') {
       s.status = ev.status; renderStatus(name);
       if (ev.status !== 'running') {
         s.live = null;                    // drop the trailing bar frame
-        if (active === name) renderLive(name);
+        if (active === name) renderLive(name);  // immediately clear if viewing this tab
         es.close(); delete streams[name];
         // Links/QR point at a server that's no longer running -- clear them
         // so a stale "Local"/tunnel URL or QR doesn't linger on the card.
@@ -273,8 +293,7 @@ function isNearBottom(log) {
   return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
 }
 
-// A committed line is finalized output; it goes in above the pinned live line
-// (the progress bar), matching how a terminal scrolls text under a bottom bar.
+// A committed line is finalized output; it goes into the log.
 function appendCommitted(text) {
   const log = document.getElementById('log');
   const stick = isNearBottom(log);
@@ -282,22 +301,16 @@ function appendCommitted(text) {
   const span = document.createElement('span');
   if (text.startsWith('$ ')) span.className = 'cmd';
   span.textContent = text + '\n';
-  log.insertBefore(span, log.querySelector('.live'));  // null ref => append
+  log.appendChild(span);
   if (stick) log.scrollTop = log.scrollHeight;
 }
 
-// The live line is a single span kept last in the log; a progress-bar redraw
-// overwrites it in place instead of appending a new line each frame.
+// The progress bar is shown in a fixed bar at the bottom, not scrollable.
 function renderLive(name) {
-  const log = document.getElementById('log');
+  const progress = document.getElementById('progress');
   const s = ensure(name);
-  let el = log.querySelector('.live');
-  if (s.live == null) { if (el) el.remove(); return; }
-  const stick = isNearBottom(log);
-  clearEmpty(log);
-  if (!el) { el = document.createElement('span'); el.className = 'live'; log.appendChild(el); }
-  el.textContent = s.live + '\n';
-  if (stick) log.scrollTop = log.scrollHeight;
+  // Always show the current live text in the progress bar, or clear if none
+  progress.textContent = s.live ? s.live + '\n' : '';
 }
 
 (function initSplitter() {

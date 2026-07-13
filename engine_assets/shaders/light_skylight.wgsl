@@ -1,6 +1,5 @@
 // Deferred skylight: an ambient hemisphere.  Every lit pixel gets albedo *
-// mix(bottom, top) blended on how upward-facing its world normal is.  Drawn as
-// a fullscreen triangle, additively accumulated with the other light passes.
+// mix(bottom, top) blended on how upward-facing its world normal is.
 
 struct LightUniform {
     inv_view_proj: mat4x4<f32>,
@@ -26,7 +25,6 @@ var<uniform> light: LightUniform;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
-    // Fullscreen triangle from the vertex index alone (no vertex buffer).
     let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
     return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
 }
@@ -36,7 +34,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let coords = vec2<i32>(pos.xy);
     let depth = textureLoad(t_depth, coords, 0);
     if (depth >= 1.0) {
-        // No world geometry here: leave the clear color untouched.
+        // No world geometry here, bail
         discard;
     }
 
@@ -48,6 +46,6 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let sky = mix(light.color2.rgb, light.color_cone.rgb, up_ness);
 
     // Metals have no diffuse; keep a little ambient so they don't go black
-    // (no environment reflections yet).
+    // until we get environmental reflections
     return vec4<f32>(albedo * sky * (1.0 - metallic * 0.7), 1.0);
 }

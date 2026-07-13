@@ -1,19 +1,14 @@
-// Deferred directional light: Cook-Torrance GGX PBR (metallic/roughness from
-// the G-buffer's spec target), shadowed by its screen-space mask -- the
-// cascades were already projected into t_mask by shadow_mask_cascades.wgsl.
-// Fullscreen triangle, additively accumulated with the other light passes.
-
 struct LightUniform {
     inv_view_proj: mat4x4<f32>,
-    position_range: vec4<f32>,   // xyz world position (unused), w range (unused)
-    direction_cone: vec4<f32>,   // xyz direction the light points, w cos(outer)
-    color_cone: vec4<f32>,       // rgb color * intensity, w cos(inner)
-    color2: vec4<f32>,           // skylight bottom color (unused here)
+    position_range: vec4<f32>,              // xyz world position (unused), w range (unused)
+    direction_cone: vec4<f32>,              // xyz direction the light points, w cos(outer)
+    color_cone: vec4<f32>,                  // rgb color * intensity, w cos(inner)
+    color2: vec4<f32>,                      // skylight bottom color (unused here)
     camera_pos: vec4<f32>,
-    target_dims: vec4<f32>,      // xy render target size, zw shadow map size
-    shadow_matrices: array<mat4x4<f32>, 4>,  // used by the mask pass
+    target_dims: vec4<f32>,                 // xy render target size, zw shadow map size
+    shadow_matrices: array<mat4x4<f32>, 4>, // used by the mask pass
     shadow_rects: array<vec4<f32>, 4>,
-    shadow_params: vec4<f32>     // x > 0 = sample the shadow mask
+    shadow_params: vec4<f32>                // x > 0 = sample the shadow mask
 };
 
 @group(0) @binding(0)

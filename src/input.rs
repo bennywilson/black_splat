@@ -107,9 +107,7 @@ impl InputManager {
             return false;
         }
 
-        let key_pair = self.key_map.get_mut(&button_name);
-        if key_pair.is_some() {
-            let key_pair = key_pair.unwrap();
+        if let Some(key_pair) = self.key_map.get_mut(&button_name) {
             if *state == ElementState::Pressed {
                 if *key_pair == ButtonState::None {
                     *key_pair = ButtonState::JustPressed;
@@ -159,9 +157,7 @@ impl InputManager {
             return false;
         }
 
-        let key_pair = self.key_map.get_mut(&key_name);
-        if key_pair.is_some() {
-            let key_pair = key_pair.unwrap();
+        if let Some(key_pair) = self.key_map.get_mut(&key_name) {
             if state == ElementState::Pressed {
                 if *key_pair == ButtonState::None {
                     *key_pair = ButtonState::JustPressed;

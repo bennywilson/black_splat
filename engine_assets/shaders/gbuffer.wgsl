@@ -1,11 +1,3 @@
-// World-pass G-buffer shader: writes albedo, world normal and PBR
-// metallic/roughness for the deferred lighting pass (see light_*.wgsl).
-// model_color is the actor color multiplied by the material's color constant
-// on the CPU; spec_color.xy are the material's metallic/roughness constants,
-// each multiplied by an independent grayscale map (read from the red channel):
-// t_metal for metallic, t_rough for roughness (the built-in white 1x1 when a
-// map isn't assigned, so the constant passes through unchanged).
-
 struct ModelUniform {
     world: mat4x4<f32>,
     inv_world: mat4x4<f32>,
@@ -44,8 +36,6 @@ fn vs_main(
 
     out.tex_coords = model.tex_coords;
     out.clip_position = model_uniform.world_view_proj * vec4<f32>(model.position.xyz, 1.0);
-    // World-space normal (rotation + uniform scale; renormalized in the
-    // fragment stage after interpolation).
     out.normal = (model_uniform.world * vec4<f32>(model.normal.xyz, 0.0)).xyz;
 
     return out;
@@ -81,8 +71,8 @@ fn fs_main(in: VertexOutput) -> GBufferOutput {
     let metallic = textureSample(t_metal, s_color, in.tex_coords).r;
     let roughness = textureSample(t_rough, s_color, in.tex_coords).r;
     out.specular = vec4<f32>(
-        metallic * model_uniform.spec_color.x,  // metallic
-        roughness * model_uniform.spec_color.y,  // roughness
+        metallic * model_uniform.spec_color.x,
+        roughness * model_uniform.spec_color.y,
         0.0,
         1.0
     );

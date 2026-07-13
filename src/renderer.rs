@@ -627,13 +627,11 @@ impl<'a> Renderer<'a> {
         // onto the scene target; forward is a single model pass whose World
         // branch clears the scene color/depth targets itself.  Either way,
         // everything below renders forward on top.
-        if self.deferred_world_enabled && self.gbuffer_pass.is_some() {
+        if let (true, Some(gbuffer_pass)) = (self.deferred_world_enabled, self.gbuffer_pass.as_mut())
+        {
             {
                 PERF_SCOPE!("World GBuffer");
-                self.gbuffer_pass
-                    .as_mut()
-                    .unwrap()
-                    .render(&mut ctx, &self.actor_map);
+                gbuffer_pass.render(&mut ctx, &self.actor_map);
             }
             {
                 PERF_SCOPE!("Deferred Lighting");
@@ -939,7 +937,7 @@ impl<'a> Renderer<'a> {
     /// from the non-async frame tick.
     pub async fn preload_texture(&mut self, file_path: &str) -> TextureHandle {
         self.asset_manager
-            .load_texture(file_path, &self.device_resources)
+            .load_texture(file_path, &self.device_resources, TextureFilter::Linear)
             .await
     }
 
@@ -957,7 +955,7 @@ impl<'a> Renderer<'a> {
             &texture.view,
             wgpu::FilterMode::Linear,
         );
-        self.egui_texture_ids.insert(handle.clone(), id);
+        self.egui_texture_ids.insert(*handle, id);
         Some(id)
     }
 

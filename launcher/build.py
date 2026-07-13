@@ -7,12 +7,6 @@ Used two ways:
         python3 build.py list
         python3 build.py run <example> <native|wasm|tunnel>
         python3 build.py stop [port]
-
-This replaces the old per-example build_wasm.bat / build_wasm_tunneled.bat --
-they were identical except for the crate name and (for splat) which runtime
-assets to copy, so this is one parameterised implementation instead of three
-drifting copies. It's plain cross-platform Python (no batch-file-only logic),
-so the same code runs on Windows, Linux, and macOS.
 """
 import argparse
 import glob as globmod

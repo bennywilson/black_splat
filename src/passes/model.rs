@@ -89,7 +89,7 @@ impl Model {
         // Loading the texture is the only async step; the GPU resources are all
         // built synchronously in `new_particle_with_texture`.
         let texture_handle = asset_manager
-            .load_texture(texture_file_path, device_resources)
+            .load_texture(texture_file_path, device_resources, TextureFilter::Linear)
             .await;
         Self::new_particle_with_texture(&texture_handle, device_resources, asset_manager)
     }
@@ -167,8 +167,7 @@ impl Model {
                 label: Some("Model::texture_bind_group_layout"),
             });
 
-        let mut textures = Vec::<TextureHandle>::new();
-        textures.push(*texture_handle);
+        let textures = vec![*texture_handle];
         // Resolve the built-in white (a &mut borrow) before the shared texture
         // borrows below. Bound to the metallic/roughness slots (2 and 3) so
         // this model reads as constant-only PBR through the G-buffer shader.
@@ -283,7 +282,7 @@ impl Model {
                     if let Ok(dir) = std::env::current_dir() {
                         let file_path = format!("{}\\game_assets\\{}", dir.display(), uri);
                         let texture_handle = asset_manager
-                            .load_texture(&file_path, device_resources)
+                            .load_texture(&file_path, device_resources, TextureFilter::Linear)
                             .await;
                         textures.push(texture_handle);
                     }
@@ -438,6 +437,7 @@ impl Model {
                             image.height,
                             device_resources,
                             Some("gltf base color"),
+                            TextureFilter::Linear,
                         )
                         .ok();
                     }

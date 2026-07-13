@@ -295,9 +295,15 @@ impl Texture {
         })
     }
 
-    pub fn from_bytes(device: &Device, queue: &Queue, bytes: &[u8], label: &str) -> Result<Self> {
+    pub fn from_bytes(
+        device: &Device,
+        queue: &Queue,
+        bytes: &[u8],
+        label: &str,
+        filter: TextureFilter,
+    ) -> Result<Self> {
         let img = image::load_from_memory(bytes)?;
-        Self::from_image(device, queue, &img, Some(label))
+        Self::from_image(device, queue, &img, Some(label), filter)
     }
 
     pub fn from_rgba(
@@ -307,6 +313,7 @@ impl Texture {
         height: u32,
         device_resources: &DeviceResources<'_>,
         label: Option<&str>,
+        filter: TextureFilter,
     ) -> Result<Self> {
         let queue = &device_resources.queue;
         let device = &device_resources.device;
@@ -358,13 +365,14 @@ impl Texture {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (tex_filter, mip_filter) = filter.modes();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            mag_filter: tex_filter,
+            min_filter: tex_filter,
+            mipmap_filter: mip_filter,
             ..Default::default()
         });
 
@@ -380,6 +388,7 @@ impl Texture {
         queue: &Queue,
         img: &image::DynamicImage,
         label: Option<&str>,
+        filter: TextureFilter,
     ) -> Result<Self> {
         let dimensions = img.dimensions();
         let size = wgpu::Extent3d {
@@ -417,13 +426,14 @@ impl Texture {
         );
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (tex_filter, mip_filter) = filter.modes();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
             address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            mag_filter: tex_filter,
+            min_filter: tex_filter,
+            mipmap_filter: mip_filter,
             ..Default::default()
         });
 
@@ -432,6 +442,28 @@ impl Texture {
             view,
             sampler,
         })
+    }
+}
+
+/// Texture sampling mode chosen at load time.  Sprites/pixel-art want `Nearest`
+/// so atlas cells stay crisp and don't bleed across tile edges; 3D model maps
+/// want `Linear` for bilinear filtering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureFilter {
+    Nearest,
+    Linear,
+}
+
+impl TextureFilter {
+    fn modes(self) -> (wgpu::FilterMode, wgpu::MipmapFilterMode) {
+        match self {
+            TextureFilter::Nearest => {
+                (wgpu::FilterMode::Nearest, wgpu::MipmapFilterMode::Nearest)
+            }
+            TextureFilter::Linear => {
+                (wgpu::FilterMode::Linear, wgpu::MipmapFilterMode::Linear)
+            }
+        }
     }
 }
 

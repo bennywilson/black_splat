@@ -1,6 +1,5 @@
 // Depth-only shadow-map shader: renders casters into a tile of the shadow
-// atlas from the light's point of view.  No fragment stage -- the pipeline
-// only writes depth.  One uniform slot per draw (dynamic offset).
+// atlas from the light's point of view.  Depth-only
 
 struct ShadowDrawUniform {
     light_view_proj_world: mat4x4<f32>

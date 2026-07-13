@@ -1,5 +1,5 @@
-//! Persisted, user-editable editor preferences for the splat demo.  Right now
-//! that's just the viewport gizmo hotkeys, but the file is meant to grow.
+//! Persisted, user-editable editor preferences for the splat demo: viewport
+//! gizmo hotkeys, shadow settings, and the startup scene JSON.
 //!
 //! On native it's saved to a per-user config file (see [`config_file_path`]);
 //! on web there's no filesystem, so [`EditorConfig::load`]/[`save`](EditorConfig::save)
@@ -12,10 +12,10 @@
 
 use black_splat::{editor::GizmoMode, egui};
 
-/// The gizmo modes a hotkey can switch to, paired with their toolbar label, in
-/// a fixed order.  This order is the single source of truth: the gizmo toolbar,
-/// the keybindings window, and [`EditorConfig::gizmo_keys`] are all indexed by
-/// it, and [`CONFIG_KEYS`] gives each slot its on-disk name.
+/// Gizmo modes a hotkey can switch to, paired with its toolbar label.
+/// Slot order is shared: the gizmo toolbar, the keybindings window,
+/// [`EditorConfig::gizmo_keys`], and [`CONFIG_KEYS`] all index by it, so slot
+/// `i` means the same action everywhere.
 pub const GIZMO_ACTIONS: [(GizmoMode, &str); 3] = [
     (GizmoMode::Translate, "Move"),
     (GizmoMode::Rotate, "Rotate"),
@@ -58,9 +58,8 @@ impl Default for EditorConfig {
 }
 
 impl EditorConfig {
-    /// Binds `key` to `slot`.  Bindings are kept unique: if another action
-    /// already uses `key`, it inherits the key `slot` is giving up (a swap), so
-    /// no action is ever left without a hotkey and no two share one.
+    /// Binds `key` to `slot`. If another action already uses `key`, the two
+    /// slots swap keys, so every action keeps a hotkey and none collide.
     pub fn rebind(&mut self, slot: usize, key: egui::Key) {
         if slot >= self.gizmo_keys.len() {
             return;
@@ -137,8 +136,6 @@ impl EditorConfig {
     }
 
     /// Writes the config to disk, creating the parent directory if needed.
-    /// Best-effort: a failure (read-only home, etc.) is silently ignored so it
-    /// never takes down the editor.
     pub fn save(&self) {
         let Some(path) = config_file_path() else {
             return;

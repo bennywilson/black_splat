@@ -8,8 +8,6 @@ struct GlobalConstants {
     splat_params: vec4<f32>,
     // x: max sh degree, y: overall scale, z/w: unused
     splat_params_2: vec4<f32>,
-    // Cloud world transform (editor gizmo): translate/rotate/scale of the whole
-    // cloud.  Identity leaves the cloud where its data puts it.
     model: mat4x4<f32>,
 };
 
@@ -112,22 +110,12 @@ fn vs_main(@builtin(vertex_index) vertex_id: u32) -> VSOutput {
         return output;
     }
 
-    // Cloud world transform: split the model matrix into its rotation and a
-    // (uniform) scale so the per-splat billboard rotates and grows with the
-    // cloud.  Non-uniform cloud scale is approximated by the average column
-    // length for the billboard size, while positions still use the full matrix.
-    let mcol0 = u.model[0].xyz;
-    let mcol1 = u.model[1].xyz;
-    let mcol2 = u.model[2].xyz;
-    let cloud_sx = length(mcol0);
-    let cloud_sy = length(mcol1);
-    let cloud_sz = length(mcol2);
-    let cloud_scale = (cloud_sx + cloud_sy + cloud_sz) / 3.0;
-    let cloud_rot = mat3x3<f32>(
-        mcol0 / max(cloud_sx, 0.000001),
-        mcol1 / max(cloud_sy, 0.000001),
-        mcol2 / max(cloud_sz, 0.000001),
-    );
+    // Cloud world transform (uniform scale only): pull the scalar scale off one
+    // column and normalize the 3x3 into a pure rotation.  The rotation orients
+    // the per-splat billboard, the scale grows it with the cloud, and positions
+    // still use the full model matrix.
+    let cloud_scale = length(u.model[0].xyz);
+    let cloud_rot = mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz) * (1.0 / max(cloud_scale, 0.000001));
 
     // Note: Dynamic indexing into an array requires a var instead of let on naga/Vulkan
     var axes = quat_axes(g_splats[splat_id].rotation);
@@ -194,8 +182,5 @@ fn fs_main(input: VSOutput) -> @location(0) vec4<f32> {
     let output_alpha = clamp(input.color.a * falloff, 0.0, 1.0);
     let out_color = clamp(((input.color.rgb - 0.5) * u.splat_params.z) + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
 
-    // Splats are alpha-blended among themselves here in display space (matching
-    // the reference 3DGS look).  The splat_composite pass converts the finished
-    // composite into the linear HDR scene once (see splat_composite.wgsl).
     return vec4<f32>(out_color, output_alpha);
 }

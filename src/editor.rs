@@ -534,6 +534,7 @@ impl TransformGizmo {
     /// [`GizmoSpace::Local`] (see [`Self::local_axes`] /
     /// [`Self::average_local_axes`]); ignored in [`GizmoSpace::World`].
     /// Returns true if it changed `position`/`rotation`/`scale` this frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn ui(
         &mut self,
         ctx: &egui::Context,
@@ -656,7 +657,7 @@ impl TransformGizmo {
                     };
                     // Grab along the whole shaft, but with a much larger radius
                     // right at the tip so the arrowhead is an easy touch target.
-                    let hit = pointer.map_or(false, |p| {
+                    let hit = pointer.is_some_and(|p| {
                         distance_to_segment(p, center, tip) < GIZMO_HIT_RADIUS
                             || p.distance(tip) < GIZMO_TIP_HIT_RADIUS
                     });
@@ -791,7 +792,7 @@ impl TransformGizmo {
                     };
                     // Grab along the shaft, with a bigger radius at the box tip
                     // so it's an easy touch target.
-                    let hit = pointer.map_or(false, |p| {
+                    let hit = pointer.is_some_and(|p| {
                         distance_to_segment(p, center, tip) < GIZMO_HIT_RADIUS
                             || p.distance(tip) < GIZMO_TIP_HIT_RADIUS
                     });

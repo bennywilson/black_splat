@@ -1,7 +1,4 @@
-// Deferred point light: omnidirectional Cook-Torrance GGX PBR with a smooth
-// quadratic falloff out to position_range.w.  Point lights never cast
-// shadows.  Fullscreen triangle, additively accumulated with the other light
-// passes.
+// Note: Point lights currently do not cast shadows
 
 struct LightUniform {
     inv_view_proj: mat4x4<f32>,

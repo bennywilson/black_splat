@@ -141,7 +141,7 @@ impl ParticleActor {
         // synchronously.  Split out so an already-loaded texture can be spawned
         // from a non-async context (see `from_texture` / the editor).
         let texture_handle = asset_manager
-            .load_texture(&params.texture_file, device_resources)
+            .load_texture(&params.texture_file, device_resources, TextureFilter::Nearest)
             .await;
         Self::from_texture(
             transform,

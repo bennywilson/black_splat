@@ -4,12 +4,6 @@
 // shadowed by the inserted CG objects).  This pass multiply-blends that factor
 // onto the already-composited scene color, darkening the Gaussian splats that
 // sit behind the proxy so the CG objects read as grounded.
-//
-// The fragment only outputs the darkening factor -- the multiply blend does
-// `scene *= factor`.  It is applied only where the catcher is the frontmost
-// real surface (catcher depth <= scene depth), so a CG object standing on the
-// catcher (which writes the nearer scene depth) is left untouched, and only
-// the splat behind the object is darkened.
 
 @group(0) @binding(0) var t_catcher_shadow: texture_2d<f32>;
 @group(0) @binding(1) var t_catcher_depth: texture_depth_2d;
@@ -29,7 +23,6 @@ struct OverlayParams {
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
-    // Fullscreen triangle from the vertex index alone (no vertex buffer).
     let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
     return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
 }
@@ -46,8 +39,6 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // CG object.  The small epsilon absorbs depth-buffer precision.
     if (catcher_depth < 0.9999 && catcher_depth <= scene_depth + 0.0005) {
         let raw = textureLoad(t_catcher_shadow, coords, 0).r;
-        // Scale the shadow amount (1 - raw) by the artist's density, so higher
-        // density drives the multiply factor darker (toward 0 = black).
         factor = clamp(1.0 - params.density * (1.0 - raw), 0.0, 1.0);
     }
     return vec4<f32>(factor, factor, factor, 1.0);
