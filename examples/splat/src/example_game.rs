@@ -688,6 +688,15 @@ struct MujocoSceneActor {
     playing: bool,
     speed: f32,
     scene: Option<MujocoScene>,
+    // Real triangle-mesh actors for the scene's mesh-type geoms (registered
+    // into the renderer's own actor map, see `tick_mujoco_actors`) -- index-
+    // aligned with `MujocoScene::mesh_geoms`'s output, which is stable across
+    // frames since a loaded model's geom set never changes. Rebuilt whenever
+    // `scene` is (re)loaded.
+    mesh_geom_actors: Vec<Actor>,
+    // mesh .obj path -> loaded Model, so each unique mesh is only loaded once
+    // per scene load instead of every frame.
+    mesh_model_cache: std::collections::HashMap<String, ModelHandle>,
 }
 
 impl MujocoSceneActor {
@@ -702,6 +711,8 @@ impl MujocoSceneActor {
             playing: true,
             speed: 1.0,
             scene: None,
+            mesh_geom_actors: Vec::new(),
+            mesh_model_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -2135,7 +2146,10 @@ impl SplatGame {
                 if i >= self.scene_mujoco_actors.len() {
                     None
                 } else {
-                    self.scene_mujoco_actors.remove(i);
+                    let actor = self.scene_mujoco_actors.remove(i);
+                    for mesh_actor in &actor.mesh_geom_actors {
+                        renderer.remove_actor(mesh_actor);
+                    }
                     Some(i)
                 }
             }
@@ -2344,7 +2358,10 @@ impl SplatGame {
                 }
             }
             Selection::MujocoActor(i) => {
-                self.scene_mujoco_actors.remove(i);
+                let actor = self.scene_mujoco_actors.remove(i);
+                for mesh_actor in &actor.mesh_geom_actors {
+                    renderer.remove_actor(mesh_actor);
+                }
             }
             Selection::PostProcess => {}
         }
@@ -2430,6 +2447,8 @@ impl SplatGame {
                     playing: m.playing,
                     speed: m.speed,
                     scene: None,
+                    mesh_geom_actors: Vec::new(),
+                    mesh_model_cache: std::collections::HashMap::new(),
                 });
                 // scene is None / loaded_path empty, so tick_mujoco_actors
                 // reloads it from xml_path on the next tick.
@@ -2614,12 +2633,20 @@ impl SplatGame {
                 // Only apply if xml_path still matches what was requested --
                 // a further edit in the meantime gets its own load below.
                 if actor.xml_path == path {
-                    match result.and_then(|xml| MujocoScene::from_xml_str(&xml)) {
+                    match result.and_then(|xml| MujocoScene::from_xml(&path, &xml)) {
                         Ok(mut scene) => {
                             scene.set_playing(actor.playing);
                             scene.set_speed(actor.speed);
                             actor.scene = Some(scene);
                             actor.loaded_path = path;
+                            // The old sim's mesh geoms (if any) no longer
+                            // correspond to anything -- drop them from the
+                            // renderer; the loop below rebuilds fresh ones
+                            // from the new scene.
+                            for mesh_actor in actor.mesh_geom_actors.drain(..) {
+                                renderer.remove_actor(&mesh_actor);
+                            }
+                            actor.mesh_model_cache.clear();
                         }
                         Err(e) => {
                             log!("Mujoco actor '{name}' failed to load '{path}': {e}");
@@ -2656,6 +2683,32 @@ impl SplatGame {
         for actor in &mut self.scene_mujoco_actors {
             if let Some(scene) = &mut actor.scene {
                 scene.tick_and_draw_at(renderer, game_config, actor.position, actor.rotation);
+
+                let mesh_geoms = scene.mesh_geoms(actor.position, actor.rotation);
+                // First time this scene's mesh geoms are seen: one Actor per
+                // geom, index-aligned with `mesh_geoms` (stable across frames
+                // -- see the field comment on `mesh_geom_actors`).
+                if actor.mesh_geom_actors.is_empty() && !mesh_geoms.is_empty() {
+                    for geom in &mesh_geoms {
+                        let handle = *actor
+                            .mesh_model_cache
+                            .entry(geom.mesh_path.clone())
+                            .or_insert_with(|| {
+                                pollster::block_on(renderer.load_model(&geom.mesh_path, false))
+                            });
+                        let mut mesh_actor = Actor::new();
+                        mesh_actor.set_model(&handle);
+                        mesh_actor.set_layer(&SceneLayer::World, &None);
+                        actor.mesh_geom_actors.push(mesh_actor);
+                    }
+                }
+
+                for (mesh_actor, geom) in actor.mesh_geom_actors.iter_mut().zip(mesh_geoms.iter()) {
+                    mesh_actor.set_position(&geom.position);
+                    mesh_actor.set_rotation(&geom.rotation);
+                    mesh_actor.set_color(geom.rgba.into());
+                    renderer.add_or_update_actor(mesh_actor);
+                }
             }
         }
     }
@@ -2998,7 +3051,11 @@ impl SplatGame {
         renderer.clear_gaussian_splats();
         self.active_splat = 0;
         self.pending_splats.lock().unwrap().clear();
-        self.scene_mujoco_actors.clear();
+        for actor in self.scene_mujoco_actors.drain(..) {
+            for mesh_actor in &actor.mesh_geom_actors {
+                renderer.remove_actor(mesh_actor);
+            }
+        }
         self.selected = None;
         self.multi_selected.clear();
         self.context_menu = None;
@@ -3088,6 +3145,8 @@ impl SplatGame {
                 playing: dto.playing,
                 speed: dto.speed,
                 scene: None,
+                mesh_geom_actors: Vec::new(),
+                mesh_model_cache: std::collections::HashMap::new(),
             });
         }
 

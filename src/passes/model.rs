@@ -573,6 +573,240 @@ impl Model {
         }
     }
 
+    /// Loads a Wavefront .obj (plus its companion .mtl, resolved by `tobj`
+    /// relative to the .obj's own directory) straight from disk. Native only
+    /// -- unlike `from_bytes`, this needs a real filesystem path so the MTL
+    /// and any texture it references (`map_Kd`) can be found next to the
+    /// .obj. Used for MuJoCo mesh geoms (see `crate::mujoco`), whose MJCF
+    /// `<mesh file="...">` assets are plain .obj files.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn from_obj_path(
+        path: &str,
+        device_resources: &mut DeviceResources<'_>,
+        asset_manager: &mut AssetManager,
+    ) -> anyhow::Result<Self> {
+        let device = &device_resources.device;
+
+        let (obj_models, obj_materials) = tobj::load_obj(
+            path,
+            &tobj::LoadOptions {
+                triangulate: true,
+                single_index: true,
+                ..Default::default()
+            },
+        )?;
+        let obj_materials = obj_materials.unwrap_or_default();
+
+        let mut vertices = Vec::<Vertex>::new();
+        let mut indices = Vec::<u16>::new();
+        let mut diffuse_texture_file: Option<String> = None;
+        for m in &obj_models {
+            let mesh = &m.mesh;
+            if diffuse_texture_file.is_none() {
+                if let Some(mat_id) = mesh.material_id {
+                    if let Some(tex) = obj_materials.get(mat_id).and_then(|mat| mat.diffuse_texture.clone()) {
+                        diffuse_texture_file = Some(tex);
+                    }
+                }
+            }
+            let has_normals = !mesh.normals.is_empty();
+            let has_uvs = !mesh.texcoords.is_empty();
+            let base = vertices.len() as u32;
+            let vertex_count = mesh.positions.len() / 3;
+            for i in 0..vertex_count {
+                vertices.push(Vertex {
+                    position: [
+                        mesh.positions[i * 3],
+                        mesh.positions[i * 3 + 1],
+                        mesh.positions[i * 3 + 2],
+                    ],
+                    tex_coords: if has_uvs {
+                        // OBJ uvs are bottom-left origin; wgpu/this engine's
+                        // samplers expect top-left, same flip glTF loading
+                        // doesn't need (it's already top-left).
+                        [mesh.texcoords[i * 2], 1.0 - mesh.texcoords[i * 2 + 1]]
+                    } else {
+                        [0.0, 0.0]
+                    },
+                    normal: if has_normals {
+                        [mesh.normals[i * 3], mesh.normals[i * 3 + 1], mesh.normals[i * 3 + 2]]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    },
+                    color: [1.0, 1.0, 1.0, 1.0],
+                });
+            }
+            for idx in &mesh.indices {
+                indices.push((base + *idx) as u16);
+            }
+        }
+
+        let num_indices = indices.len() as u32;
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Model_vertex_buffer (obj)"),
+            contents: bytemuck::cast_slice(vertices.as_slice()),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer (obj)"),
+            contents: bytemuck::cast_slice(indices.as_slice()),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("Model_texture_bind_group_layout (obj)"),
+            });
+
+        // Most MuJoCo mesh .mtls are untextured (a plain Kd/Ks/Ns triple, see
+        // e.g. mujoco_menagerie assets) -- white lets the per-instance actor
+        // color (the geom's resolved MJCF <material> rgba) show through
+        // untinted, same as `new_particle_with_texture`'s untextured case.
+        let white_handle = asset_manager.white_texture(device_resources);
+        let mut textures = Vec::<TextureHandle>::new();
+        if let Some(tex_file) = diffuse_texture_file {
+            let obj_dir = std::path::Path::new(path).parent();
+            let tex_path = obj_dir
+                .map(|dir| dir.join(&tex_file).to_string_lossy().into_owned())
+                .unwrap_or(tex_file);
+            let texture_handle = asset_manager
+                .load_texture(&tex_path, device_resources, TextureFilter::Linear)
+                .await;
+            textures.push(texture_handle);
+        }
+
+        let color_texture = if let Some(handle) = textures.first() {
+            asset_manager.get_texture(handle)
+        } else {
+            asset_manager.get_texture(&white_handle)
+        };
+        let white = asset_manager.get_texture(&white_handle);
+
+        let tex_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&color_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&color_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&white.view),
+                },
+            ],
+            label: Some("Model::tex_bind_group (obj)"),
+        });
+
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("ModelPass_uniform_bind_group_layout (obj)"),
+            });
+
+        let uniform = ModelUniform {
+            ..Default::default()
+        };
+        let mut uniform_buffers = Vec::<wgpu::Buffer>::new();
+        let mut uniform_bind_groups = Vec::<wgpu::BindGroup>::new();
+        for _ in 0..MAX_UNIFORMS {
+            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("kbModelPipeline_uniform_buffer (obj)"),
+                contents: bytemuck::cast_slice(&[uniform]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
+            let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &uniform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+                label: Some("ModelPass_uniform_bind_group (obj)"),
+            });
+
+            uniform_buffers.push(uniform_buffer);
+            uniform_bind_groups.push(uniform_bind_group);
+        }
+
+        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instance_buffer (obj)"),
+            mapped_at_creation: false,
+            size: (size_of::<ModelDrawInstance>() * MAX_UNIFORMS) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+
+        Ok(Model {
+            vertex_buffer,
+            index_buffer,
+            instance_buffer,
+            num_indices,
+            uniform_bind_groups,
+            uniform_buffers,
+            textures,
+            hole_texture: None,
+            empty_texture: None,
+            tex_bind_group,
+            next_uniform_buffer: 0,
+        })
+    }
+
     pub fn alloc_uniform_buffer(&mut self) -> &mut wgpu::Buffer {
         if self.next_uniform_buffer > 80 {
             self.next_uniform_buffer -= 1;

@@ -32,6 +32,7 @@ const MJ_GEOM_SPHERE: u32 = 2;
 const MJ_GEOM_CAPSULE: u32 = 3;
 const MJ_GEOM_CYLINDER: u32 = 5;
 const MJ_GEOM_BOX: u32 = 6;
+const MJ_GEOM_MESH: u32 = 7;
 
 /// A loaded MuJoCo scene: owns and steps the sim (native) or reflects the
 /// sibling wasm module's latest frame (wasm32), and draws every geom as a
@@ -41,6 +42,13 @@ pub struct MujocoScene {
     mj_data: MjData<Box<MjModel>>,
     #[cfg(not(target_arch = "wasm32"))]
     sim_time_accum: f32,
+    // mesh name -> resolved absolute .obj path, for `mesh_geoms`. Built by
+    // `collect_mesh_paths` -- mujoco-rs's own `mesh_pathadr` only exposes the
+    // MJCF's raw, un-resolved `file` attribute (e.g. "link0/link0.obj", not
+    // joined with `meshdir` or the declaring file's directory), so it can't
+    // be opened as-is.
+    #[cfg(not(target_arch = "wasm32"))]
+    mesh_paths: std::collections::HashMap<String, String>,
     /// Whether `tick_and_draw` advances the sim each frame. Paused scenes
     /// still draw their current pose.
     playing: bool,
@@ -55,10 +63,49 @@ impl MujocoScene {
     /// [`crate::assets::load_string`]) and parses it.
     pub async fn load(file_path: &str) -> anyhow::Result<Self> {
         let xml = crate::assets::load_string(file_path).await?;
-        Self::from_xml_str(&xml)
+        Self::from_xml(file_path, &xml)
     }
 
-    /// Parses an already-loaded MJCF string (e.g. an `include_str!`'d scene).
+    /// Parses an MJCF file already fetched as `xml`, using `path` to resolve
+    /// relative `<include>`/`meshdir` references on native. `MjModel` has no
+    /// notion of a base directory when parsing from a string (it stages the
+    /// text into a synthetic VFS entry with no real path), so a mesh path
+    /// like `meshdir="assets"` would otherwise be looked up relative to the
+    /// process's CWD instead of the MJCF's own directory. Loading straight
+    /// from `path` lets MuJoCo resolve those relative to the real file.
+    /// Wasm has no filesystem to resolve against, so it always parses `xml`.
+    pub fn from_xml(path: &str, xml: &str) -> anyhow::Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = xml;
+            Self::from_xml_path(path)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = path;
+            Self::from_xml_str(xml)
+        }
+    }
+
+    /// Loads and parses an MJCF file directly from disk (native only) --
+    /// preserves the file's directory so relative `<include>`/`meshdir`
+    /// references resolve correctly (see [`from_xml`](Self::from_xml)).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_xml_path(path: &str) -> anyhow::Result<Self> {
+        let model = MjModel::from_xml(path)
+            .map_err(|e| anyhow::anyhow!("failed to parse MJCF: {e}"))?;
+        Ok(Self {
+            mj_data: MjData::new(Box::new(model)),
+            sim_time_accum: 0.0,
+            mesh_paths: collect_mesh_paths(path),
+            playing: true,
+            speed: 1.0,
+        })
+    }
+
+    /// Parses an already-loaded MJCF string (e.g. an `include_str!`'d scene)
+    /// with no base directory -- relative `<include>`/`meshdir` references
+    /// won't resolve on native (see [`from_xml`](Self::from_xml)).
     pub fn from_xml_str(xml: &str) -> anyhow::Result<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -67,6 +114,7 @@ impl MujocoScene {
             Ok(Self {
                 mj_data: MjData::new(Box::new(model)),
                 sim_time_accum: 0.0,
+                mesh_paths: std::collections::HashMap::new(),
                 playing: true,
                 speed: 1.0,
             })
@@ -225,6 +273,68 @@ impl MujocoScene {
         }
     }
 
+    /// Every mesh-type geom this frame, resolved to a source .obj path (via
+    /// `mesh_paths`, built at load time by re-walking the MJCF -- see
+    /// [`collect_mesh_paths`]) plus the world transform and MJCF-resolved
+    /// `<material>` rgba to draw it with. Callers load/cache a real
+    /// triangle-mesh `Model` per unique path (see
+    /// `crate::assets::AssetManager::load_model`, which dispatches to
+    /// `Model::from_obj_path` for `.obj`) and draw one instance per entry --
+    /// `draw_mj_geom` skips `MJ_GEOM_MESH` since it can't do this itself (it
+    /// only has a `Renderer`, not an `AssetManager`). Native only: mesh geoms
+    /// aren't supported over the wasm bridge yet, so this is always empty
+    /// there. `origin`/`rotation` place the whole scene the same way
+    /// `tick_and_draw_at` does.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn mesh_geoms(&self, origin: CgVec3, rotation: CgQuat) -> Vec<MeshGeomInstance> {
+        let model = self.mj_data.model();
+        let ngeom = model.ffi().ngeom as usize;
+        let mut out = Vec::new();
+        for i in 0..ngeom {
+            if model.geom_type()[i] as u32 != MJ_GEOM_MESH {
+                continue;
+            }
+            let mesh_id = model.geom_dataid()[i];
+            if mesh_id < 0 {
+                continue;
+            }
+            let Some(mesh_name) = model.id_to_name(MjtObj::mjOBJ_MESH, mesh_id as usize) else {
+                continue;
+            };
+            let Some(mesh_path) = self.mesh_paths.get(mesh_name) else {
+                continue;
+            };
+            // A geom with a <material> takes its color from the material's
+            // own rgba, not geom_rgba (which stays at its unset default --
+            // effectively white -- whenever a material is assigned; MuJoCo
+            // never copies mat_rgba into it). geom_rgba only applies to
+            // geoms colored directly via their own `rgba` attribute, with no
+            // material reference (matid < 0).
+            let mat_id = model.geom_matid()[i];
+            let rgba = if mat_id >= 0 {
+                model.mat_rgba()[mat_id as usize]
+            } else {
+                model.geom_rgba()[i]
+            };
+            let xpos = self.mj_data.geom_xpos()[i];
+            let xmat = self.mj_data.geom_xmat()[i];
+            let (ex, ey, ez) = mj_basis(std::array::from_fn(|k| xmat[k] as f32));
+            let (ex, ey, ez) = (rotation * ex, rotation * ey, rotation * ez);
+            out.push(MeshGeomInstance {
+                mesh_path: mesh_path.clone(),
+                rgba,
+                position: origin + rotation * mj_vec3([xpos[0] as f32, xpos[1] as f32, xpos[2] as f32]),
+                rotation: quat_from_basis(ex, ey, ez),
+            });
+        }
+        out
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn mesh_geoms(&self, _origin: CgVec3, _rotation: CgQuat) -> Vec<MeshGeomInstance> {
+        Vec::new()
+    }
+
     /// Adds `delta` to a joint's first degree-of-freedom velocity (e.g. a
     /// hinge's qvel) -- native mutates the sim directly; wasm calls back into
     /// JS (`window.__bsMujocoApplyQvel`, see `index.html`), since the sim
@@ -244,6 +354,92 @@ impl MujocoScene {
             }
         }
     }
+}
+
+/// One mesh-type geom's world placement for this frame, plus which .obj to
+/// draw there -- see [`MujocoScene::mesh_geoms`].
+pub struct MeshGeomInstance {
+    pub mesh_path: String,
+    pub rgba: [f32; 4],
+    pub position: CgVec3,
+    pub rotation: CgQuat,
+}
+
+/// Re-walks the MJCF (and any `<include>`d files, recursively) starting from
+/// `xml_path` to build a mesh name -> resolved absolute .obj path map.
+///
+/// mujoco-rs's `MjModel::mesh_pathadr`/`paths` only exposes the MJCF's raw,
+/// un-resolved `<mesh file="...">` attribute (e.g. "link0/link0.obj"), not
+/// joined with `<compiler meshdir="...">` or the declaring file's own
+/// directory -- so it can't be opened as a real path. This does that join
+/// ourselves, mirroring MJCF's own resolution rules: `meshdir` (if set) is
+/// relative to the file that declares it; a mesh's `file` is relative to
+/// `meshdir`; an omitted `<mesh name="...">` defaults to the file's stem
+/// (MuJoCo's own default-naming rule), which is how `mesh_geoms` looks
+/// entries up (via `MjModel::id_to_name`).
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_mesh_paths(xml_path: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut visited = std::collections::HashSet::new();
+    collect_mesh_paths_into(xml_path, &mut map, &mut visited);
+    map
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn collect_mesh_paths_into(
+    xml_path: &str,
+    map: &mut std::collections::HashMap<String, String>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    let path = std::path::Path::new(xml_path);
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canon) {
+        return; // Already walked (or a cyclic <include>).
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(doc) = roxmltree::Document::parse(&text) else {
+        return;
+    };
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut meshdir = dir.to_path_buf();
+
+    for node in doc.descendants().filter(|n| n.is_element()) {
+        match node.tag_name().name() {
+            "compiler" => {
+                if let Some(md) = node.attribute("meshdir") {
+                    meshdir = dir.join(md);
+                }
+            }
+            "mesh" => {
+                if let Some(file) = node.attribute("file") {
+                    let name = node.attribute("name").map(str::to_string).unwrap_or_else(|| {
+                        std::path::Path::new(file)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    });
+                    map.insert(name, meshdir.join(file).to_string_lossy().into_owned());
+                }
+            }
+            "include" => {
+                if let Some(inc_file) = node.attribute("file") {
+                    let inc_path = dir.join(inc_file);
+                    collect_mesh_paths_into(&inc_path.to_string_lossy(), map, visited);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Builds a rotation from a geom's world-space basis vectors (already
+/// engine-space, see [`mj_basis`]) -- `ex`/`ey`/`ez` are orthonormal, so this
+/// is a well-defined proper rotation.
+#[cfg(not(target_arch = "wasm32"))]
+fn quat_from_basis(ex: CgVec3, ey: CgVec3, ez: CgVec3) -> CgQuat {
+    cgmath::Matrix3::from_cols(ex, ey, ez).into()
 }
 
 // MuJoCo is Z-up right-handed; the engine is Y-up right-handed. This maps
@@ -376,6 +572,9 @@ fn draw_mj_geom(
             let half = CgVec3::new(size[0], size[1], size[2]);
             draw_wire_box(renderer, game_config, center, ex, ey, ez, half, color);
         }
+        // Drawn as a real triangle mesh by the caller (see
+        // `MujocoScene::mesh_geoms`), not wireframed here.
+        MJ_GEOM_MESH => {}
         _ => {
             // No wireframe for this geom type yet (ellipsoid, mesh, hfield,
             // ...); draw a small axis cross so it's still visible.

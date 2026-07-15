@@ -626,8 +626,14 @@ impl AssetManager {
                         file_path.to_string()
                     }
                 };
-                let bytes = load_binary(&final_file_path).await.unwrap();
-                Model::from_bytes(&bytes, device_resource, self, use_holes).await
+                if final_file_path.to_ascii_lowercase().ends_with(".obj") {
+                    Model::from_obj_path(&final_file_path, device_resource, self)
+                        .await
+                        .unwrap_or_else(|e| panic!("failed to load OBJ model {final_file_path}: {e}"))
+                } else {
+                    let bytes = load_binary(&final_file_path).await.unwrap();
+                    Model::from_bytes(&bytes, device_resource, self, use_holes).await
+                }
             }
             #[cfg(target_arch = "wasm32")]
             {
