@@ -21,7 +21,116 @@
      canvas -- the page is just a host for the wasm module. -->
 
 <script type="module">
-	import init from "./black_splat_splat_demo.js";
+	import init, * as bsApp from "./black_splat_splat_demo.js";
+
+	// MuJoCo (MujocoActor, see src/mujoco.rs) is a second, independent wasm
+	// module with its own linear memory and its own requestAnimationFrame
+	// loop; it hands geom snapshots to the Rust side via the mj_bridge_*
+	// wasm-bindgen exports, matching examples/mujoco_test/index.html. Unlike
+	// that fixed single-scene example, the editor can add/retarget a
+	// MujocoActor's XML path at any time, so this polls for the *current*
+	// model text each frame and reloads whenever it changes, rather than
+	// loading once at boot. Only the most recently loaded MJCF actually
+	// simulates -- src/mujoco.rs's wasm bridge is a single global sim, a
+	// known limitation for scenes with multiple simultaneous MujocoActors.
+	async function startMujocoBridge() {
+		let mujoco = null;
+		let model = null;
+		let data = null;
+		let lastXml = "";
+		let geomType, geomSize, geomRgba;
+		let accumulator = 0;
+		let lastTime = performance.now();
+		const SIM_TIMESTEP = 0.005;
+		const MAX_STEPS_PER_FRAME = 8;
+
+		function loadModel(xml) {
+			if (model) {
+				model.delete();
+				data.delete();
+			}
+			model = mujoco.MjModel.from_xml_string(xml);
+			data = new mujoco.MjData(model);
+			geomType = new Uint32Array(model.geom_type);
+			geomSize = new Float32Array(model.geom_size);
+			geomRgba = new Float32Array(model.geom_rgba);
+			accumulator = 0;
+
+			for (const name of bsApp.mj_bridge_watched_geom_names()) {
+				const geom = model.geom(name);
+				bsApp.mj_bridge_report_geom_id(name, geom.id);
+				geom.delete();
+			}
+			for (const name of bsApp.mj_bridge_watched_joint_names()) {
+				const joint = model.jnt(name);
+				bsApp.mj_bridge_report_joint_dof(name, joint.dofadr);
+				joint.delete();
+			}
+		}
+
+		window.__bsMujocoApplyQvel = (dofIndex, amount) => {
+			if (data) data.qvel[dofIndex] += amount;
+		};
+
+		function frame(now) {
+			const xml = bsApp.mj_bridge_model_xml();
+			if (xml && xml !== lastXml) {
+				lastXml = xml;
+				try {
+					loadModel(xml);
+				} catch (err) {
+					console.error("MuJoCo bridge: failed to load MJCF:", err);
+				}
+			}
+
+			if (model) {
+				if (bsApp.mj_bridge_take_reset_requested()) {
+					mujoco.mj_resetData(model, data);
+					accumulator = 0;
+				}
+
+				const dt = Math.min((now - lastTime) / 1000, 0.1);
+				if (bsApp.mj_bridge_playing()) {
+					accumulator += dt * bsApp.mj_bridge_speed();
+				}
+
+				let steps = 0;
+				while (accumulator >= SIM_TIMESTEP && steps < MAX_STEPS_PER_FRAME) {
+					mujoco.mj_step(model, data);
+					accumulator -= SIM_TIMESTEP;
+					steps++;
+				}
+				if (bsApp.mj_bridge_take_single_step_requested()) {
+					mujoco.mj_step(model, data);
+				}
+
+				bsApp.mj_bridge_set_geoms(
+					geomType,
+					geomSize,
+					geomRgba,
+					new Float32Array(data.geom_xpos),
+					new Float32Array(data.geom_xmat),
+				);
+			}
+
+			lastTime = now;
+			requestAnimationFrame(frame);
+		}
+
+		// Loading the MuJoCo wasm module itself is deferred until a
+		// MujocoActor actually exists (mj_bridge_model_xml() non-empty), so
+		// scenes without one don't pay for it.
+		async function waitForFirstModel() {
+			for (;;) {
+				if (bsApp.mj_bridge_model_xml()) return;
+				await new Promise((r) => setTimeout(r, 250));
+			}
+		}
+		await waitForFirstModel();
+		const loadMujoco = (await import("./mujoco_web/mujoco.js")).default;
+		mujoco = await loadMujoco();
+		requestAnimationFrame(frame);
+	}
 
 	function viewportSize() {
 		// visualViewport reflects the actual visible area on mobile (accounts
@@ -75,6 +184,10 @@
                 `./black_splat_splat_demo_bg.wasm?v=${Date.now()}`,
                 import.meta.url
             ),
+        }).then(() => {
+            startMujocoBridge().catch((err) =>
+                console.error("MuJoCo bridge failed to start:", err)
+            );
         });
     });
 

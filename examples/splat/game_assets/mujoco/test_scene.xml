@@ -1,0 +1,25 @@
+<mujoco model="black_splat mujoco actor">
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+  <worldbody>
+    <light diffuse="1 1 1" pos="0 0 5" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="3 3 0.1" rgba="0.3 0.3 0.35 1"/>
+
+    <body name="pendulum_arm" pos="0 0 2">
+      <joint name="hinge" type="hinge" axis="0 1 0" pos="0 0 0.5" damping="5.5"/>
+      <geom type="capsule" fromto="0 0 0.5 0 0 -0.5" size="0.05" rgba="0.8 0.2 0.2 1"/>
+      <body name="bob" pos="0 0 -0.5">
+        <geom name="bob" type="sphere" size="0.15" rgba="0.9 0.6 0.1 1"/>
+      </body>
+    </body>
+
+    <body name="box1" pos="0.8 0.3 1.5">
+      <joint type="free"/>
+      <geom type="box" size="0.15 0.15 0.15" rgba="0.2 0.6 0.9 1"/>
+    </body>
+
+    <body name="box2" pos="-0.6 -0.2 2.2">
+      <joint type="free"/>
+      <geom type="box" size="0.12 0.12 0.12" rgba="0.3 0.9 0.4 1"/>
+    </body>
+  </worldbody>
+</mujoco>

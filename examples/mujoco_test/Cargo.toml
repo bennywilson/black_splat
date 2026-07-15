@@ -1,27 +1,17 @@
 [package]
-name = "black_splat_splat_demo"
+name = "black_splat_mujoco_test"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0"
 cgmath = "0.18"
-getrandom = { version = "0.2", features = ["js"] }
 instant = { version = "0.1.12", features = ["wasm-bindgen"] }
 pollster = "0.3"
-# Native + browser file-open dialog for the "load your own .ply" button.  On
-# wasm it wraps an HTML file input, so the picked file never leaves the device.
-rfd = "0.14"
-# Scene save/load (JSON).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
+# MJCF loading/wireframing lives in the engine (src/mujoco.rs): native drives
+# mujoco-rs directly, wasm bridges to a sibling `@mujoco/mujoco` wasm module
+# (see that module's doc comment).
 black_splat = { path = "../../", features = ["mujoco"] }
-
-[build-dependencies]
-anyhow = "1.0"
-fs_extra = "1.2"
-glob = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

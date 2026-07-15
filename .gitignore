@@ -16,9 +16,15 @@ Cargo.lock
 
 .vs/
 target/
+target_check/
 # Build artifacts
 *.exe
 
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# mujoco-rs auto-downloaded native binaries (examples/mujoco_test)
+.mujoco_dl/
+
+node_modules/

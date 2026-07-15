@@ -45,14 +45,20 @@ pub async fn load_binary(file_name: &str) -> anyhow::Result<Vec<u8>> {
 pub async fn load_string(file_name: &str) -> anyhow::Result<String> {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "wasm32")] {
-            let path = Path::new(file_name);
-            let file_name = format!("/rust_assets/{}", path.file_name().unwrap().to_str().unwrap());
-
-            let url = format_url(&file_name);
-            let txt = reqwest::get(url)
-                .await?
-                .text()
-                .await?;
+            // Same cache-then-fetch shape as load_binary: user-imported assets
+            // (e.g. a MuJoCo scene picked via a native-style file dialog) only
+            // ever exist in IndexedDB, since they were never on the server.
+            let txt = if let Some(cached) = crate::idb::get(file_name).await {
+                String::from_utf8(cached)?
+            } else {
+                let base = Path::new(file_name).file_name().unwrap().to_str().unwrap();
+                let url = format_url(&format!("/rust_assets/{}", base));
+                let resp = reqwest::get(url).await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("fetch {base} failed: HTTP {}", resp.status());
+                }
+                resp.text().await?
+            };
         } else {
             let txt = std::fs::read_to_string(file_name)?;
         }

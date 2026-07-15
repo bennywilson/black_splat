@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+
+<meta name="author" content="Benny Wilson">
+<title>Black Splat</title>
+
+<script type="module">
+	import init, * as bsApp from "./black_splat_mujoco_test.js";
+	import loadMujoco from "./mujoco_web/mujoco.js";
+
+	// Matches game_assets/scene.xml's <option timestep="..."> -- fixed-step
+	// sim decoupled from render framerate, capped so a tab hitch can't
+	// spiral into a catch-up storm.
+	const SIM_TIMESTEP = 0.005;
+	const MAX_STEPS_PER_FRAME = 8;
+
+	// Rust only knows the MJCF text once MujocoScene::load's async asset
+	// fetch resolves (game_config -> initialize_world -> MujocoScene::load),
+	// which happens well after `init()`'s promise settles -- so poll instead
+	// of assuming it's ready immediately.
+	async function waitForModelXml() {
+		for (let i = 0; i < 500; i++) {
+			const xml = bsApp.mj_bridge_model_xml();
+			if (xml) return xml;
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		throw new Error("timed out waiting for Rust to load an MJCF scene");
+	}
+
+	async function main() {
+		console.log("[mj_bridge] booting Rust/wasm-bindgen app...");
+		// Boot the Rust/wasm-bindgen engine first so its exports (the
+		// mj_bridge_* functions below) exist before anything calls them.
+		await init();
+		console.log("[mj_bridge] Rust app booted; loading MuJoCo wasm module...");
+
+		// MuJoCo itself is a second, independent wasm module (DeepMind's
+		// official web build) with its own linear memory -- it runs its own
+		// simulation loop here in JS and hands geom snapshots to the Rust
+		// side by copying flat arrays across the wasm-bindgen boundary.
+		const mujoco = await loadMujoco();
+		console.log("[mj_bridge] MuJoCo wasm module loaded; waiting for Rust to load a scene...");
+
+		const xml = await waitForModelXml();
+		const model = mujoco.MjModel.from_xml_string(xml);
+		const data = new mujoco.MjData(model);
+		console.log(`[mj_bridge] model parsed: ngeom=${model.ngeom}`);
+
+		// Resolve every geom/joint name the Rust side registered interest in
+		// (via MujocoScene::watch_geom/watch_joint) against this parsed model,
+		// and report the ids back -- Rust can't parse MJCF itself on wasm.
+		for (const name of bsApp.mj_bridge_watched_geom_names()) {
+			const geom = model.geom(name);
+			bsApp.mj_bridge_report_geom_id(name, geom.id);
+			geom.delete();
+		}
+		for (const name of bsApp.mj_bridge_watched_joint_names()) {
+			const joint = model.jnt(name);
+			bsApp.mj_bridge_report_joint_dof(name, joint.dofadr);
+			joint.delete();
+		}
+		console.log("[mj_bridge] starting sim loop");
+
+		// Called from Rust (MujocoScene::apply_joint_qvel) -- mutating qvel
+		// directly is the JS-side equivalent of the native path's
+		// MjJointDataInfo::view_mut.
+		window.__bsMujocoApplyQvel = (dofIndex, amount) => {
+			data.qvel[dofIndex] += amount;
+		};
+
+		const ngeom = model.ngeom;
+		const geomType = new Uint32Array(model.geom_type);
+		const geomSize = new Float32Array(model.geom_size);
+		const geomRgba = new Float32Array(model.geom_rgba);
+
+		let accumulator = 0;
+		let lastTime = performance.now();
+
+		function frame(now) {
+			if (bsApp.mj_bridge_take_reset_requested()) {
+				mujoco.mj_resetData(model, data);
+				accumulator = 0;
+			}
+
+			const dt = Math.min((now - lastTime) / 1000, 0.1);
+			lastTime = now;
+
+			if (bsApp.mj_bridge_playing()) {
+				accumulator += dt * bsApp.mj_bridge_speed();
+			}
+
+			let steps = 0;
+			while (accumulator >= SIM_TIMESTEP && steps < MAX_STEPS_PER_FRAME) {
+				mujoco.mj_step(model, data);
+				accumulator -= SIM_TIMESTEP;
+				steps++;
+			}
+
+			if (bsApp.mj_bridge_take_single_step_requested()) {
+				mujoco.mj_step(model, data);
+			}
+
+			bsApp.mj_bridge_set_geoms(
+				geomType,
+				geomSize,
+				geomRgba,
+				new Float32Array(data.geom_xpos),
+				new Float32Array(data.geom_xmat),
+			);
+
+			requestAnimationFrame(frame);
+		}
+		requestAnimationFrame(frame);
+	}
+
+	window.addEventListener("load", () => {
+		main().catch((err) => console.error("MuJoCo bridge failed to start:", err));
+	});
+</script>
+
+<canvas id="target" width="1366" height="768"></canvas>
