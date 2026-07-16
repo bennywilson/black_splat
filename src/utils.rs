@@ -160,7 +160,9 @@ pub type CgPoint = cgmath::Point3<f32>;
 pub const CG_POINT_ZERO: CgPoint = CgPoint::new(0.0, 0.0, 0.0);
 
 pub type CgQuat = cgmath::Quaternion<f32>;
-pub const CG_QUAT_IDENT: CgQuat = CgQuat::new(0.0, 0.0, 0.0, 1.0);
+// cgmath's Quaternion::new takes the scalar first -- new(w, xi, yj, zk), not
+// the (x, y, z, w) order glm/Unity use. Identity is w=1.
+pub const CG_QUAT_IDENT: CgQuat = CgQuat::new(1.0, 0.0, 0.0, 0.0);
 
 pub type CgMat3 = cgmath::Matrix3<f32>;
 pub const CG_MAT3_IDENT: CgMat3 = CgMat3::new(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);

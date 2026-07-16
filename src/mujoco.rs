@@ -67,13 +67,20 @@ impl MujocoScene {
     }
 
     /// Parses an MJCF file already fetched as `xml`, using `path` to resolve
-    /// relative `<include>`/`meshdir` references on native. `MjModel` has no
-    /// notion of a base directory when parsing from a string (it stages the
-    /// text into a synthetic VFS entry with no real path), so a mesh path
-    /// like `meshdir="assets"` would otherwise be looked up relative to the
-    /// process's CWD instead of the MJCF's own directory. Loading straight
-    /// from `path` lets MuJoCo resolve those relative to the real file.
-    /// Wasm has no filesystem to resolve against, so it always parses `xml`.
+    /// relative `<include>` references on native. `MjModel` has no notion of
+    /// a base directory when parsing from a string (it stages the text into
+    /// a synthetic VFS entry with no real path), so an `<include file="...">`
+    /// would otherwise be looked up relative to the process's CWD instead of
+    /// the MJCF's own directory. Loading straight from `path` lets MuJoCo
+    /// resolve those relative to the real file. Wasm has no filesystem to
+    /// resolve against, so it always parses `xml`.
+    ///
+    /// Note this does *not* help a `<compiler meshdir="...">` attribute: a
+    /// relative `meshdir` replaces the model directory rather than being
+    /// joined with it, and is resolved against the process's CWD regardless
+    /// of how `path` is given (relative or absolute) -- MJCF authors need to
+    /// either drop `meshdir` and inline the subdirectory into each
+    /// `<mesh file="...">`, or pass an absolute `meshdir`.
     pub fn from_xml(path: &str, xml: &str) -> anyhow::Result<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -88,8 +95,9 @@ impl MujocoScene {
     }
 
     /// Loads and parses an MJCF file directly from disk (native only) --
-    /// preserves the file's directory so relative `<include>`/`meshdir`
-    /// references resolve correctly (see [`from_xml`](Self::from_xml)).
+    /// preserves the file's directory so relative `<include>` references
+    /// resolve correctly (see [`from_xml`](Self::from_xml); `meshdir` is a
+    /// separate concern, noted there).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_xml_path(path: &str) -> anyhow::Result<Self> {
         let model = MjModel::from_xml(path)
@@ -318,12 +326,14 @@ impl MujocoScene {
             };
             let xpos = self.mj_data.geom_xpos()[i];
             let xmat = self.mj_data.geom_xmat()[i];
-            let (ex, ey, ez) = mj_basis(std::array::from_fn(|k| xmat[k] as f32));
+            let (xpos_eff, xmat_eff) =
+                undo_mesh_asset_transform(model, mesh_id as usize, xpos, xmat);
+            let (ex, ey, ez) = mj_basis(xmat_eff);
             let (ex, ey, ez) = (rotation * ex, rotation * ey, rotation * ez);
             out.push(MeshGeomInstance {
                 mesh_path: mesh_path.clone(),
                 rgba,
-                position: origin + rotation * mj_vec3([xpos[0] as f32, xpos[1] as f32, xpos[2] as f32]),
+                position: origin + rotation * mj_vec3(xpos_eff),
                 rotation: quat_from_basis(ex, ey, ez),
             });
         }
@@ -354,6 +364,61 @@ impl MujocoScene {
             }
         }
     }
+
+    /// This model's joints in MuJoCo's own order: name + `qpos` width (1 for
+    /// a hinge/slide, 4 for a ball, 7 for a free joint). This is the layout
+    /// [`crate::trajectory::TrajectoryClip::retarget`] remaps a trajectory
+    /// onto before [`apply_trajectory_frame`](Self::apply_trajectory_frame)
+    /// can play it back. Wasm has no qpos access over the bridge yet, so
+    /// this is always empty there.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn joint_tracks(&self) -> Vec<crate::trajectory::JointTrack> {
+        let model = self.mj_data.model();
+        let njnt = model.ffi().njnt as usize;
+        let jnt_type = model.jnt_type();
+        (0..njnt)
+            .filter_map(|i| {
+                let name = model.id_to_name(MjtObj::mjOBJ_JOINT, i)?.to_string();
+                let dofs = match jnt_type[i] {
+                    MjtJoint::mjJNT_FREE => 7,
+                    MjtJoint::mjJNT_BALL => 4,
+                    MjtJoint::mjJNT_SLIDE | MjtJoint::mjJNT_HINGE => 1,
+                };
+                Some(crate::trajectory::JointTrack { name, dofs })
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn joint_tracks(&self) -> Vec<crate::trajectory::JointTrack> {
+        Vec::new()
+    }
+
+    /// Writes one frame of a [`crate::trajectory::RetargetedClip`] straight
+    /// into the sim's `qpos` (per joint, by name -- the clip was already
+    /// remapped onto this model's own `joint_tracks` by
+    /// [`crate::trajectory::TrajectoryClip::retarget`], so no further
+    /// lookups/conversion happens here) and re-runs forward kinematics so
+    /// drawn geom poses reflect it immediately, without stepping physics.
+    /// Out-of-range `frame_idx` is a no-op. Native only, see
+    /// [`joint_tracks`](Self::joint_tracks).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_trajectory_frame(&mut self, clip: &crate::trajectory::RetargetedClip, frame_idx: usize) {
+        let Some(frame) = clip.frames.get(frame_idx) else {
+            return;
+        };
+        let mut offset = 0;
+        for jt in &clip.joints {
+            if let Some(joint) = self.mj_data.joint(&jt.name) {
+                joint.view_mut(&mut self.mj_data).qpos.copy_from_slice(&frame[offset..offset + jt.dofs]);
+            }
+            offset += jt.dofs;
+        }
+        self.mj_data.forward();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn apply_trajectory_frame(&mut self, _clip: &crate::trajectory::RetargetedClip, _frame_idx: usize) {}
 }
 
 /// One mesh-type geom's world placement for this frame, plus which .obj to
@@ -432,6 +497,61 @@ fn collect_mesh_paths_into(
             _ => {}
         }
     }
+}
+
+/// Re-expresses a mesh geom's world transform so it applies to the *source
+/// asset's* vertices rather than MuJoCo's own processed copy.
+///
+/// MuJoCo doesn't keep mesh vertices as authored: at compile time it recenters
+/// each mesh on its center of mass and rotates it onto its principal axes of
+/// inertia, recording what it did in `mesh_pos`/`mesh_quat` ("translation /
+/// rotation applied to asset vertices"). `geom_xpos`/`geom_xmat` then place
+/// *that* processed mesh. We render the .obj as authored (see
+/// [`MujocoScene::mesh_geoms`]), so applying the geom transform raw would
+/// offset every piece by its own centroid and spin it into its own inertia
+/// frame. Undoing the asset transform first puts the authored vertices where
+/// MuJoCo would have drawn them.
+///
+/// With `P` = `mesh_pos`, `Q` = `mesh_quat`, MuJoCo's processed vertices are
+/// `v_processed = Qᵀ(v_asset - P)`, so substituting into
+/// `xpos + R·v_processed` gives the transform this returns:
+/// `R_eff = R·Qᵀ`, `pos_eff = xpos - R_eff·P`.
+///
+/// `mesh_scale` is not undone here: it's a non-uniform scale, which a rigid
+/// (position + rotation) instance transform can't carry. Scaled `<mesh>`
+/// assets will render at their authored size.
+#[cfg(not(target_arch = "wasm32"))]
+fn undo_mesh_asset_transform(
+    model: &MjModel,
+    mesh_id: usize,
+    xpos: [f64; 3],
+    xmat: [f64; 9],
+) -> ([f32; 3], [f32; 9]) {
+    use cgmath::Matrix as _; // `transpose`
+
+    // cgmath is column-major; xmat is row-major (column j of R is the image
+    // of local axis j, see `mj_basis`).
+    let r = cgmath::Matrix3::new(
+        xmat[0] as f32, xmat[3] as f32, xmat[6] as f32,
+        xmat[1] as f32, xmat[4] as f32, xmat[7] as f32,
+        xmat[2] as f32, xmat[5] as f32, xmat[8] as f32,
+    );
+    let q = model.mesh_quat()[mesh_id];
+    // MuJoCo quats are [w, x, y, z]; cgmath's `new` takes (scalar, x, y, z).
+    let q = CgQuat::new(q[0] as f32, q[1] as f32, q[2] as f32, q[3] as f32);
+    let r_eff = r * cgmath::Matrix3::from(q).transpose();
+
+    let p = model.mesh_pos()[mesh_id];
+    let p = CgVec3::new(p[0] as f32, p[1] as f32, p[2] as f32);
+    let pos_eff = CgVec3::new(xpos[0] as f32, xpos[1] as f32, xpos[2] as f32) - r_eff * p;
+
+    // Back to row-major for `mj_basis` (Matrix3's x/y/z fields are columns).
+    let xmat_eff = [
+        r_eff.x.x, r_eff.y.x, r_eff.z.x,
+        r_eff.x.y, r_eff.y.y, r_eff.z.y,
+        r_eff.x.z, r_eff.y.z, r_eff.z.z,
+    ];
+    (pos_eff.into(), xmat_eff)
 }
 
 /// Builds a rotation from a geom's world-space basis vectors (already
