@@ -55,6 +55,9 @@ pub struct MujocoScene {
     /// Multiplies `game_config.delta_time` before it's accumulated into sim
     /// steps -- 1.0 is realtime, 0.5 is half-speed, etc.
     speed: f32,
+    /// Suppresses physics stepping in `tick_and_draw`, leaving `qpos` under
+    /// whoever is writing it -- see [`set_kinematic`](Self::set_kinematic).
+    kinematic: bool,
 }
 
 impl MujocoScene {
@@ -108,6 +111,7 @@ impl MujocoScene {
             mesh_paths: collect_mesh_paths(path),
             playing: true,
             speed: 1.0,
+            kinematic: false,
         })
     }
 
@@ -125,13 +129,14 @@ impl MujocoScene {
                 mesh_paths: std::collections::HashMap::new(),
                 playing: true,
                 speed: 1.0,
+                kinematic: false,
             })
         }
         #[cfg(target_arch = "wasm32")]
         {
             wasm_bridge::set_model_xml(xml.to_string());
             wasm_bridge::set_playback(true, 1.0);
-            Ok(Self { playing: true, speed: 1.0 })
+            Ok(Self { playing: true, speed: 1.0, kinematic: false })
         }
     }
 
@@ -156,6 +161,30 @@ impl MujocoScene {
         self.speed = speed;
         #[cfg(target_arch = "wasm32")]
         wasm_bridge::set_playback(self.playing, self.speed);
+    }
+
+    pub fn is_kinematic(&self) -> bool {
+        self.kinematic
+    }
+
+    /// Stops [`tick_and_draw`](Self::tick_and_draw) from stepping physics,
+    /// so whatever last wrote `qpos` stays put.
+    ///
+    /// Set this while replaying a recorded trajectory
+    /// ([`apply_trajectory_frame`](Self::apply_trajectory_frame)). Most MJCFs
+    /// -- mujoco_menagerie's `panda.xml` included -- drive their joints with
+    /// position servos, which would spend every step hauling the arm from the
+    /// pose the clip just wrote back toward `ctrl`, so the replay would fight
+    /// the controller instead of showing the recorded motion. A recorded demo
+    /// is already a full `qpos` history: there's nothing left for the solver
+    /// to work out, and stepping can only corrupt it.
+    ///
+    /// The tradeoff is that nothing else in the sim moves either -- no gravity,
+    /// no contacts, so objects the arm "grasps" won't be carried along. Driving
+    /// the actuators instead (write `ctrl`, keep stepping) is the physical
+    /// alternative, at the cost of the arm lagging the demo.
+    pub fn set_kinematic(&mut self, kinematic: bool) {
+        self.kinematic = kinematic;
     }
 
     /// Advances the sim by exactly one fixed timestep, bypassing `playing`
@@ -200,9 +229,9 @@ impl MujocoScene {
         {
             // Fixed-timestep sim stepping decoupled from render framerate;
             // capped so a debugger pause / hitch can't spiral into a
-            // catch-up storm. Paused scenes skip stepping but still draw
-            // their current pose below.
-            if self.playing {
+            // catch-up storm. Paused and kinematic scenes skip stepping but
+            // still draw their current pose below.
+            if self.playing && !self.kinematic {
                 let dt = self.mj_data.model().opt().timestep as f32;
                 self.sim_time_accum += game_config.delta_time * self.speed;
                 let mut steps = 0;

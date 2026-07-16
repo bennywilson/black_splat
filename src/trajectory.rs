@@ -179,6 +179,23 @@ pub mod cache {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub mod cache {
+    use super::*;
+
+    /// Wasm has nowhere to cache to (see the native module above), so this
+    /// retargets on every load. Retargeting is an O(joints x frames) remap
+    /// with no I/O -- next to the fetch it costs nothing; the native cache
+    /// exists to skip repeated *process launches* re-doing the work, which
+    /// a page load can't benefit from anyway.
+    pub async fn load_retargeted(
+        clip_path: &str,
+        target_joints: &[JointTrack],
+    ) -> anyhow::Result<RetargetedClip> {
+        Ok(TrajectoryClip::load(clip_path).await?.retarget(target_joints))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
