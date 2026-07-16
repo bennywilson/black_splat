@@ -573,26 +573,61 @@ impl Model {
         }
     }
 
-    /// Loads a Wavefront .obj (plus its companion .mtl, resolved by `tobj`
-    /// relative to the .obj's own directory) straight from disk. Native only
-    /// -- unlike `from_bytes`, this needs a real filesystem path so the MTL
-    /// and any texture it references (`map_Kd`) can be found next to the
-    /// .obj. Used for MuJoCo mesh geoms (see `crate::mujoco`), whose MJCF
-    /// `<mesh file="...">` assets are plain .obj files.
+    /// Loads a Wavefront .obj (plus its companion .mtl, resolved relative to
+    /// the .obj's own directory) straight from disk. Native only -- a thin
+    /// wrapper over [`from_obj_bytes`](Self::from_obj_bytes), which is where
+    /// the work happens.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn from_obj_path(
         path: &str,
         device_resources: &mut DeviceResources<'_>,
         asset_manager: &mut AssetManager,
     ) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let base_dir = std::path::Path::new(path).parent();
+        Self::from_obj_bytes(&bytes, base_dir, device_resources, asset_manager).await
+    }
+
+    /// Loads a Wavefront .obj from bytes already in memory. `base_dir` is
+    /// where a companion .mtl (and any `map_Kd` texture it names) is resolved
+    /// from; `None` means "nowhere to look", leaving the model untextured.
+    ///
+    /// Used for MuJoCo mesh geoms (see `crate::mujoco`), whose MJCF
+    /// `<mesh file="...">` assets are plain .obj files. Taking bytes rather
+    /// than a path is what lets wasm load them at all: an imported model's
+    /// .obj files live in IndexedDB, not on any filesystem tobj could open,
+    /// so `base_dir` is `None` there.
+    ///
+    /// A missing .mtl is not an error. mujoco_menagerie's .obj files name an
+    /// `mtllib` the repo doesn't actually ship, and a mesh geom takes its
+    /// colour from the MJCF `<material>` instead (see
+    /// `MujocoScene::mesh_geoms`, whose `rgba` the caller applies per
+    /// instance) -- so there's nothing in the .mtl we need.
+    pub async fn from_obj_bytes(
+        bytes: &[u8],
+        base_dir: Option<&std::path::Path>,
+        device_resources: &mut DeviceResources<'_>,
+        asset_manager: &mut AssetManager,
+    ) -> anyhow::Result<Self> {
         let device = &device_resources.device;
 
-        let (obj_models, obj_materials) = tobj::load_obj(
-            path,
+        let (obj_models, obj_materials) = tobj::load_obj_buf(
+            &mut std::io::Cursor::new(bytes),
             &tobj::LoadOptions {
                 triangulate: true,
                 single_index: true,
                 ..Default::default()
+            },
+            |mtl_path| {
+                // Only native has a filesystem to find the .mtl on; either
+                // way, failing to is survivable (see the doc comment) -- tobj
+                // merges this Err in rather than failing the whole load.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(dir) = base_dir {
+                    return tobj::load_mtl(dir.join(mtl_path));
+                }
+                let _ = mtl_path;
+                Err(tobj::LoadError::OpenFileFailed)
             },
         )?;
         let obj_materials = obj_materials.unwrap_or_default();
@@ -705,8 +740,7 @@ impl Model {
         let white_handle = asset_manager.white_texture(device_resources);
         let mut textures = Vec::<TextureHandle>::new();
         if let Some(tex_file) = diffuse_texture_file {
-            let obj_dir = std::path::Path::new(path).parent();
-            let tex_path = obj_dir
+            let tex_path = base_dir
                 .map(|dir| dir.join(&tex_file).to_string_lossy().into_owned())
                 .unwrap_or(tex_file);
             let texture_handle = asset_manager

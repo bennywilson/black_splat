@@ -1020,9 +1020,9 @@ impl<'a> Renderer<'a> {
             .await
     }
 
-    /// Registers a model from in-memory glb/gltf bytes (see
+    /// Registers a model from in-memory glb/gltf or .obj bytes (see
     /// [`AssetManager::add_model_from_bytes`]).  Synchronous, for the web
-    /// editor's model import from the frame tick.
+    /// editor's model import and MuJoCo mesh geoms, both from the frame tick.
     #[cfg(target_arch = "wasm32")]
     pub fn load_model_from_bytes(
         &mut self,

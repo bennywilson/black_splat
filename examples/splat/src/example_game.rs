@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use black_splat::{
     egui, assets::*, config::*, editor::{self, EditorChoice, GizmoSpace, TransformGizmo}, engine::*,
-    fly_camera::*, game_object::*, input::*, mujoco::MujocoScene, renderer::*, resource::SceneLayer,
+    fly_camera::*, game_object::*, input::*, mujoco::{MjcfBundle, MujocoScene}, renderer::*, resource::SceneLayer,
     touch_pads::*, trajectory::RetargetedClip, utils::*, log,
     passes::deferred::ShadowSettings,
     passes::gaussian_splat::SplatParams,
@@ -602,6 +602,7 @@ struct MujocoActorSnapshot {
     playing: bool,
     speed: f32,
     looping: bool,
+    wireframe: bool,
 }
 
 /// One undoable editor action.  `Edit` covers both gizmo-transform drags and
@@ -702,6 +703,9 @@ struct MujocoSceneActor {
     rotation: CgQuat,
     playing: bool,
     speed: f32,
+    // Whether primitive geoms draw as wireframe lines (mesh geoms always
+    // render regardless -- see `MujocoScene::set_wireframe`).
+    wireframe: bool,
     scene: Option<MujocoScene>,
     // Real triangle-mesh actors for the scene's mesh-type geoms (registered
     // into the renderer's own actor map, see `tick_mujoco_actors`) -- index-
@@ -712,6 +716,11 @@ struct MujocoSceneActor {
     // mesh .obj path -> loaded Model, so each unique mesh is only loaded once
     // per scene load instead of every frame.
     mesh_model_cache: std::collections::HashMap<String, ModelHandle>,
+    // Mesh paths a fetch has already been dispatched for, so a mesh isn't
+    // re-requested every frame while its load is in flight (wasm only --
+    // native loads meshes inline, see `tick_mujoco_actors`).
+    #[cfg(target_arch = "wasm32")]
+    requested_meshes: std::collections::HashSet<String>,
 }
 
 impl MujocoSceneActor {
@@ -731,9 +740,12 @@ impl MujocoSceneActor {
             rotation: CG_QUAT_IDENT,
             playing: true,
             speed: 1.0,
+            wireframe: true,
             scene: None,
             mesh_geom_actors: Vec::new(),
             mesh_model_cache: std::collections::HashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            requested_meshes: std::collections::HashSet::new(),
         }
     }
 }
@@ -749,9 +761,11 @@ impl editor::EditorInspect for MujocoSceneActor {
         changed |= visitor.edit_bool("Playing", &mut self.playing);
         changed |= visitor.edit_float("Speed", &mut self.speed);
         changed |= visitor.edit_bool("Looping", &mut self.looping);
+        changed |= visitor.edit_bool("Wireframe", &mut self.wireframe);
         if let Some(scene) = &mut self.scene {
             scene.set_playing(self.playing);
             scene.set_speed(self.speed);
+            scene.set_wireframe(self.wireframe);
         }
         changed
     }
@@ -962,6 +976,8 @@ struct MujocoActorDto {
     speed: f32,
     #[serde(default = "default_true")]
     looping: bool,
+    #[serde(default = "default_true")]
+    wireframe: bool,
 }
 
 fn default_true() -> bool {
@@ -1582,16 +1598,22 @@ pub struct SplatGame {
     // MuJoCo physics actors (see MujocoSceneActor): each owns its own live
     // sim, loaded/reloaded from xml_path by tick_mujoco_actors.
     scene_mujoco_actors: Vec<MujocoSceneActor>,
-    // MJCF text fetches that finished since the last tick: (actor name,
-    // requested path, fetch result). MujocoScene itself is only ever built
-    // on the main thread (mujoco-rs FFI state isn't Send), so the background
-    // task only fetches the string; tick_mujoco_actors does the parse.
-    pending_mujoco_loads: Arc<Mutex<Vec<(String, String, anyhow::Result<String>)>>>,
+    // MJCF fetches that finished since the last tick: (actor name, requested
+    // path, fetch result). MujocoScene itself is only ever built on the main
+    // thread (mujoco-rs FFI state isn't Send), so the background task only
+    // gathers the model's files; tick_mujoco_actors does the parse.
+    pending_mujoco_loads: Arc<Mutex<Vec<(String, String, anyhow::Result<MjcfBundle>)>>>,
     // Trajectory clips that finished loading + retargeting since the last
     // tick: (actor name, requested path, result). Unlike the MJCF fetch above
     // this does do its real work off-thread -- retargeting only touches plain
     // data (see `trajectory::cache::load_retargeted`), no FFI state.
     pending_mujoco_trajectories: Arc<Mutex<Vec<(String, String, anyhow::Result<RetargetedClip>)>>>,
+    // MuJoCo mesh geom .obj bytes that finished loading: (actor name, mesh
+    // path, bytes). Web only -- the renderer's own load_model suspends on
+    // IndexedDB, which the frame tick can't do, so the fetch is spawned and a
+    // later tick turns the bytes into a Model (see `tick_mujoco_actors`).
+    #[cfg(target_arch = "wasm32")]
+    pending_mujoco_meshes: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
     // "Load .ply" plumbing.  The file dialog must run asynchronously (a browser
     // file input can't block the frame loop), so it drops its result here and
     // tick_frame picks it up: (file name, source path if one exists -- native
@@ -1711,27 +1733,34 @@ impl SplatGame {
     /// later tick to assign.
     fn open_mujoco_xml_picker(&self, actor_name: String) {
         let picked = self.picked_mujoco_xml.clone();
-        let dialog = rfd::AsyncFileDialog::new();
+
+        // Native hands back the .xml's real path and stops there: MuJoCo
+        // opens the model's <include>s and meshes off disk relative to it.
         #[cfg(not(target_arch = "wasm32"))]
-        let dialog = dialog.add_filter("MuJoCo XML", &["xml"]);
-        let pick = async move {
-            if let Some(file) = dialog.pick_file().await {
-                #[cfg(not(target_arch = "wasm32"))]
-                let path = file.path().to_string_lossy().into_owned();
-                #[cfg(target_arch = "wasm32")]
-                let path = {
-                    let key = format!("mujoco_scenes/{}", file.file_name());
-                    let bytes = file.read().await;
-                    black_splat::idb::put(&key, &bytes).await;
-                    key
-                };
-                *picked.lock().unwrap() = Some((actor_name, path));
-            }
-        };
+        {
+            let dialog = rfd::AsyncFileDialog::new().add_filter("MuJoCo XML", &["xml"]);
+            let pick = async move {
+                if let Some(file) = dialog.pick_file().await {
+                    let path = file.path().to_string_lossy().into_owned();
+                    *picked.lock().unwrap() = Some((actor_name, path));
+                }
+            };
+            std::thread::spawn(move || pollster::block_on(pick));
+        }
+
+        // The web build has no filesystem behind the picked file, so it
+        // imports the model's whole folder instead (see
+        // `import_mujoco_model_folder`). Picking a lone .xml can't work: every
+        // real model references siblings, and they'd all dangle.
         #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(pick);
-        #[cfg(not(target_arch = "wasm32"))]
-        std::thread::spawn(move || pollster::block_on(pick));
+        wasm_bindgen_futures::spawn_local(async move {
+            match import_mujoco_model_folder().await {
+                Ok(Some(root)) => *picked.lock().unwrap() = Some((actor_name, root)),
+                // Dialog dismissed, or an empty folder.
+                Ok(None) => {}
+                Err(e) => log!("MuJoCo model import failed: {e:?}"),
+            }
+        });
     }
 
     /// Opens the file dialog to pick a trajectory clip JSON for a
@@ -2269,6 +2298,7 @@ impl SplatGame {
                         playing: m.playing,
                         speed: m.speed,
                         looping: m.looping,
+                        wireframe: m.wireframe,
                     }),
                 )
             }),
@@ -2369,12 +2399,14 @@ impl SplatGame {
                     slot.playing = m.playing;
                     slot.speed = m.speed;
                     slot.looping = m.looping;
+                    slot.wireframe = m.wireframe;
                     // scene/loaded_path and clip/loaded_trajectory_path are
                     // left alone -- tick_mujoco_actors reconciles a changed
                     // xml_path/trajectory_path against the live sim.
                     if let Some(scene) = &mut slot.scene {
                         scene.set_playing(slot.playing);
                         scene.set_speed(slot.speed);
+                        scene.set_wireframe(slot.wireframe);
                     }
                 }
             }
@@ -2520,9 +2552,12 @@ impl SplatGame {
                     rotation: m.rotation,
                     playing: m.playing,
                     speed: m.speed,
+                    wireframe: m.wireframe,
                     scene: None,
                     mesh_geom_actors: Vec::new(),
                     mesh_model_cache: std::collections::HashMap::new(),
+                    #[cfg(target_arch = "wasm32")]
+                    requested_meshes: std::collections::HashSet::new(),
                 });
                 // scene is None / loaded_path empty, so tick_mujoco_actors
                 // reloads it from xml_path on the next tick.
@@ -2697,7 +2732,30 @@ impl SplatGame {
     /// Details-panel edit, undo/redo, or scene load) and steps + wireframes
     /// every loaded one. Called once per frame from tick_frame_internal.
     fn tick_mujoco_actors(&mut self, renderer: &mut Renderer, game_config: &Config) {
-        let finished: Vec<(String, String, anyhow::Result<String>)> =
+        // Mesh .obj bytes that arrived since the last tick, turned into Models
+        // here on the render thread. Dropped on the floor if the actor is gone
+        // or has since reloaded (a stale mesh belongs to a model that no
+        // longer exists).
+        #[cfg(target_arch = "wasm32")]
+        {
+            let fetched: Vec<(String, String, Vec<u8>)> =
+                std::mem::take(&mut *self.pending_mujoco_meshes.lock().unwrap());
+            for (name, path, bytes) in fetched {
+                if !self
+                    .scene_mujoco_actors
+                    .iter()
+                    .any(|a| a.name == name && a.requested_meshes.contains(&path))
+                {
+                    continue;
+                }
+                let handle = renderer.load_model_from_bytes(&path, &bytes, false);
+                if let Some(actor) = self.scene_mujoco_actors.iter_mut().find(|a| a.name == name) {
+                    actor.mesh_model_cache.insert(path, handle);
+                }
+            }
+        }
+
+        let finished: Vec<(String, String, anyhow::Result<MjcfBundle>)> =
             std::mem::take(&mut *self.pending_mujoco_loads.lock().unwrap());
         for (name, path, result) in finished {
             if let Some(actor) = self.scene_mujoco_actors.iter_mut().find(|a| a.name == name) {
@@ -2707,10 +2765,11 @@ impl SplatGame {
                 // Only apply if xml_path still matches what was requested --
                 // a further edit in the meantime gets its own load below.
                 if actor.xml_path == path {
-                    match result.and_then(|xml| MujocoScene::from_xml(&path, &xml)) {
+                    match result.and_then(MujocoScene::from_bundle) {
                         Ok(mut scene) => {
                             scene.set_playing(actor.playing);
                             scene.set_speed(actor.speed);
+                            scene.set_wireframe(actor.wireframe);
                             actor.scene = Some(scene);
                             actor.loaded_path = path;
                             // A clip is retargeted onto one specific model's
@@ -2728,6 +2787,10 @@ impl SplatGame {
                                 renderer.remove_actor(&mesh_actor);
                             }
                             actor.mesh_model_cache.clear();
+                            // Else the new model's meshes would look already
+                            // requested and never be fetched.
+                            #[cfg(target_arch = "wasm32")]
+                            actor.requested_meshes.clear();
                         }
                         Err(e) => {
                             log!("Mujoco actor '{name}' failed to load '{path}': {e}");
@@ -2752,7 +2815,7 @@ impl SplatGame {
             let path = actor.xml_path.clone();
             let pending = self.pending_mujoco_loads.clone();
             let task = async move {
-                let result = black_splat::assets::load_string(&path).await;
+                let result = MujocoScene::load_bundle(&path).await;
                 pending.lock().unwrap().push((name, path, result));
             };
             #[cfg(target_arch = "wasm32")]
@@ -2830,6 +2893,15 @@ impl SplatGame {
                 continue; // Retry once the sim finishes loading.
             };
             let target_joints = scene.joint_tracks();
+            if target_joints.is_empty() {
+                // On wasm `scene` exists as soon as the files are staged, but
+                // the joint layout only arrives once the JS side has actually
+                // parsed the model a few frames later. Retargeting against an
+                // empty layout matches nothing and would drop the clip for
+                // good, since the dispatch guard above won't fire twice for
+                // the same path. Wait for the layout instead.
+                continue;
+            }
             actor.pending_trajectory_path = Some(actor.trajectory_path.clone());
             let name = actor.name.clone();
             let path = actor.trajectory_path.clone();
@@ -2869,17 +2941,50 @@ impl SplatGame {
                 scene.tick_and_draw_at(renderer, game_config, actor.position, actor.rotation);
 
                 let mesh_geoms = scene.mesh_geoms(actor.position, actor.rotation);
-                // First time this scene's mesh geoms are seen: one Actor per
-                // geom, index-aligned with `mesh_geoms` (stable across frames
-                // -- see the field comment on `mesh_geom_actors`).
-                if actor.mesh_geom_actors.is_empty() && !mesh_geoms.is_empty() {
+
+                // Native reads the .obj straight off disk, so the load can
+                // just happen here.
+                #[cfg(not(target_arch = "wasm32"))]
+                for geom in &mesh_geoms {
+                    if !actor.mesh_model_cache.contains_key(&geom.mesh_path) {
+                        let handle = pollster::block_on(renderer.load_model(&geom.mesh_path, false));
+                        actor.mesh_model_cache.insert(geom.mesh_path.clone(), handle);
+                    }
+                }
+
+                // Wasm can't: the .obj lives in IndexedDB and reading it
+                // suspends, which the frame tick can't do. Dispatch the fetch
+                // and let a later tick register the model (see the drain at
+                // the top of this function).
+                #[cfg(target_arch = "wasm32")]
+                for geom in &mesh_geoms {
+                    if actor.mesh_model_cache.contains_key(&geom.mesh_path)
+                        || !actor.requested_meshes.insert(geom.mesh_path.clone())
+                    {
+                        continue;
+                    }
+                    let name = actor.name.clone();
+                    let path = geom.mesh_path.clone();
+                    let pending = self.pending_mujoco_meshes.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match black_splat::assets::load_binary(&path).await {
+                            Ok(bytes) => pending.lock().unwrap().push((name, path, bytes)),
+                            Err(e) => log!("MuJoCo mesh {path} failed to load: {e}"),
+                        }
+                    });
+                }
+
+                // One Actor per mesh geom, index-aligned with `mesh_geoms`
+                // (stable across frames -- see the field comment on
+                // `mesh_geom_actors`). Held back until every mesh has a model:
+                // the alignment is by index, so a partial build would pair
+                // actors with the wrong geoms.
+                if actor.mesh_geom_actors.is_empty()
+                    && !mesh_geoms.is_empty()
+                    && mesh_geoms.iter().all(|g| actor.mesh_model_cache.contains_key(&g.mesh_path))
+                {
                     for geom in &mesh_geoms {
-                        let handle = *actor
-                            .mesh_model_cache
-                            .entry(geom.mesh_path.clone())
-                            .or_insert_with(|| {
-                                pollster::block_on(renderer.load_model(&geom.mesh_path, false))
-                            });
+                        let handle = actor.mesh_model_cache[&geom.mesh_path];
                         let mut mesh_actor = Actor::new();
                         mesh_actor.set_model(&handle);
                         mesh_actor.set_layer(&SceneLayer::World, &None);
@@ -3155,6 +3260,7 @@ impl SplatGame {
                     playing: m.playing,
                     speed: m.speed,
                     looping: m.looping,
+                    wireframe: m.wireframe,
                 })
                 .collect(),
             post_process: Some(PostProcessDto::from_settings(&self.scene_post_process)),
@@ -3336,9 +3442,12 @@ impl SplatGame {
                 rotation: arr_quat(dto.rotation),
                 playing: dto.playing,
                 speed: dto.speed,
+                wireframe: dto.wireframe,
                 scene: None,
                 mesh_geom_actors: Vec::new(),
                 mesh_model_cache: std::collections::HashMap::new(),
+                #[cfg(target_arch = "wasm32")]
+                requested_meshes: std::collections::HashSet::new(),
             });
         }
 
@@ -3501,6 +3610,91 @@ impl SplatGame {
     }
 }
 
+/// Imports a MuJoCo model's whole folder into IndexedDB, returning the key of
+/// its entry MJCF -- ready to drop straight into a `MujocoSceneActor`'s
+/// `xml_path`, since `MujocoScene::load_bundle`'s walk asks IndexedDB for
+/// exactly the keys written here. `Ok(None)` if the visitor picked nothing.
+///
+/// rfd has no folder picker on web (its wasm backend only wraps a plain
+/// `<input type="file">`), so this drives the element itself to get at
+/// `webkitdirectory` -- the one broadly-supported way a page can read a
+/// directory without asking the visitor to zip it first.
+///
+/// Nothing is uploaded: the files go from the visitor's disk straight into
+/// this origin's IndexedDB, and the model never leaves the device.
+#[cfg(target_arch = "wasm32")]
+async fn import_mujoco_model_folder() -> anyhow::Result<Option<String>> {
+    use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or_else(|| anyhow::anyhow!("no document"))?;
+    let input: web_sys::HtmlInputElement = document
+        .create_element("input")
+        .map_err(|e| anyhow::anyhow!("create <input>: {e:?}"))?
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("created element wasn't an <input>"))?;
+    input.set_type("file");
+    input.set_webkitdirectory(true);
+
+    // Resolve once the visitor confirms. A dismissed dialog fires no event in
+    // most browsers, so this can simply never resolve -- the task then parks
+    // forever holding just the input, which is why nothing else waits on it.
+    let input_for_cb = input.clone();
+    let chosen = js_sys::Promise::new(&mut move |resolve, _reject| {
+        let cb = Closure::once(Box::new(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        }) as Box<dyn FnOnce()>);
+        input_for_cb.set_onchange(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    });
+    input.click();
+    wasm_bindgen_futures::JsFuture::from(chosen)
+        .await
+        .map_err(|e| anyhow::anyhow!("folder picker: {e:?}"))?;
+
+    let Some(files) = input.files() else {
+        return Ok(None);
+    };
+
+    // Every .xml's text, kept aside so the include graph can name the entry
+    // point once the whole folder is in (see `mujoco::find_root_mjcf`).
+    let mut mjcfs: Vec<(String, String)> = Vec::new();
+    for i in 0..files.length() {
+        let Some(file) = files.get(i) else { continue };
+        // webkitRelativePath ("panda/assets/link0_0.obj") is what makes this
+        // worth doing -- it's the model's own layout, which every <include>
+        // and <mesh file="..."> in the MJCF is written against. web-sys
+        // doesn't bind it (it's non-standard), hence the Reflect call.
+        let relative = js_sys::Reflect::get(&file, &JsValue::from_str("webkitRelativePath"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| file.name());
+        let key = format!("mujoco_scenes/{relative}");
+
+        let buffer = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+            .await
+            .map_err(|e| anyhow::anyhow!("read {relative}: {e:?}"))?;
+        let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+
+        if relative.to_ascii_lowercase().ends_with(".xml") {
+            if let Ok(text) = String::from_utf8(bytes.clone()) {
+                mjcfs.push((key.clone(), text));
+            }
+        }
+        black_splat::idb::put(&key, &bytes).await;
+    }
+
+    if mjcfs.is_empty() {
+        anyhow::bail!("no MJCF (.xml) file in the picked folder");
+    }
+    let root = black_splat::mujoco::find_root_mjcf(&mjcfs)
+        .ok_or_else(|| anyhow::anyhow!("every .xml in the folder is <include>d by another"))?;
+    log!("imported MuJoCo model: {} file(s), root {root}", files.length());
+    Ok(Some(root))
+}
+
 impl GameEngine for SplatGame {
     fn new(game_config: &Config) -> Self {
         log!("SplatGame::new()");
@@ -3515,6 +3709,8 @@ impl GameEngine for SplatGame {
             scene_mujoco_actors: Vec::new(),
             pending_mujoco_loads: Arc::new(Mutex::new(Vec::new())),
             pending_mujoco_trajectories: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(target_arch = "wasm32")]
+            pending_mujoco_meshes: Arc::new(Mutex::new(Vec::new())),
             picked_mujoco_trajectory: Arc::new(Mutex::new(None)),
             scene_actors: Vec::new(),
             scene_lights: Vec::new(),

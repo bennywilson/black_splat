@@ -31,5 +31,18 @@ wasm-bindgen-futures = "0.4.42"
 js-sys = "0.3"
 # The engine's log! macro expands to web_sys::console at the call site.
 # Window/Navigator are for the touch-device check (GUI sizing); Storage is the
-# localStorage that persists the startup scene.
-web-sys =  { version = "0.3.69", features = ["Window", "Navigator", "Storage"] }
+# localStorage that persists the startup scene. Document/Element/
+# HtmlInputElement/File/FileList/Blob back the MuJoCo model folder import
+# (see `import_mujoco_model_folder`), which drives an <input webkitdirectory>
+# directly because rfd's web backend has no folder picker.
+web-sys =  { version = "0.3.69", features = [
+    "Window",
+    "Navigator",
+    "Storage",
+    "Document",
+    "Element",
+    "HtmlInputElement",
+    "File",
+    "FileList",
+    "Blob",
+] }

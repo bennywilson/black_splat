@@ -13,17 +13,42 @@
 	const SIM_TIMESTEP = 0.005;
 	const MAX_STEPS_PER_FRAME = 8;
 
-	// Rust only knows the MJCF text once MujocoScene::load's async asset
-	// fetch resolves (game_config -> initialize_world -> MujocoScene::load),
-	// which happens well after `init()`'s promise settles -- so poll instead
-	// of assuming it's ready immediately.
-	async function waitForModelXml() {
+	// Rust only knows the model once MujocoScene::load's async asset fetch
+	// resolves (game_config -> initialize_world -> MujocoScene::load), which
+	// happens well after `init()`'s promise settles -- so poll instead of
+	// assuming it's ready immediately.
+	async function waitForModel() {
 		for (let i = 0; i < 500; i++) {
-			const xml = bsApp.mj_bridge_model_xml();
-			if (xml) return xml;
+			if (bsApp.mj_bridge_model_generation() > 0) return;
 			await new Promise((r) => setTimeout(r, 20));
 		}
 		throw new Error("timed out waiting for Rust to load an MJCF scene");
+	}
+
+	// MuJoCo opens an MJCF's <include>/<mesh>/<texture> references relative to
+	// the model file, so it needs them on a filesystem -- from_xml_string has
+	// no base directory and every relative reference in it fails. Stage the
+	// files Rust gathered (MujocoScene::load_bundle) into the wasm build's
+	// in-memory FS, then load by path. scene.xml here references nothing, but
+	// the bridge is shared with examples/splat, which loads real robots.
+	function stageModel(mujoco) {
+		for (const path of bsApp.mj_bridge_model_file_paths()) {
+			const bytes = bsApp.mj_bridge_take_model_file_bytes(path);
+			const absolute = path.startsWith("/") ? path : "/" + path;
+			const dir = absolute.substring(0, absolute.lastIndexOf("/"));
+			let built = "";
+			for (const part of dir.split("/").filter((p) => p.length > 0)) {
+				built += "/" + part;
+				try {
+					mujoco.FS.mkdir(built);
+				} catch (err) {
+					// Already exists -- siblings share parent dirs.
+				}
+			}
+			mujoco.FS.writeFile(absolute, bytes);
+		}
+		const root = bsApp.mj_bridge_model_root();
+		return root.startsWith("/") ? root : "/" + root;
 	}
 
 	async function main() {
@@ -40,8 +65,8 @@
 		const mujoco = await loadMujoco();
 		console.log("[mj_bridge] MuJoCo wasm module loaded; waiting for Rust to load a scene...");
 
-		const xml = await waitForModelXml();
-		const model = mujoco.MjModel.from_xml_string(xml);
+		await waitForModel();
+		const model = mujoco.MjModel.from_xml_path(stageModel(mujoco));
 		const data = new mujoco.MjData(model);
 		console.log(`[mj_bridge] model parsed: ngeom=${model.ngeom}`);
 
