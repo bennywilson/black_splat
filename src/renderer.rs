@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use cgmath::{InnerSpace, SquareMatrix};
 use instant::Instant;
 use std::{collections::HashMap, sync::Arc};
 use wgpu_text::glyph_brush::{HorizontalAlign, Layout, Section as TextSection, Text, VerticalAlign};
@@ -934,7 +936,8 @@ impl<'a> Renderer<'a> {
         capture_config.fov = 90.0;
         self.resize(&capture_config);
 
-        let cube_texture = CubeTexture::new(&self.device_resources.device, SCENE_COLOR_FORMAT, FACE_SIZE);
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut cube_texture = CubeTexture::new(&self.device_resources.device, SCENE_COLOR_FORMAT, FACE_SIZE);
         let position = light.get_position();
 
         for (face, (dir, up)) in Texture::CUBE_FACE_DIRECTIONS.iter().enumerate() {
@@ -1003,6 +1006,32 @@ impl<'a> Renderer<'a> {
         // an empty scene, not that the shader is wrong).
         #[cfg(not(target_arch = "wasm32"))]
         Self::dump_cube_texture_to_disk(&self.device_resources, &cube_texture, FACE_SIZE, light_id);
+
+        // Diffuse irradiance: a 9-term SH projection of mip 0, computed on
+        // the CPU via a blocking readback -- same reason as
+        // `dump_cube_texture_to_disk`, this doesn't work on wasm (no
+        // synchronous map_async there), so wasm falls back to sampling the
+        // roughest GPU-prefiltered mip by normal instead (see
+        // light_skylight.wgsl's `sky_env.mip_params.z` branch).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            cube_texture.sh_coeffs =
+                Self::project_skylight_sh(&self.device_resources, &cube_texture, FACE_SIZE);
+            let sh_dc = cube_texture.sh_coeffs[0];
+            log!(
+                "bake_skylight_cubemap: SH L00 (average radiance) = ({:.3}, {:.3}, {:.3})",
+                sh_dc[0],
+                sh_dc[1],
+                sh_dc[2]
+            );
+        }
+        // Specular roughness: GPU-only GGX-prefiltered mip chain, works on
+        // every backend including wasm.
+        self.lighting_pass.as_ref().unwrap().prefilter_skylight_mips(
+            &self.device_resources,
+            &cube_texture,
+            FACE_SIZE,
+        );
 
         self.env_cubemaps.insert(light_id, cube_texture);
         self.game_camera = saved_camera;
@@ -1132,6 +1161,154 @@ impl<'a> Renderer<'a> {
         }
         drop(mapped);
         readback.unmap();
+    }
+
+    /// Projects a freshly-baked cube's mip 0 onto 9 real spherical-harmonic
+    /// (band 0-2) RGB coefficients -- a standard cosine-lobe-ready diffuse
+    /// irradiance representation (Ramamoorthi & Hanrahan). Reads the texture
+    /// back to the CPU (same pattern as `dump_cube_texture_to_disk`) and
+    /// reduces there: at ~98k texels this is trivial next to the bake's other
+    /// one-shot costs, and needs no GPU reduction pass.
+    ///
+    /// Each texel's direction is reconstructed with the same 90-degree-FOV
+    /// camera convention `bake_skylight_cubemap` used to *write* that texel
+    /// (`Camera::from_look` + a standard perspective projection, inverted),
+    /// so this is guaranteed consistent with the actual capture regardless of
+    /// any GPU hardware cubemap-addressing convention. The per-texel solid
+    /// angle uses the standard `4/(u^2+v^2+1)^1.5` cubemap Jacobian weight
+    /// (texels away from a face's center subtend less solid angle); the
+    /// result is corrected so the 6 faces' weights sum to a full sphere
+    /// (4*pi), which cancels out the flat-projection discretization error.
+    ///
+    /// Native only: relies on a blocking `map_async` + `device.poll`
+    /// readback, which isn't available on wasm (see call site).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn project_skylight_sh(
+        device_resources: &DeviceResources,
+        cube_texture: &CubeTexture,
+        face_size: u32,
+    ) -> [[f32; 4]; 9] {
+        let device = &device_resources.device;
+        let queue = &device_resources.queue;
+        let bytes_per_row = face_size * 8; // Rgba16Float
+        let face_bytes = (bytes_per_row * face_size) as u64;
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("skylight SH readback"),
+            size: face_bytes * 6,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("skylight SH copy"),
+        });
+        for face in 0..6u32 {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cube_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: face },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: face_bytes * face as u64,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(face_size),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: face_size,
+                    height: face_size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let mapped = slice.get_mapped_range();
+
+        let mut sh = [CgVec3::new(0.0, 0.0, 0.0); 9];
+        let mut weight_sum = 0.0f32;
+
+        for (face, (dir, up)) in Texture::CUBE_FACE_DIRECTIONS.iter().enumerate() {
+            let cam = Camera::from_look(
+                CgVec3::new(0.0, 0.0, 0.0),
+                CgVec3::new(dir[0], dir[1], dir[2]),
+                CgVec3::new(up[0], up[1], up[2]),
+            );
+            let (view_matrix, _, _) = cam.calculate_view_matrix();
+            let proj_matrix = cgmath::perspective(cgmath::Deg(90.0), 1.0, 0.1, 10.0);
+            let inv_view_proj = (proj_matrix * view_matrix)
+                .invert()
+                .unwrap_or_else(cgmath::Matrix4::identity);
+
+            let start = (face_bytes * face as u64) as usize;
+            let end = start + face_bytes as usize;
+            let halfs: &[u16] = bytemuck::cast_slice(&mapped[start..end]);
+
+            for row in 0..face_size {
+                for col in 0..face_size {
+                    let u = (col as f32 + 0.5) / face_size as f32;
+                    let v = (row as f32 + 0.5) / face_size as f32;
+                    let ndc = cgmath::Vector4::new(u * 2.0 - 1.0, 1.0 - v * 2.0, 0.0, 1.0);
+                    let world = inv_view_proj * ndc;
+                    let n =
+                        CgVec3::new(world.x / world.w, world.y / world.w, world.z / world.w)
+                            .normalize();
+
+                    let fu = u * 2.0 - 1.0;
+                    let fv = 1.0 - v * 2.0;
+                    let texel_area = (2.0 / face_size as f32).powi(2);
+                    let weight = texel_area * 4.0 / (fu * fu + fv * fv + 1.0).powf(1.5);
+
+                    let px = (row * face_size + col) as usize;
+                    let radiance = CgVec3::new(
+                        f16_to_f32(halfs[px * 4]),
+                        f16_to_f32(halfs[px * 4 + 1]),
+                        f16_to_f32(halfs[px * 4 + 2]),
+                    );
+
+                    // Real-SH basis, band 0-2 (must match light_skylight.wgsl's
+                    // eval_sh_irradiance constants).
+                    let basis = [
+                        0.282095,
+                        0.488603 * n.y,
+                        0.488603 * n.z,
+                        0.488603 * n.x,
+                        1.092548 * n.x * n.y,
+                        1.092548 * n.y * n.z,
+                        0.315392 * (3.0 * n.z * n.z - 1.0),
+                        1.092548 * n.x * n.z,
+                        0.546274 * (n.x * n.x - n.y * n.y),
+                    ];
+                    for i in 0..9 {
+                        sh[i] += radiance * (basis[i] * weight);
+                    }
+                    weight_sum += weight;
+                }
+            }
+        }
+        drop(mapped);
+        readback.unmap();
+
+        let norm = if weight_sum > 0.0 {
+            4.0 * std::f32::consts::PI / weight_sum
+        } else {
+            0.0
+        };
+        std::array::from_fn(|i| {
+            let c = sh[i] * norm;
+            [c.x, c.y, c.z, 0.0]
+        })
     }
 
     /// Frees a skylight's baked environment cubemap, if it has one. Unlike

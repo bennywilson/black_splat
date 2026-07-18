@@ -254,6 +254,10 @@ impl AssetManager {
             include_str!("../engine_assets/shaders/light_spot.wgsl").to_string(),
         );
         file_to_string_buffer.insert(
+            "skylight_prefilter.wgsl".to_string(),
+            include_str!("../engine_assets/shaders/skylight_prefilter.wgsl").to_string(),
+        );
+        file_to_string_buffer.insert(
             "shadow_depth.wgsl".to_string(),
             include_str!("../engine_assets/shaders/shadow_depth.wgsl").to_string(),
         );

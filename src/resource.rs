@@ -462,20 +462,37 @@ impl Texture {
     }
 }
 
-/// An HDR cube render target: `face_views[i]` (D2, one array layer) is what
-/// a capture pass renders into for face `i` (see `Texture::CUBE_FACE_DIRECTIONS`
-/// for the face order); `cube_view` (Cube, all 6 layers) is what a lighting
-/// shader samples as a `texture_cube<f32>`. Built once by a skylight's
+/// An HDR cube render target: `face_views[mip][i]` (D2, one array layer, one
+/// mip) is what a capture/prefilter pass renders into for face `i` at level
+/// `mip` (see `Texture::CUBE_FACE_DIRECTIONS` for the face order); `cube_view`
+/// (Cube, all mips, all 6 layers) is what a lighting shader samples as a
+/// `texture_cube<f32>`. Mip 0 is the raw capture; mips 1.. are a GGX-prefiltered
+/// roughness chain and `sh_coeffs` is a 9-term spherical-harmonic projection of
+/// mip 0 for diffuse irradiance -- both filled in by a skylight's
 /// environment-capture bake (see `Renderer::bake_skylight_cubemap`).
 pub struct CubeTexture {
     pub texture: wgpu::Texture,
     pub cube_view: wgpu::TextureView,
-    pub face_views: [wgpu::TextureView; 6],
+    pub face_views: Vec<[wgpu::TextureView; 6]>,
     pub sampler: wgpu::Sampler,
+    pub mip_count: u32,
+    pub sh_coeffs: [[f32; 4]; 9],
 }
 
 impl CubeTexture {
+    /// Mip levels from `face_size` down to a 4x4 floor (128 -> 6 levels).
+    /// Below 4x4 there isn't enough resolution for a stable GGX prefilter, and
+    /// a 1x1 fallback texture just wants its single mip.
+    fn mip_count_for(face_size: u32) -> u32 {
+        if face_size < 4 {
+            1
+        } else {
+            1 + (face_size / 4).ilog2()
+        }
+    }
+
     pub fn new(device: &Device, format: wgpu::TextureFormat, face_size: u32) -> Self {
+        let mip_count = Self::mip_count_for(face_size);
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Skylight Env Cubemap"),
             size: wgpu::Extent3d {
@@ -483,13 +500,14 @@ impl CubeTexture {
                 height: face_size,
                 depth_or_array_layers: 6,
             },
-            mip_level_count: 1,
+            mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            // COPY_DST to receive each captured face from the scene color
-            // target; COPY_SRC to read the finished cubemap back for the PNG
-            // debug dump (see Renderer::bake_skylight_cubemap).
+            // COPY_DST to receive the captured mip-0 face from the scene
+            // color target; RENDER_ATTACHMENT so the GGX prefilter pass can
+            // also render into mips 1..; COPY_SRC to read mip 0 back for the
+            // PNG debug dump (see Renderer::bake_skylight_cubemap).
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_DST
@@ -504,15 +522,21 @@ impl CubeTexture {
             ..Default::default()
         });
 
-        let face_views = std::array::from_fn(|i| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("Skylight Env Cubemap Face"),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: i as u32,
-                array_layer_count: Some(1),
-                ..Default::default()
+        let face_views = (0..mip_count)
+            .map(|mip| {
+                std::array::from_fn(|i| {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("Skylight Env Cubemap Face"),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        base_mip_level: mip,
+                        mip_level_count: Some(1),
+                        base_array_layer: i as u32,
+                        array_layer_count: Some(1),
+                        ..Default::default()
+                    })
+                })
             })
-        });
+            .collect();
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -529,6 +553,10 @@ impl CubeTexture {
             cube_view,
             face_views,
             sampler,
+            mip_count,
+            // Flat white DC term until a real bake fills this in, so a fresh
+            // (unbaked) skylight's diffuse term isn't pitch black.
+            sh_coeffs: [[0.0; 4]; 9],
         }
     }
 }

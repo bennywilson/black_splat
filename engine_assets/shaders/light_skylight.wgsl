@@ -1,9 +1,8 @@
 // Deferred skylight: an ambient hemisphere, or -- once the skylight has a
-// baked environment cubemap (see Renderer::bake_skylight_cubemap) -- that
-// cubemap sampled by world normal, a cheap stand-in for a real irradiance
-// convolution. Also contributes a mirror-sharp specular reflection term
-// (Fresnel-weighted against the diffuse term), so metallic surfaces have
-// something to show besides diffuse ambient. Can additionally draw the bake
+// baked environment cubemap (see Renderer::bake_skylight_cubemap) -- diffuse
+// irradiance from a 9-term spherical-harmonic projection of that cube plus a
+// specular reflection sampled from its GGX-prefiltered mip chain (mip 0 =
+// mirror, deeper mips = wider roughness lobe). Can additionally draw the bake
 // as the background where nothing was rendered, to inspect it
 // (Light::show_env_as_skybox).
 
@@ -15,6 +14,13 @@ struct LightUniform {
     color2: vec4<f32>,           // rgb bottom color * intensity, w 1.0 if t_env is a real bake
     camera_pos: vec4<f32>,        // xyz camera world position, w 1.0 to draw t_env as the background
     target_dims: vec4<f32>       // xy render target size in pixels
+};
+
+// Diffuse irradiance SH coefficients (band 0..2, RGB in xyz) plus the mip
+// chain's roughness range. See Renderer::bake_skylight_cubemap.
+struct SkylightEnvUniform {
+    sh: array<vec4<f32>, 9>,
+    mip_params: vec4<f32>,   // x: highest mip index (roughness 1.0 samples this level)
 };
 
 @group(0) @binding(0)
@@ -32,6 +38,30 @@ var<uniform> light: LightUniform;
 var t_env: texture_cube<f32>;
 @group(1) @binding(2)
 var s_env: sampler;
+@group(1) @binding(3)
+var<uniform> sky_env: SkylightEnvUniform;
+
+// Standard real-SH irradiance evaluation (Ramamoorthi & Hanrahan): `sh` holds
+// raw radiance projection coefficients; the A0/A1/A2 constants below fold in
+// the cosine-lobe convolution so this directly returns cosine-weighted
+// irradiance, not raw radiance.
+fn eval_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
+    let a0 = 3.141593;
+    let a1 = 2.094395;
+    let a2 = 0.785398;
+    var res = sky_env.sh[0].rgb * (0.282095 * a0);
+    res += sky_env.sh[1].rgb * (0.488603 * n.y * a1);
+    res += sky_env.sh[2].rgb * (0.488603 * n.z * a1);
+    res += sky_env.sh[3].rgb * (0.488603 * n.x * a1);
+    res += sky_env.sh[4].rgb * (1.092548 * n.x * n.y * a2);
+    res += sky_env.sh[5].rgb * (1.092548 * n.y * n.z * a2);
+    res += sky_env.sh[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0) * a2);
+    res += sky_env.sh[7].rgb * (1.092548 * n.x * n.z * a2);
+    res += sky_env.sh[8].rgb * (0.546274 * (n.x * n.x - n.y * n.y) * a2);
+    // Divide the cosine-convolved projection by pi to turn irradiance into
+    // the outgoing Lambertian radiance a diffuse albedo multiplies against.
+    return max(res / 3.141593, vec3<f32>(0.0));
+}
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
@@ -76,12 +106,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let world_w = light.inv_view_proj * ndc;
     let world_pos = world_w.xyz / world_w.w;
     let view_dir = normalize(light.camera_pos.xyz - world_pos);
-    // Bend the reflection ray back toward the normal as roughness rises. The
-    // bake has no mip chain to prefilter against (see
-    // Renderer::bake_skylight_cubemap), so this stands in for the widening
-    // specular lobe: a rough surface samples roughly what faces it rather
-    // than a sharp mirror image of the environment.
-    let reflect_dir = normalize(mix(reflect(-view_dir, normal), normal, roughness * roughness));
+    let reflect_dir = normalize(reflect(-view_dir, normal));
 
     var sky: vec3<f32>;
     var refl: vec3<f32>;
@@ -89,14 +114,29 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // The captured cubemap is already full-color radiance -- scale by
         // plain intensity only, not the Color swatch (that's baked into the
         // capture's exposure, not a tint to reapply on top of real pixels).
-        sky = textureSampleLevel(t_env, s_env, normal, 0.0).rgb * light.direction_cone.a;
-        // Mirror-sharp reflection -- no roughness blur yet, since the bake
-        // has no mip chain to filter against (see Renderer::bake_skylight_cubemap).
-        refl = textureSampleLevel(t_env, s_env, reflect_dir, 0.0).rgb * light.direction_cone.a;
+        if (sky_env.mip_params.z > 0.5) {
+            sky = eval_sh_irradiance(normal) * light.direction_cone.a;
+        } else {
+            // No CPU-projected SH available (wasm -- see
+            // Renderer::bake_skylight_cubemap). Sample the roughest
+            // GPU-prefiltered mip by normal as a cheaper, GPU-only stand-in:
+            // not a true cosine-weighted irradiance convolution, but far
+            // softer than a mip-0 mirror sample.
+            sky = textureSampleLevel(t_env, s_env, normal, sky_env.mip_params.x).rgb
+                * light.direction_cone.a;
+        }
+        // Sample the GGX-prefiltered mip matching this surface's roughness
+        // (mip 0 = mirror, sky_env.mip_params.x = roughest available level).
+        let mip = roughness * sky_env.mip_params.x;
+        refl = textureSampleLevel(t_env, s_env, reflect_dir, mip).rgb * light.direction_cone.a;
     } else {
+        // No baked mip chain to blur against here -- bend the reflection ray
+        // back toward the normal as roughness rises so the two-color gradient
+        // still softens for rough surfaces instead of staying a hard mirror.
+        let bent_reflect_dir = normalize(mix(reflect_dir, normal, roughness * roughness));
         let up_ness = normal.y * 0.5 + 0.5;
         sky = mix(light.color2.rgb, light.color_cone.rgb, up_ness);
-        let refl_up_ness = reflect_dir.y * 0.5 + 0.5;
+        let refl_up_ness = bent_reflect_dir.y * 0.5 + 0.5;
         refl = mix(light.color2.rgb, light.color_cone.rgb, refl_up_ness);
     }
 
