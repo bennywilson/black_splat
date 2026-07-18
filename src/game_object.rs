@@ -558,6 +558,12 @@ pub struct Light {
     // still held in memory (see Renderer::env_cubemaps). Meaningless on other
     // light types.
     use_env_cubemap: bool,
+    // Debug view: draws a skylight's baked cubemap as the background wherever
+    // no geometry was rendered, so the capture can be eyeballed directly. The
+    // bake is taken from the skylight's position, not the camera's, so the
+    // parallax is wrong -- it's an inspection aid, not a real skybox.
+    // Meaningless on other light types.
+    show_env_as_skybox: bool,
     // A one-shot trigger, checked and cleared by the game's tick: when true,
     // a skylight's baked cubemap (if any) is freed from
     // `Renderer::env_cubemaps` -- unlike `use_env_cubemap` this actually
@@ -580,6 +586,7 @@ crate::editor_properties!(Light {
     casts_shadow: bool("Casts Shadow"),
     bake_cubemap_requested: bool("Bake Environment Cubemap"),
     use_env_cubemap: bool("Use Environment Cubemap"),
+    show_env_as_skybox: bool("Show Cubemap as Skybox"),
     clear_cubemap_requested: bool("Clear Environment Cubemap"),
 });
 
@@ -610,6 +617,7 @@ impl Light {
             casts_shadow: true,
             bake_cubemap_requested: false,
             use_env_cubemap: true,
+            show_env_as_skybox: false,
             clear_cubemap_requested: false,
         }
     }
@@ -715,6 +723,12 @@ impl Light {
     /// in place of the analytic gradient.
     pub fn use_env_cubemap(&self) -> bool {
         self.use_env_cubemap
+    }
+
+    /// Whether a skylight's baked cubemap should also be drawn as the
+    /// background where no geometry was rendered (a debug view).
+    pub fn show_env_as_skybox(&self) -> bool {
+        self.show_env_as_skybox
     }
 
     /// Reads and clears the one-shot clear trigger; the caller should drop

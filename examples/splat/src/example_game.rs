@@ -5741,6 +5741,11 @@ impl GameEngine for SplatGame {
                     self.gizmo.mode = *mode;
                 }
             }
+            if ctx.input(|input| {
+                input.key_pressed(egui::Key::S) && (input.modifiers.ctrl || input.modifiers.command)
+            }) {
+                do_save_scene = true;
+            }
         }
 
         // In-world editor icons for lights (clicking one selects it).  Kept for
@@ -6445,7 +6450,7 @@ impl GameEngine for SplatGame {
                 // filesystem).  Reject anything else rather than panic in the
                 // glb parser.
                 #[cfg(target_arch = "wasm32")]
-                let handle = if bytes.starts_with(b"glTF") {
+                let shandle = if bytes.starts_with(b"glTF") {
                     // Persist to IndexedDB in the background (bytes already in
                     // hand), and upload from those bytes for this session.
                     let (p, b) = (path.clone(), bytes.clone());
@@ -6457,7 +6462,7 @@ impl GameEngine for SplatGame {
                     None
                 };
 
-                self.status = Some(match handle {
+                self.status = Some(match shandle {
                     // The model is registered in the renderer's AssetManager by
                     // the load above; add its catalog entry so it lists too.
                     Some(_) => {

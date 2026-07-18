@@ -37,14 +37,14 @@
   </default>
 
   <asset>
-    <material class="panda" name="white" rgba="1 1 1 1"/>
-    <material class="panda" name="off_white" rgba="0.901961 0.921569 0.929412 1"/>
-    <material class="panda" name="black" rgba="0.25 0.25 0.25 1"/>
-    <material class="panda" name="green" rgba="0 1 0 1"/>
-    <material class="panda" name="light_blue" rgba="0.039216 0.541176 0.780392 1"/>
-    <material class="panda" name="tool_hang_stand" rgba="0.6 0.3 0.1 1" specular="0.3" shininess="0.4"/>
-    <material class="panda" name="tool_hang_frame" rgba="0.55 0.1 0.08 1" specular="0.3" shininess="0.4"/>
-    <material class="panda" name="tool_hang_tool" rgba="0.1 0.15 0.55 1" specular="0.6" shininess="0.7"/>
+    <material class="panda" name="white" rgba="1 1 1 1" reflectance="0.02" shininess="0.1"/>
+    <material class="panda" name="off_white" rgba="0.901961 0.921569 0.929412 1" reflectance="0.02" shininess="0.1"/>
+    <material class="panda" name="black" rgba="0.25 0.25 0.25 1" reflectance="0.02" shininess="0.05"/>
+    <material class="panda" name="green" rgba="0 1 0 1" reflectance="0.02" shininess="0.1"/>
+    <material class="panda" name="light_blue" rgba="0.039216 0.541176 0.780392 1" reflectance="0.02" shininess="0.1"/>
+    <material class="panda" name="tool_hang_stand" rgba="0.6 0.3 0.1 1" specular="0.3" reflectance="0.02" shininess="0.15"/>
+    <material class="panda" name="tool_hang_frame" rgba="0.55 0.1 0.08 1" specular="0.3" reflectance="0.02" shininess="0.15"/>
+    <material class="panda" name="tool_hang_tool" rgba="0.1 0.15 0.55 1" specular="0.6" reflectance="0.05" shininess="0.3"/>
 
     <!-- Visual meshes -->
     <mesh file="assets/link0_0.obj"/>

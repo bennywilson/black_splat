@@ -1069,6 +1069,17 @@ impl<'a> Renderer<'a> {
         });
         let mapped = slice.get_mapped_range();
 
+        // Absolute path, created if missing, and logged -- relative paths land
+        // in whatever directory the editor happened to be launched from.
+        let out_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("skylight_bake_dump");
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            log!("bake dump: could not create {}: {e}", out_dir.display());
+            return;
+        }
+        log!("bake dump: writing 6 faces to {}", out_dir.display());
+
         const FACE_NAMES: [&str; 6] = ["px", "nx", "py", "ny", "pz", "nz"];
         for face in 0..6usize {
             let start = (face_bytes * face as u64) as usize;
@@ -1085,7 +1096,22 @@ impl<'a> Renderer<'a> {
                 }
                 rgba[px * 4 + 3] = 255;
             }
-            let path = format!("skylight_bake_light{}_{}.png", light_id, FACE_NAMES[face]);
+            // Report the min/max linear luminance so an all-black capture is
+            // obvious from the log without opening the PNGs.
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for px in 0..(face_size * face_size) as usize {
+                for c in 0..3usize {
+                    let v = f16_to_f32(halfs[px * 4 + c]);
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
+
+            let path = out_dir.join(format!(
+                "skylight_bake_light{}_{}.png",
+                light_id, FACE_NAMES[face]
+            ));
             match image::save_buffer(
                 &path,
                 &rgba,
@@ -1093,8 +1119,15 @@ impl<'a> Renderer<'a> {
                 face_size,
                 image::ColorType::Rgba8,
             ) {
-                Ok(()) => log::info!("Saved skylight bake face to {path}"),
-                Err(e) => log::warn!("Failed to save skylight bake face {path}: {e}"),
+                Ok(()) => {
+                    log!(
+                        "bake dump: wrote {} (linear range {lo:.4} .. {hi:.4})",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    log!("bake dump: FAILED to write {}: {e}", path.display());
+                }
             }
         }
         drop(mapped);

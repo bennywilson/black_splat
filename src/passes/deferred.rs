@@ -2253,7 +2253,19 @@ impl LightingPass {
                 // sample instead of the top/bottom gradient (unused by other
                 // light types).
                 color2: [color2.x, color2.y, color2.z, if has_env_cubemap { 1.0 } else { 0.0 }],
-                camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
+                // w: 1.0 if this skylight should also draw its cubemap as the
+                // background where no geometry was rendered -- a debug view of
+                // the bake (unused by other light types).
+                camera_pos: [
+                    camera_pos.x,
+                    camera_pos.y,
+                    camera_pos.z,
+                    if has_env_cubemap && light.show_env_as_skybox() {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                ],
                 target_dims: [rw as f32, rh as f32, 0.0, 0.0],
                 ..Default::default()
             };
