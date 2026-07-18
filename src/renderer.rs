@@ -85,6 +85,10 @@ pub struct Renderer<'a> {
     // Scene lights mirrored from the game/editor (see add_or_update_light),
     // consumed by the deferred lighting pass each frame.
     light_map: HashMap<u32, Light>,
+    // Baked environment cubemaps, keyed by skylight id (see
+    // bake_skylight_cubemap): sampled by the deferred lighting pass in place
+    // of a skylight's top/bottom gradient once present.
+    env_cubemaps: HashMap<u32, CubeTexture>,
 
     particle_map: HashMap<ParticleHandle, ParticleActor>,
     next_particle_id: ParticleHandle,
@@ -219,6 +223,7 @@ impl<'a> Renderer<'a> {
             asset_manager,
             actor_map: HashMap::<u32, Actor>::new(),
             light_map: HashMap::<u32, Light>::new(),
+            env_cubemaps: HashMap::new(),
             particle_map: HashMap::<ParticleHandle, ParticleActor>::new(),
             next_particle_id: INVALID_PARTICLE_HANDLE,
             active_particles: 0,
@@ -640,6 +645,7 @@ impl<'a> Renderer<'a> {
                     &self.light_map,
                     &self.actor_map,
                     self.shadow_pass.as_mut().unwrap(),
+                    &self.env_cubemaps,
                 );
             }
         } else {
@@ -865,6 +871,123 @@ impl<'a> Renderer<'a> {
     /// Removes every light (editor "New Scene" / scene load).
     pub fn clear_lights(&mut self) {
         self.light_map.clear();
+    }
+
+    /// Bakes an HDR environment cubemap for the skylight `light_id`, capturing
+    /// the full composited scene (World-layer actors + the active Gaussian
+    /// splat model, lit by every other light) from that skylight's current
+    /// position -- 6 faces, one 90-degree-FOV render each. Actors flagged
+    /// `exclude_from_env_capture` and shadow-catcher proxies are skipped, so a
+    /// MuJoCo robot or other inserted prop doesn't get baked into the
+    /// lighting it's about to be lit by. A no-op if `light_id` isn't a
+    /// Skylight in `light_map`, or the GL backend (no deferred passes).
+    ///
+    /// This is a one-shot, editor-triggered bake (see
+    /// `Light::take_cubemap_bake_request`), not a per-frame probe: it
+    /// temporarily resizes every render target (and reconfigures the window
+    /// surface) to the capture resolution and back, which would be far too
+    /// costly to repeat every frame with Gaussian splats in the scene.
+    pub fn bake_skylight_cubemap(&mut self, light_id: u32, game_config: &Config) {
+        const FACE_SIZE: u32 = 128;
+
+        let (Some(light), true) = (
+            self.light_map.get(&light_id).cloned(),
+            self.deferred_world_enabled,
+        ) else {
+            return;
+        };
+        if light.get_light_type() != LightType::Skylight {
+            return;
+        }
+        let (Some(_), Some(_)) = (self.gbuffer_pass.as_ref(), self.lighting_pass.as_ref()) else {
+            return;
+        };
+
+        let filtered_actors: HashMap<u32, Actor> = self
+            .actor_map
+            .iter()
+            .filter(|(_, actor)| {
+                !actor.is_shadow_catcher() && !actor.is_excluded_from_env_capture()
+            })
+            .map(|(id, actor)| (*id, actor.clone()))
+            .collect();
+
+        let saved_camera = self.game_camera.clone();
+
+        let mut capture_config = game_config.clone();
+        capture_config.window_width = FACE_SIZE;
+        capture_config.window_height = FACE_SIZE;
+        capture_config.render_scale = 1.0;
+        capture_config.fov = 90.0;
+        self.resize(&capture_config);
+
+        let cube_texture = CubeTexture::new(&self.device_resources.device, SCENE_COLOR_FORMAT, FACE_SIZE);
+        let position = light.get_position();
+
+        for (face, (dir, up)) in Texture::CUBE_FACE_DIRECTIONS.iter().enumerate() {
+            self.game_camera = Camera::from_look(
+                position,
+                CgVec3::new(dir[0], dir[1], dir[2]),
+                CgVec3::new(up[0], up[1], up[2]),
+            );
+
+            let mut ctx = RenderContext {
+                device: &mut self.device_resources,
+                assets: &mut self.asset_manager,
+                camera: &self.game_camera,
+                config: &capture_config,
+            };
+            self.gbuffer_pass
+                .as_mut()
+                .unwrap()
+                .render(&mut ctx, &filtered_actors);
+            self.lighting_pass.as_mut().unwrap().render(
+                &mut ctx,
+                &self.light_map,
+                &filtered_actors,
+                self.shadow_pass.as_mut().unwrap(),
+                &self.env_cubemaps,
+            );
+            if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+                if splat_pass.has_model() {
+                    splat_pass.render(&mut ctx);
+                    if let Some(composite_pass) = &mut self.splat_composite_pass {
+                        composite_pass.render(&mut ctx);
+                    }
+                }
+            }
+
+            let mut encoder = self.device_resources.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor {
+                    label: Some("bake_skylight_cubemap face copy"),
+                },
+            );
+            encoder.copy_texture_to_texture(
+                self.device_resources.render_textures[0].texture.as_image_copy(),
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cube_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: face as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: FACE_SIZE,
+                    height: FACE_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.device_resources
+                .queue
+                .submit(std::iter::once(encoder.finish()));
+        }
+
+        self.env_cubemaps.insert(light_id, cube_texture);
+        self.game_camera = saved_camera;
+        self.resize(game_config);
     }
 
     /// Routes World-layer actors through the deferred G-buffer + lighting

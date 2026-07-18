@@ -835,6 +835,51 @@ impl MujocoScene {
             wasm_bridge::set_qpos(&adrs, &values);
         }
     }
+
+    /// Draws a small debug wire box for each of a retargeted clip's
+    /// [`unmatched`](crate::trajectory::RetargetedClip::unmatched) object
+    /// tracks at `frame_idx` -- a free-joint pose the source clip recorded
+    /// (typically a manipulated object) that has no matching body in this
+    /// model yet, so there's no real geom to draw. Placeholder until the
+    /// target MJCF grows a body/freejoint with the same name, at which point
+    /// `retarget` picks it up as a normal joint and this stops drawing it.
+    ///
+    /// Call once per bound clip, alongside [`tick_and_draw_at`](Self::tick_and_draw_at)
+    /// -- same `origin`/`rotation` convention. Draws unconditionally on
+    /// wireframe mode; out-of-range `frame_idx` is a no-op.
+    pub fn draw_unmatched_objects(
+        &self,
+        renderer: &mut Renderer,
+        game_config: &Config,
+        clip: &crate::trajectory::RetargetedClip,
+        frame_idx: usize,
+        origin: CgVec3,
+        rotation: CgQuat,
+    ) {
+        if !self.wireframe {
+            return;
+        }
+        let Some(frame) = clip.unmatched_frames.get(frame_idx) else {
+            return;
+        };
+        const HALF_EXTENT: f32 = 0.05;
+        let half = CgVec3::new(HALF_EXTENT, HALF_EXTENT, HALF_EXTENT);
+        let color = CgVec4::new(1.0, 0.85, 0.0, 1.0);
+        let mut offset = 0;
+        for jt in &clip.unmatched {
+            let vals = &frame[offset..offset + jt.dofs];
+            offset += jt.dofs;
+            let pos = [vals[0] as f32, vals[1] as f32, vals[2] as f32];
+            // MuJoCo free-joint qpos is [x, y, z, qw, qx, qy, qz].
+            let q = CgQuat::new(vals[3] as f32, vals[4] as f32, vals[5] as f32, vals[6] as f32);
+            let m = cgmath::Matrix3::from(q);
+            let center = origin + rotation * mj_vec3(pos);
+            let ex = rotation * mj_vec3(m.x.into());
+            let ey = rotation * mj_vec3(m.y.into());
+            let ez = rotation * mj_vec3(m.z.into());
+            draw_wire_box(renderer, game_config, center, ex, ey, ez, half, color);
+        }
+    }
 }
 
 /// One mesh-type geom's world placement for this frame, plus which .obj to

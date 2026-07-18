@@ -73,7 +73,8 @@ impl TrajectoryClip {
     pub fn retarget(&self, target_joints: &[JointTrack]) -> RetargetedClip {
         let offsets = self.joint_offsets();
         let mut joints = Vec::new();
-        let mut ranges = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut matched = vec![false; self.joints.len()];
         for tj in target_joints {
             let Some(i) = self.joints.iter().position(|sj| sj.name == tj.name) else {
                 continue;
@@ -81,20 +82,40 @@ impl TrajectoryClip {
             if self.joints[i].dofs != tj.dofs {
                 continue;
             }
+            matched[i] = true;
             ranges.push(offsets[i]);
             joints.push(tj.clone());
         }
-        let frames = self
-            .frames
-            .iter()
-            .map(|f| {
-                ranges
-                    .iter()
-                    .flat_map(|&(start, dofs)| f[start..start + dofs].iter().copied())
-                    .collect()
-            })
-            .collect();
-        RetargetedClip { dt: self.dt, joints, frames }
+
+        // Free-joint (7-dof) source tracks with no matching joint in the
+        // target model -- typically a manipulated object whose body hasn't
+        // been added to the target MJCF yet. Kept alongside the matched set
+        // (not written into qpos, since there's no joint to write) so
+        // playback can still visualize their recorded motion as a
+        // placeholder -- see `MujocoScene::draw_unmatched_objects`.
+        let mut unmatched = Vec::new();
+        let mut unmatched_ranges: Vec<(usize, usize)> = Vec::new();
+        for (i, sj) in self.joints.iter().enumerate() {
+            if sj.dofs == 7 && !matched[i] {
+                unmatched.push(sj.clone());
+                unmatched_ranges.push(offsets[i]);
+            }
+        }
+
+        let pack = |ranges: &[(usize, usize)]| -> Vec<Vec<f64>> {
+            self.frames
+                .iter()
+                .map(|f| {
+                    ranges
+                        .iter()
+                        .flat_map(|&(start, dofs)| f[start..start + dofs].iter().copied())
+                        .collect()
+                })
+                .collect()
+        };
+        let frames = pack(&ranges);
+        let unmatched_frames = pack(&unmatched_ranges);
+        RetargetedClip { dt: self.dt, joints, frames, unmatched, unmatched_frames }
     }
 }
 
@@ -107,6 +128,15 @@ pub struct RetargetedClip {
     pub dt: f32,
     pub joints: Vec<JointTrack>,
     pub frames: Vec<Vec<f64>>,
+    /// Free-joint source tracks that had no matching joint in the target
+    /// model at retarget time (e.g. a manipulated object not yet modeled in
+    /// the target MJCF) -- one frame per entry in `frames`, packed the same
+    /// way. `#[serde(default)]` so a disk cache written before this field
+    /// existed still deserializes (as empty) instead of forcing a recompute.
+    #[serde(default)]
+    pub unmatched: Vec<JointTrack>,
+    #[serde(default)]
+    pub unmatched_frames: Vec<Vec<f64>>,
 }
 
 impl RetargetedClip {
@@ -221,5 +251,13 @@ mod tests {
             vec!["c", "b"]
         );
         assert_eq!(retargeted.frames[0], vec![3.0, 2.0]);
+        // free_base is 7-dof in the source but the target's version is a
+        // mismatched 4-dof, so it's dropped from the matched set above --
+        // it should surface as unmatched instead of vanishing entirely.
+        assert_eq!(
+            retargeted.unmatched.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(),
+            vec!["free_base"]
+        );
+        assert_eq!(retargeted.unmatched_frames[0], vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
     }
 }

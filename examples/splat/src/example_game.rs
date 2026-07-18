@@ -2920,7 +2920,11 @@ impl SplatGame {
         for actor in &mut self.scene_mujoco_actors {
             // Drive the pose from the clip before drawing, so the wireframe and
             // mesh geoms below both read the frame we just wrote. The sim won't
-            // step out from under it -- a bound clip sets `kinematic`.
+            // step out from under it -- a bound clip sets `kinematic`. Also
+            // remembers the frame index so the unmatched-object placeholder
+            // draw below (a separate call, since it doesn't touch the sim)
+            // can read the same frame.
+            let mut clip_frame_idx = None;
             if let (Some(scene), Some(clip)) = (&mut actor.scene, &actor.clip) {
                 let total = clip.frame_count() as f32 * clip.dt;
                 if total > 0.0 {
@@ -2933,12 +2937,25 @@ impl SplatGame {
                         actor.clip_time.clamp(0.0, total - clip.dt)
                     };
                     let frame = (actor.clip_time / clip.dt) as usize;
-                    scene.apply_trajectory_frame(clip, frame.min(clip.frame_count() - 1));
+                    let frame = frame.min(clip.frame_count() - 1);
+                    scene.apply_trajectory_frame(clip, frame);
+                    clip_frame_idx = Some(frame);
                 }
             }
 
             if let Some(scene) = &mut actor.scene {
                 scene.tick_and_draw_at(renderer, game_config, actor.position, actor.rotation);
+
+                if let (Some(clip), Some(frame)) = (&actor.clip, clip_frame_idx) {
+                    scene.draw_unmatched_objects(
+                        renderer,
+                        game_config,
+                        clip,
+                        frame,
+                        actor.position,
+                        actor.rotation,
+                    );
+                }
 
                 let mesh_geoms = scene.mesh_geoms(actor.position, actor.rotation);
 
@@ -2988,6 +3005,7 @@ impl SplatGame {
                         let mut mesh_actor = Actor::new();
                         mesh_actor.set_model(&handle);
                         mesh_actor.set_layer(&SceneLayer::World, &None);
+                        mesh_actor.set_exclude_from_env_capture(true);
                         actor.mesh_geom_actors.push(mesh_actor);
                     }
                 }
@@ -6474,6 +6492,16 @@ impl GameEngine for SplatGame {
 
         // Reconcile + step + draw every MuJoCo actor.
         self.tick_mujoco_actors(renderer, game_config);
+
+        // A skylight's "Bake Environment Cubemap" checkbox is a one-shot
+        // trigger (see Light::take_cubemap_bake_request): fire the bake and
+        // let the checkbox pop back up.
+        for light in &mut self.scene_lights {
+            if light.take_cubemap_bake_request() {
+                renderer.bake_skylight_cubemap(light.id, game_config);
+                renderer.add_or_update_light(light);
+            }
+        }
 
         // Upload lazily-fetched model bytes that arrived this frame (web): browser
         // selects and scene actors whose model was still loading pop in here.

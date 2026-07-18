@@ -1772,6 +1772,16 @@ pub struct LightingPass {
     // One pre-built uniform buffer + bind group per light slot, so every
     // light's constants can be written before the frame's single submit.
     light_uniforms: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    // The skylight pipeline alone binds an extra texture_cube + sampler (its
+    // baked environment map, see Renderer::bake_skylight_cubemap), so it gets
+    // its own bind-group-1 layout instead of sharing `light_uniforms`'
+    // uniform-only layout. Built fresh each frame a skylight renders (rare
+    // enough not to warrant a pre-built pool like `light_uniforms`).
+    skylight_env_bind_group_layout: wgpu::BindGroupLayout,
+    // A 1x1 black cube texture bound in place of a light's real environment
+    // map before it has one baked -- keeps the bind group valid without a
+    // branch in the pipeline/layout.
+    fallback_cube: CubeTexture,
 }
 
 impl LightingPass {
@@ -1889,6 +1899,51 @@ impl LightingPass {
             immediate_size: 0,
         });
 
+        // The skylight's bind-group-1 layout: the same uniform buffer plus a
+        // texture_cube + sampler for its baked environment map.
+        let skylight_env_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::Cube,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("LightingPass_skylight_env_bind_group_layout"),
+            });
+        let skylight_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("LightingPass_skylight_pipeline_layout"),
+                bind_group_layouts: &[
+                    Some(&gbuffer_bind_group_layout),
+                    Some(&skylight_env_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+        let fallback_cube = CubeTexture::new(device, SCENE_COLOR_FORMAT, 1);
+
         // Lights accumulate: add rgb onto whatever earlier lights wrote, force
         // alpha to 1 wherever geometry is lit (background keeps the clear alpha).
         let additive = wgpu::BlendState {
@@ -1917,11 +1972,14 @@ impl LightingPass {
             shader_handles.push(asset_manager.load_shader(path, device_resources).await);
         }
 
-        let make_pipeline = |handle: &ShaderHandle, label: &str| -> wgpu::RenderPipeline {
+        let make_pipeline = |handle: &ShaderHandle,
+                              label: &str,
+                              layout: &wgpu::PipelineLayout|
+         -> wgpu::RenderPipeline {
             let shader = asset_manager.get_shader(handle);
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pipeline_layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: shader,
                     entry_point: Some("vs_main"),
@@ -1958,10 +2016,17 @@ impl LightingPass {
             })
         };
 
-        let skylight_pipeline = make_pipeline(&shader_handles[0], "LightingPass_skylight");
-        let directional_pipeline = make_pipeline(&shader_handles[1], "LightingPass_directional");
-        let point_pipeline = make_pipeline(&shader_handles[2], "LightingPass_point");
-        let spot_pipeline = make_pipeline(&shader_handles[3], "LightingPass_spot");
+        let skylight_pipeline = make_pipeline(
+            &shader_handles[0],
+            "LightingPass_skylight",
+            &skylight_pipeline_layout,
+        );
+        let directional_pipeline =
+            make_pipeline(&shader_handles[1], "LightingPass_directional", &pipeline_layout);
+        let point_pipeline =
+            make_pipeline(&shader_handles[2], "LightingPass_point", &pipeline_layout);
+        let spot_pipeline =
+            make_pipeline(&shader_handles[3], "LightingPass_spot", &pipeline_layout);
 
         LightingPass {
             skylight_pipeline,
@@ -1971,6 +2036,8 @@ impl LightingPass {
             gbuffer_bind_group_layout,
             gbuffer_bind_group,
             light_uniforms,
+            skylight_env_bind_group_layout,
+            fallback_cube,
         }
     }
 
@@ -2038,6 +2105,7 @@ impl LightingPass {
         lights: &HashMap<u32, Light>,
         actors: &HashMap<u32, Actor>,
         shadow_pass: &mut ShadowPass,
+        env_cubemaps: &HashMap<u32, CubeTexture>,
     ) {
         shadow_pass.begin_frame(ctx);
 
@@ -2162,12 +2230,16 @@ impl LightingPass {
             // The cone fades in over the outer 20% of the angle.
             let inner_rad = outer_rad * 0.8;
 
+            let has_env_cubemap = env_cubemaps.contains_key(&light.id);
             let mut uniform = LightUniform {
                 inv_view_proj,
                 position_range: [position.x, position.y, position.z, light.get_range()],
                 direction_cone: [direction.x, direction.y, direction.z, outer_rad.cos()],
                 color_cone: [color.x, color.y, color.z, inner_rad.cos()],
-                color2: [color2.x, color2.y, color2.z, 0.0],
+                // w: 1.0 if this skylight has a baked environment cubemap to
+                // sample instead of the top/bottom gradient (unused by other
+                // light types).
+                color2: [color2.x, color2.y, color2.z, if has_env_cubemap { 1.0 } else { 0.0 }],
                 camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
                 target_dims: [rw as f32, rh as f32, 0.0, 0.0],
                 ..Default::default()
@@ -2221,6 +2293,35 @@ impl LightingPass {
                 LightType::Point => &self.point_pipeline,
                 LightType::Spot => &self.spot_pipeline,
             };
+            // Skylights bind an extra texture_cube/sampler pair, so they get a
+            // one-off bind group each frame instead of the pre-built
+            // `light_uniforms` pool (see `skylight_env_bind_group_layout`).
+            let skylight_bind_group = (light_type == LightType::Skylight).then(|| {
+                let env = env_cubemaps.get(&light.id).unwrap_or(&self.fallback_cube);
+                let buffer = ctx.device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("LightingPass_skylight_uniform"),
+                    contents: bytemuck::cast_slice(&[uniform]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                ctx.device.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &self.skylight_env_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&env.cube_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&env.sampler),
+                        },
+                    ],
+                    label: Some("LightingPass_skylight_bind_group"),
+                })
+            });
             let mut encoder =
                 ctx.device
                     .device
@@ -2245,7 +2346,11 @@ impl LightingPass {
             });
             render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.gbuffer_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.light_uniforms[slot].1, &[]);
+            render_pass.set_bind_group(
+                1,
+                skylight_bind_group.as_ref().unwrap_or(&self.light_uniforms[slot].1),
+                &[],
+            );
             render_pass.draw(0..3, 0..1);
             drop(render_pass);
             ctx.device.queue.submit(std::iter::once(encoder.finish()));

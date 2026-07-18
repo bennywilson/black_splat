@@ -42,6 +42,9 @@
     <material class="panda" name="black" rgba="0.25 0.25 0.25 1"/>
     <material class="panda" name="green" rgba="0 1 0 1"/>
     <material class="panda" name="light_blue" rgba="0.039216 0.541176 0.780392 1"/>
+    <material class="panda" name="tool_hang_stand" rgba="0.6 0.3 0.1 1" specular="0.3" shininess="0.4"/>
+    <material class="panda" name="tool_hang_frame" rgba="0.55 0.1 0.08 1" specular="0.3" shininess="0.4"/>
+    <material class="panda" name="tool_hang_tool" rgba="0.1 0.15 0.55 1" specular="0.6" shininess="0.7"/>
 
     <!-- Visual meshes -->
     <mesh file="assets/link0_0.obj"/>
@@ -100,6 +103,14 @@
     <mesh file="assets/hand_4.obj"/>
     <mesh file="assets/finger_0.obj"/>
     <mesh file="assets/finger_1.obj"/>
+
+    <!-- ToolHang manipulated objects, extracted verbatim (exact geometry,
+    not an approximation) from the robosuite demo's embedded MJCF: see
+    tools/robomimic_to_trajectory.py's module docs for where these tracks
+    come from. -->
+    <mesh file="assets/tool_hang_stand.obj"/>
+    <mesh file="assets/tool_hang_frame.obj"/>
+    <mesh file="assets/tool_hang_tool.obj"/>
   </asset>
 
   <worldbody>
@@ -211,6 +222,21 @@
           </body>
         </body>
       </body>
+    </body>
+
+    <!-- ToolHang manipulated objects: see the <asset> block above for
+    where these meshes come from. -->
+    <body name="stand_root">
+      <freejoint name="stand_joint0"/>
+      <geom type="mesh" mesh="tool_hang_stand" material="tool_hang_stand"/>
+    </body>
+    <body name="frame_root">
+      <freejoint name="frame_joint0"/>
+      <geom type="mesh" mesh="tool_hang_frame" material="tool_hang_frame"/>
+    </body>
+    <body name="tool_root">
+      <freejoint name="tool_joint0"/>
+      <geom type="mesh" mesh="tool_hang_tool" material="tool_hang_tool"/>
     </body>
   </worldbody>
 
