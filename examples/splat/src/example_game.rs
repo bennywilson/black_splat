@@ -664,8 +664,9 @@ enum AddKind {
 #[derive(Clone)]
 struct SceneSplat {
     name: String,
-    // Where the .ply came from (stored in saved scenes so they can reload it).
-    // Empty when there is no re-readable source (browser file picks).
+    // Where the .ply came from (stored in saved scenes so they can reload
+    // it): a real filesystem path on native, an IndexedDB cache key on web.
+    // Empty only for scenes saved before this was tracked.
     path: String,
     params: SplatParams,
     transform: ActorTransform,
@@ -1684,14 +1685,23 @@ impl SplatGame {
         let pick = async move {
             if let Some(file) = dialog.pick_file().await {
                 let name = file.file_name();
+                *picker_state.lock().unwrap() = PickerState::Reading(name.clone());
+                let bytes = file.read().await;
                 // Remember where the file lives when the platform can tell us
-                // (native), so saved scenes can reload the cloud by path.
+                // (native), so saved scenes can reload the cloud by path. The
+                // web build has no filesystem path, so cache the bytes into
+                // IndexedDB under a synthetic key instead -- `load_binary`
+                // checks there first, so saved scenes can reload it the same
+                // way MuJoCo trajectory picks do (see
+                // `open_mujoco_trajectory_picker`).
                 #[cfg(not(target_arch = "wasm32"))]
                 let path = Some(file.path().to_string_lossy().to_string());
                 #[cfg(target_arch = "wasm32")]
-                let path = None;
-                *picker_state.lock().unwrap() = PickerState::Reading(name.clone());
-                let bytes = file.read().await;
+                let path = {
+                    let key = format!("splats/{name}");
+                    black_splat::idb::put(&key, &bytes).await;
+                    Some(key)
+                };
                 *picked.lock().unwrap() = Some((name, path, bytes));
             }
             *picker_state.lock().unwrap() = PickerState::Idle;
@@ -3006,6 +3016,20 @@ impl SplatGame {
                         mesh_actor.set_model(&handle);
                         mesh_actor.set_layer(&SceneLayer::World, &None);
                         mesh_actor.set_exclude_from_env_capture(true);
+                        // Named by its (metallic, roughness) pair so geoms
+                        // sharing a MJCF <material> share one Material too --
+                        // create_material returns the existing handle for a
+                        // name it's already seen.
+                        let material_name =
+                            format!("mj_mr_{:.3}_{:.3}", geom.metallic, geom.roughness);
+                        let material = renderer.create_material(
+                            &material_name,
+                            &MaterialDesc {
+                                mr_constant: CgVec4::new(geom.metallic, geom.roughness, 0.0, 0.0),
+                                ..Default::default()
+                            },
+                        );
+                        mesh_actor.set_material(&material);
                         actor.mesh_geom_actors.push(mesh_actor);
                     }
                 }
@@ -3607,7 +3631,7 @@ impl SplatGame {
         let mut skipped_splats = 0;
         for dto in &scene.splats {
             if dto.path.is_empty() {
-                // A cloud picked through a browser dialog: no re-readable path.
+                // Saved before splat paths were tracked: no re-readable source.
                 skipped_splats += 1;
                 continue;
             }
@@ -6501,6 +6525,12 @@ impl GameEngine for SplatGame {
                 renderer.bake_skylight_cubemap(light.id, game_config);
                 renderer.add_or_update_light(light);
             }
+            // Same one-shot pattern for "Clear Environment Cubemap": drop the
+            // baked GPU texture and fall back to the analytic gradient.
+            if light.take_cubemap_clear_request() {
+                renderer.clear_skylight_cubemap(light.id);
+                renderer.add_or_update_light(light);
+            }
         }
 
         // Upload lazily-fetched model bytes that arrived this frame (web): browser
@@ -6612,8 +6642,9 @@ impl GameEngine for SplatGame {
                 Ok(info) => {
                     self.scene_splats.push(SceneSplat {
                         name: name.clone(),
-                        // Native picks give a re-readable path (stored in saved
-                        // scenes); browser picks don't.
+                        // Native: the file's real path. Web: an IndexedDB
+                        // cache key (see `open_ply_picker`). Either way,
+                        // re-readable by `load_binary` when the scene reloads.
                         path: path.unwrap_or_default(),
                         params: default_splat_params(),
                         transform: ActorTransform::from_position(CG_VEC3_ZERO),

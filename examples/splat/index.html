@@ -90,6 +90,8 @@
 			const geomMatId = new Int32Array(model.geom_matid);
 			const geomRgba = new Float32Array(model.geom_rgba);
 			const matRgba = new Float32Array(model.mat_rgba);
+			const matReflectance = new Float32Array(model.mat_reflectance);
+			const matShininess = new Float32Array(model.mat_shininess);
 			const meshPos = new Float32Array(model.mesh_pos);
 			const meshQuat = new Float32Array(model.mesh_quat);
 
@@ -102,15 +104,19 @@
 				const name = mesh.name;
 				mesh.delete();
 
-				// A geom with a material takes the material's rgba; geom_rgba
-				// stays at its unset default in that case (MuJoCo never copies
-				// one into the other), so reading it would paint everything
-				// the same default grey.
+				// A geom with a material takes the material's rgba (and its
+				// reflectance/shininess); geom_rgba stays at its unset default
+				// in that case (MuJoCo never copies one into the other), so
+				// reading it would paint everything the same default grey.
+				// With no material, fall back to the same values the engine's
+				// own no-material default uses (see assets::MaterialDesc).
 				const matId = geomMatId[i];
 				const rgba =
 					matId >= 0
 						? matRgba.subarray(matId * 4, matId * 4 + 4)
 						: geomRgba.subarray(i * 4, i * 4 + 4);
+				const metallic = matId >= 0 ? matReflectance[matId] : 0.0;
+				const roughness = matId >= 0 ? 1.0 - matShininess[matId] : 0.85;
 
 				bsApp.mj_bridge_set_mesh_geom(
 					i,
@@ -118,6 +124,8 @@
 					rgba,
 					meshPos.subarray(meshId * 3, meshId * 3 + 3),
 					meshQuat.subarray(meshId * 4, meshId * 4 + 4),
+					metallic,
+					roughness,
 				);
 			}
 		}

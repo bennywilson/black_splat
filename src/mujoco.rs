@@ -648,10 +648,15 @@ impl MujocoScene {
             // geoms colored directly via their own `rgba` attribute, with no
             // material reference (matid < 0).
             let mat_id = model.geom_matid()[i];
-            let rgba = if mat_id >= 0 {
-                model.mat_rgba()[mat_id as usize]
+            let (rgba, metallic, roughness) = if mat_id >= 0 {
+                let m = mat_id as usize;
+                (
+                    model.mat_rgba()[m],
+                    model.mat_reflectance()[m],
+                    1.0 - model.mat_shininess()[m],
+                )
             } else {
-                model.geom_rgba()[i]
+                (model.geom_rgba()[i], 0.0, 0.85)
             };
             let xpos = self.mj_data.geom_xpos()[i];
             let xmat = self.mj_data.geom_xmat()[i];
@@ -664,6 +669,8 @@ impl MujocoScene {
                 rgba,
                 position: origin + rotation * mj_vec3(xpos_eff),
                 rotation: quat_from_basis(ex, ey, ez),
+                metallic,
+                roughness,
             });
         }
         out
@@ -705,6 +712,8 @@ impl MujocoScene {
                         rgba: info.rgba,
                         position: origin + rotation * mj_vec3(xpos_eff),
                         rotation: quat_from_basis(ex, ey, ez),
+                        metallic: info.metallic,
+                        roughness: info.roughness,
                     });
                 }
                 out
@@ -889,6 +898,12 @@ pub struct MeshGeomInstance {
     pub rgba: [f32; 4],
     pub position: CgVec3,
     pub rotation: CgQuat,
+    /// From the geom's `<material>` (0.0/0.85 -- the engine's own
+    /// no-material default, see `assets::MaterialDesc` -- when it has none):
+    /// `metallic` is `mat_reflectance`, and `roughness` is `1 - mat_shininess`
+    /// since MJCF's shininess runs the opposite way (higher = glossier).
+    pub metallic: f32,
+    pub roughness: f32,
 }
 
 /// Re-walks the MJCF (and any `<include>`d files, recursively) starting from
@@ -1204,6 +1219,10 @@ mod wasm_bridge {
         /// `undo_mesh_asset_transform_raw`.
         pub mesh_pos: [f32; 3],
         pub mesh_quat: [f32; 4],
+        /// Same `<material>` resolution as `rgba`, for `mat_reflectance` /
+        /// `mat_shininess` -- see the field docs on `MeshGeomInstance`.
+        pub metallic: f32,
+        pub roughness: f32,
     }
 
     thread_local! {
@@ -1416,12 +1435,13 @@ mod wasm_bridge {
 
     /// Reports one mesh geom's static description, once per model load.
     ///
-    /// JS has to resolve two things this side can't see. `mesh_name` needs
-    /// `geom_dataid` -> `model.mesh(id).name`, and `rgba` needs the geom's
-    /// `<material>`: a geom with one takes the material's `mat_rgba`, not its
-    /// own `geom_rgba` (which stays at its unset default whenever a material
-    /// is assigned -- MuJoCo never copies one into the other). Both live in
-    /// MuJoCo's linear memory, not ours.
+    /// JS has to resolve several things this side can't see. `mesh_name`
+    /// needs `geom_dataid` -> `model.mesh(id).name`, and `rgba`/`metallic`/
+    /// `roughness` need the geom's `<material>`: a geom with one takes the
+    /// material's `mat_rgba`/`mat_reflectance`/`mat_shininess`, not its own
+    /// `geom_rgba` (which stays at its unset default whenever a material is
+    /// assigned -- MuJoCo never copies one into the other). All of this lives
+    /// in MuJoCo's linear memory, not ours.
     ///
     /// Non-mesh geoms are simply never reported; `mesh_geoms` skips any geom
     /// with no entry here.
@@ -1432,6 +1452,8 @@ mod wasm_bridge {
         rgba: &[f32],
         mesh_pos: &[f32],
         mesh_quat: &[f32],
+        metallic: f32,
+        roughness: f32,
     ) {
         if rgba.len() != 4 || mesh_pos.len() != 3 || mesh_quat.len() != 4 {
             return; // Malformed (shouldn't happen); leave the geom unreported.
@@ -1444,6 +1466,8 @@ mod wasm_bridge {
                     rgba: std::array::from_fn(|k| rgba[k]),
                     mesh_pos: std::array::from_fn(|k| mesh_pos[k]),
                     mesh_quat: std::array::from_fn(|k| mesh_quat[k]),
+                    metallic,
+                    roughness,
                 },
             );
         });

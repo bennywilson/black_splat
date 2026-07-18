@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "camera": {
+    "position": [
+      0.83167154,
+      1.3251903,
+      0.29399443
+    ],
+    "rotation": [
+      -242.68016,
+      25.599968,
+      0.0
+    ]
+  },
+  "actors": [
+    {
+      "name": "Shadow Catcher",
+      "position": [
+        -0.02500777,
+        0.88861984,
+        -0.23048219
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        0.6205211,
+        0.5,
+        0.55
+      ],
+      "model": "quad",
+      "layer": 0,
+      "shadow_catcher": true
+    },
+    {
+      "name": "Actor 1",
+      "position": [
+        1.3869536,
+        0.9143227,
+        -0.16432488
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        0.25,
+        0.25,
+        0.25
+      ],
+      "model": "sphere",
+      "layer": 0,
+      "shadow_catcher": false
+    }
+  ],
+  "lights": [
+    {
+      "name": "Skylight",
+      "position": [
+        0.0,
+        5.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "type": 3,
+      "color": [
+        0.55,
+        0.65,
+        0.85
+      ],
+      "color2": [
+        0.28,
+        0.24,
+        0.2
+      ],
+      "intensity": 1.0,
+      "range": 10.0,
+      "spot_angle": 30.0,
+      "casts_shadow": true
+    },
+    {
+      "name": "Light 3",
+      "position": [
+        1.1576314,
+        -0.6138637,
+        -8.402263
+      ],
+      "rotation": [
+        0.44129238,
+        0.0,
+        0.0,
+        0.89736336
+      ],
+      "type": 0,
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "color2": [
+        0.25,
+        0.22,
+        0.2
+      ],
+      "intensity": 1.0,
+      "range": 10.0,
+      "spot_angle": 30.0,
+      "casts_shadow": true
+    }
+  ],
+  "particles": [],
+  "splats": [
+    {
+      "name": "office",
+      "path": "splats/office.ply",
+      "params": {
+        "falloff": 4.65,
+        "scale": 3.0,
+        "contrast": 1.0,
+        "overall_scale": 1.0,
+        "max_sh_degree": 2.0
+      },
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    }
+  ],
+  "mujoco_actors": [
+    {
+      "name": "Mujoco Actor 2",
+      "xml_path": "mujoco_scenes/franka_emika_panda/scene.xml",
+      "trajectory_path": "mujoco_trajectories/tool_hang_demo_56.json",
+      "position": [
+        -0.23630975,
+        0.88861984,
+        -0.23048219
+      ],
+      "rotation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "playing": true,
+      "speed": 1.0,
+      "looping": true,
+      "wireframe": false
+    }
+  ],
+  "post_process": {
+    "tonemap_enabled": true,
+    "exposure": 1.0,
+    "highlight_scale": 2.51,
+    "midtone_scale": 0.03,
+    "highlight_curve": 2.43,
+    "midtone_curve": 0.59,
+    "shadow_offset": 0.14
+  }
+}

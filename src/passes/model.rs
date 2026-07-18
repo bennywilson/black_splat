@@ -635,6 +635,13 @@ impl Model {
         let mut vertices = Vec::<Vertex>::new();
         let mut indices = Vec::<u16>::new();
         let mut diffuse_texture_file: Option<String> = None;
+        // Vertices whose OBJ carried no `vn` data: their normal is left at zero
+        // here and computed from the triangle geometry below. Without this an
+        // un-normalled mesh (common for CAD/robot .obj exports -- MuJoCo's
+        // Franka tool meshes, say) gets a single hardcoded up-normal on every
+        // vertex, so only up-facing surfaces catch any light and the rest reads
+        // as flat, unlit background colour.
+        let mut needs_normal = Vec::<bool>::new();
         for m in &obj_models {
             let mesh = &m.mesh;
             if diffuse_texture_file.is_none() {
@@ -666,13 +673,57 @@ impl Model {
                     normal: if has_normals {
                         [mesh.normals[i * 3], mesh.normals[i * 3 + 1], mesh.normals[i * 3 + 2]]
                     } else {
-                        [0.0, 1.0, 0.0]
+                        [0.0, 0.0, 0.0]
                     },
                     color: [1.0, 1.0, 1.0, 1.0],
                 });
+                needs_normal.push(!has_normals);
             }
             for idx in &mesh.indices {
                 indices.push((base + *idx) as u16);
+            }
+        }
+
+        // Smooth normals for any vertex the OBJ didn't supply one for:
+        // accumulate each triangle's (area-weighted, un-normalised) face normal
+        // onto its vertices, then normalise. Vertices with real `vn` data are
+        // left untouched. Runs over the assembled index buffer, so it spans
+        // whichever models were missing normals.
+        if needs_normal.iter().any(|&n| n) {
+            for tri in indices.chunks_exact(3) {
+                let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                let p0 = vertices[i0].position;
+                let p1 = vertices[i1].position;
+                let p2 = vertices[i2].position;
+                let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                let face = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                for &i in &[i0, i1, i2] {
+                    if needs_normal[i] {
+                        vertices[i].normal[0] += face[0];
+                        vertices[i].normal[1] += face[1];
+                        vertices[i].normal[2] += face[2];
+                    }
+                }
+            }
+            for (v, &missing) in vertices.iter_mut().zip(needs_normal.iter()) {
+                if !missing {
+                    continue;
+                }
+                let n = v.normal;
+                let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                // A degenerate/zero-area vertex has no direction to derive; fall
+                // back to up rather than leaving a zero normal the shader would
+                // read as unlit.
+                v.normal = if len > 1e-6 {
+                    [n[0] / len, n[1] / len, n[2] / len]
+                } else {
+                    [0.0, 1.0, 0.0]
+                };
             }
         }
 

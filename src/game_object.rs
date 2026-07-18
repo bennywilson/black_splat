@@ -553,6 +553,17 @@ pub struct Light {
     // position (see Renderer::bake_skylight_cubemap). Meaningless on other
     // light types.
     bake_cubemap_requested: bool,
+    // Soft on/off for a skylight's baked cubemap: when false, the deferred
+    // pass falls back to the analytic top/bottom gradient even if a bake is
+    // still held in memory (see Renderer::env_cubemaps). Meaningless on other
+    // light types.
+    use_env_cubemap: bool,
+    // A one-shot trigger, checked and cleared by the game's tick: when true,
+    // a skylight's baked cubemap (if any) is freed from
+    // `Renderer::env_cubemaps` -- unlike `use_env_cubemap` this actually
+    // discards the GPU texture rather than just hiding it. Meaningless on
+    // other light types.
+    clear_cubemap_requested: bool,
 }
 
 // Editor markup: the fields the Details panel shows and how each is edited.
@@ -568,6 +579,8 @@ crate::editor_properties!(Light {
     spot_angle: float("Spot Angle"),
     casts_shadow: bool("Casts Shadow"),
     bake_cubemap_requested: bool("Bake Environment Cubemap"),
+    use_env_cubemap: bool("Use Environment Cubemap"),
+    clear_cubemap_requested: bool("Clear Environment Cubemap"),
 });
 
 impl Default for Light {
@@ -596,6 +609,8 @@ impl Light {
             spot_angle: 30.0,
             casts_shadow: true,
             bake_cubemap_requested: false,
+            use_env_cubemap: true,
+            clear_cubemap_requested: false,
         }
     }
 
@@ -693,6 +708,21 @@ impl Light {
     pub fn take_cubemap_bake_request(&mut self) -> bool {
         let requested = self.bake_cubemap_requested;
         self.bake_cubemap_requested = false;
+        requested
+    }
+
+    /// Whether a skylight's baked cubemap (if any) should currently be used
+    /// in place of the analytic gradient.
+    pub fn use_env_cubemap(&self) -> bool {
+        self.use_env_cubemap
+    }
+
+    /// Reads and clears the one-shot clear trigger; the caller should drop
+    /// this light's baked cubemap from `Renderer::env_cubemaps` iff this
+    /// returns true.
+    pub fn take_cubemap_clear_request(&mut self) -> bool {
+        let requested = self.clear_cubemap_requested;
+        self.clear_cubemap_requested = false;
         requested
     }
 }

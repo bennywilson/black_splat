@@ -890,16 +890,29 @@ impl<'a> Renderer<'a> {
     pub fn bake_skylight_cubemap(&mut self, light_id: u32, game_config: &Config) {
         const FACE_SIZE: u32 = 128;
 
+        log!("bake_skylight_cubemap: starting for light {light_id}");
+
         let (Some(light), true) = (
             self.light_map.get(&light_id).cloned(),
             self.deferred_world_enabled,
         ) else {
+            log!(
+                "bake_skylight_cubemap: ABORT -- light {} in light_map: {}, deferred_world_enabled: {}",
+                light_id,
+                self.light_map.contains_key(&light_id),
+                self.deferred_world_enabled
+            );
             return;
         };
         if light.get_light_type() != LightType::Skylight {
+            log!(
+                "bake_skylight_cubemap: ABORT -- light {} is not a Skylight",
+                light_id
+            );
             return;
         }
         let (Some(_), Some(_)) = (self.gbuffer_pass.as_ref(), self.lighting_pass.as_ref()) else {
+            log!("bake_skylight_cubemap: ABORT -- deferred passes missing (GL backend?)");
             return;
         };
 
@@ -985,9 +998,115 @@ impl<'a> Renderer<'a> {
                 .submit(std::iter::once(encoder.finish()));
         }
 
+        // Debug: dump the six faces to PNG so the capture can be eyeballed
+        // (a chrome surface reflecting a flat background means the bake caught
+        // an empty scene, not that the shader is wrong).
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::dump_cube_texture_to_disk(&self.device_resources, &cube_texture, FACE_SIZE, light_id);
+
         self.env_cubemaps.insert(light_id, cube_texture);
         self.game_camera = saved_camera;
         self.resize(game_config);
+    }
+
+    /// Reads a freshly-baked `Rgba16Float` cubemap back to the CPU and writes
+    /// each face as a tonemapped PNG next to the running binary. Purely a
+    /// debugging aid for the skylight bake -- not part of normal rendering.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dump_cube_texture_to_disk(
+        device_resources: &DeviceResources,
+        cube_texture: &CubeTexture,
+        face_size: u32,
+        light_id: u32,
+    ) {
+        let device = &device_resources.device;
+        let queue = &device_resources.queue;
+        // Rgba16Float = 8 bytes/texel; 128*8 = 1024 is already 256-aligned, so
+        // no per-row padding to unravel.
+        let bytes_per_row = face_size * 8;
+        let face_bytes = (bytes_per_row * face_size) as u64;
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cubemap dump readback"),
+            size: face_bytes * 6,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cubemap dump copy"),
+        });
+        for face in 0..6u32 {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cube_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: face },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: face_bytes * face as u64,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(face_size),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: face_size,
+                    height: face_size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let mapped = slice.get_mapped_range();
+
+        const FACE_NAMES: [&str; 6] = ["px", "nx", "py", "ny", "pz", "nz"];
+        for face in 0..6usize {
+            let start = (face_bytes * face as u64) as usize;
+            let end = start + face_bytes as usize;
+            let halfs: &[u16] = bytemuck::cast_slice(&mapped[start..end]);
+            let mut rgba = vec![0u8; (face_size * face_size * 4) as usize];
+            for px in 0..(face_size * face_size) as usize {
+                for c in 0..3usize {
+                    let lin = f16_to_f32(halfs[px * 4 + c]);
+                    // Reinhard tonemap + gamma so HDR radiance is viewable.
+                    let mapped_v = lin / (lin + 1.0);
+                    let srgb = mapped_v.powf(1.0 / 2.2);
+                    rgba[px * 4 + c] = (srgb.clamp(0.0, 1.0) * 255.0) as u8;
+                }
+                rgba[px * 4 + 3] = 255;
+            }
+            let path = format!("skylight_bake_light{}_{}.png", light_id, FACE_NAMES[face]);
+            match image::save_buffer(
+                &path,
+                &rgba,
+                face_size,
+                face_size,
+                image::ColorType::Rgba8,
+            ) {
+                Ok(()) => log::info!("Saved skylight bake face to {path}"),
+                Err(e) => log::warn!("Failed to save skylight bake face {path}: {e}"),
+            }
+        }
+        drop(mapped);
+        readback.unmap();
+    }
+
+    /// Frees a skylight's baked environment cubemap, if it has one. Unlike
+    /// `Light::use_env_cubemap` (a soft, reversible toggle), this drops the
+    /// GPU texture; the light falls back to its analytic gradient until
+    /// baked again.
+    pub fn clear_skylight_cubemap(&mut self, light_id: u32) {
+        self.env_cubemaps.remove(&light_id);
     }
 
     /// Routes World-layer actors through the deferred G-buffer + lighting
@@ -1516,4 +1635,26 @@ impl<'a> Renderer<'a> {
         self.custom_sprite_passes.push(pass);
         new_index
     }
+}
+
+/// Decodes an IEEE 754 half-precision float to `f32`. Used to read back the
+/// `Rgba16Float` skylight-bake cubemap for the PNG debug dump.
+#[cfg(not(target_arch = "wasm32"))]
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 0x1;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let val = match exp {
+        0 => {
+            // Subnormal (or zero).
+            (mant as f32) * 2f32.powi(-24)
+        }
+        0x1f => {
+            // Inf / NaN -- clamp to a finite large value; the dump only needs
+            // to be viewable, not bit-exact.
+            if mant == 0 { 65504.0 } else { 0.0 }
+        }
+        _ => (mant as f32 / 1024.0 + 1.0) * 2f32.powi(exp as i32 - 15),
+    };
+    if sign == 1 { -val } else { val }
 }

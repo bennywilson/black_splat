@@ -273,7 +273,11 @@ impl Texture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC so the scene color target can be copied into a skylight's
+            // environment cubemap faces (see Renderer::bake_skylight_cubemap).
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -483,7 +487,13 @@ impl CubeTexture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_DST to receive each captured face from the scene color
+            // target; COPY_SRC to read the finished cubemap back for the PNG
+            // debug dump (see Renderer::bake_skylight_cubemap).
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 

@@ -2230,11 +2230,24 @@ impl LightingPass {
             // The cone fades in over the outer 20% of the angle.
             let inner_rad = outer_rad * 0.8;
 
-            let has_env_cubemap = env_cubemaps.contains_key(&light.id);
+            let has_env_cubemap = light.use_env_cubemap() && env_cubemaps.contains_key(&light.id);
             let mut uniform = LightUniform {
                 inv_view_proj,
                 position_range: [position.x, position.y, position.z, light.get_range()],
-                direction_cone: [direction.x, direction.y, direction.z, outer_rad.cos()],
+                // w: for a skylight, its plain intensity (the cubemap sample is
+                // already full-color radiance -- unlike the analytic gradient,
+                // it must not also be tinted by the light's Color swatch).
+                // Unused by other light types, which keep cos(outer angle) here.
+                direction_cone: [
+                    direction.x,
+                    direction.y,
+                    direction.z,
+                    if light.get_light_type() == LightType::Skylight {
+                        light.get_intensity()
+                    } else {
+                        outer_rad.cos()
+                    },
+                ],
                 color_cone: [color.x, color.y, color.z, inner_rad.cos()],
                 // w: 1.0 if this skylight has a baked environment cubemap to
                 // sample instead of the top/bottom gradient (unused by other
