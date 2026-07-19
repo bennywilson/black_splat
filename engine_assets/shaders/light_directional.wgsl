@@ -8,7 +8,7 @@ struct LightUniform {
     target_dims: vec4<f32>,                 // xy render target size, zw shadow map size
     shadow_matrices: array<mat4x4<f32>, 4>, // used by the mask pass
     shadow_rects: array<vec4<f32>, 4>,
-    shadow_params: vec4<f32>                // x > 0 = sample the shadow mask
+    shadow_params: vec4<f32>                // x > 0 = sample the shadow mask, z = shadow density
 };
 
 @group(0) @binding(0)
@@ -87,7 +87,10 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     var shadow = 1.0;
     if (light.shadow_params.x > 0.5) {
-        shadow = textureLoad(t_mask, coords, 0).x;
+        let raw = textureLoad(t_mask, coords, 0).x;
+        // Same darkening dial as the splat catcher overlay (shadow_catcher_overlay.wgsl):
+        // density 0 disables the shadow, 1 is the mask as-authored, >1 crushes it darker.
+        shadow = clamp(1.0 - light.shadow_params.z * (1.0 - raw), 0.0, 1.0);
     }
 
     let lit = pbr_brdf(albedo, mr.x, mr.y, normal, view_dir, to_light,

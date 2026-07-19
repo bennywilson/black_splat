@@ -30,9 +30,6 @@ pub const MAX_LIGHTS: usize = 32;
 
 /// Cascade tiles in the shadow atlas (and the most a directional light uses).
 pub const MAX_CASCADES: usize = 4;
-// Bias subtracted from the receiver depth when comparing against the shadow
-// map (on top of the shadow pipeline's slope-scaled rasterizer bias).
-const SHADOW_DEPTH_BIAS: f32 = 0.0015;
 // Uniform pool for shadow draws: one 256-byte slot (dynamic offset) per
 // caster-per-tile draw.
 const SHADOW_DRAW_STRIDE: usize = 256;
@@ -75,7 +72,9 @@ pub struct LightUniform {
     pub shadow_matrices: [[[f32; 4]; 4]; MAX_CASCADES],
     // Each tile's rect in its shadow map: xy uv offset, zw uv scale.
     pub shadow_rects: [[f32; 4]; MAX_CASCADES],
-    // x: shadow tile count (0 = unshadowed), y: depth bias.
+    // x: shadow tile count (0 = unshadowed), y: depth bias, z: shadow density
+    // (Light::shadow_density -- same darkening dial as the splat catcher
+    // overlay's, applied here to regular mesh geometry).
     pub shadow_params: [f32; 4],
 }
 
@@ -89,11 +88,18 @@ pub struct ShadowSettings {
     /// Side of one shadow tile in texels (the cascade atlas is 2x2 tiles; the
     /// shared spot tile is one).
     pub resolution: u32,
+    /// World-space depth bias subtracted from the receiver depth before
+    /// comparing against the shadow map (on top of the shadow pipeline's
+    /// fixed slope-scaled rasterizer bias). Too small and flat surfaces
+    /// self-shadow (acne); too large and a shadow visibly detaches from the
+    /// base of whatever's casting it (peter-panning) -- most noticeable on
+    /// thin casters, where it reads as the shadow "floating" off the object.
+    pub depth_bias: f32,
 }
 
 impl Default for ShadowSettings {
     fn default() -> Self {
-        ShadowSettings { resolution: 1024 }
+        ShadowSettings { resolution: 1024, depth_bias: 0.0015 }
     }
 }
 
@@ -101,6 +107,7 @@ impl ShadowSettings {
     fn clamped(&self) -> Self {
         ShadowSettings {
             resolution: self.resolution.clamp(256, 2048),
+            depth_bias: self.depth_bias.clamp(0.0, 0.02),
         }
     }
 }
@@ -2713,7 +2720,8 @@ impl LightingPass {
                     uniform.shadow_matrices[i] = tile.view_proj.into();
                     uniform.shadow_rects[i] = tile.rect;
                 }
-                uniform.shadow_params = [tiles.len() as f32, SHADOW_DEPTH_BIAS, 0.0, 0.0];
+                uniform.shadow_params =
+                    [tiles.len() as f32, settings.depth_bias, light.shadow_density(), 0.0];
                 let atlas_size = (settings.resolution * 2) as f32;
                 uniform.target_dims[2] = atlas_size;
                 uniform.target_dims[3] = atlas_size;
@@ -2722,7 +2730,7 @@ impl LightingPass {
                 let tile = shadow_pass.render_spot(ctx, &casters, light);
                 uniform.shadow_matrices[0] = tile.view_proj.into();
                 uniform.shadow_rects[0] = tile.rect;
-                uniform.shadow_params = [1.0, SHADOW_DEPTH_BIAS, 0.0, 0.0];
+                uniform.shadow_params = [1.0, settings.depth_bias, light.shadow_density(), 0.0];
                 uniform.target_dims[2] = settings.resolution as f32;
                 uniform.target_dims[3] = settings.resolution as f32;
                 Some(MaskKind::Spot)

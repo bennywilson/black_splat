@@ -24,6 +24,7 @@ const ADD_OBJECT_DISTANCE: f32 = 5.0;
 fn shadow_settings_from_config(config: &EditorConfig) -> ShadowSettings {
     ShadowSettings {
         resolution: config.shadow_resolution,
+        depth_bias: config.shadow_depth_bias,
     }
 }
 
@@ -5645,6 +5646,21 @@ impl GameEngine for SplatGame {
                                                         .changed();
                                                 }
                                             });
+                                        shadows_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut self.editor_config.shadow_depth_bias,
+                                                    0.0..=0.02,
+                                                )
+                                                .logarithmic(true)
+                                                .text("depth bias"),
+                                            )
+                                            .on_hover_text(
+                                                "Too low: shadow acne on flat surfaces. \
+                                                 Too high: shadows detach from thin casters \
+                                                 (looks like the shadow is floating).",
+                                            )
+                                            .changed();
                                         if shadows_changed {
                                             renderer.set_shadow_settings(
                                                 &shadow_settings_from_config(
