@@ -78,32 +78,21 @@ pub struct LightUniform {
     pub shadow_params: [f32; 4],
 }
 
-/// Shadow quality settings, tweakable at runtime (the editor exposes them in
-/// its Settings tab).  Changing the resolution recreates the shadow maps.
-/// Per-light on/off stays on the light (`Light::casts_shadow`).
+/// Global shadow quality settings, tweakable at runtime (the editor exposes
+/// them in its Settings tab).  Changing the resolution recreates the shadow
+/// maps.  Everything per-light stays on the light: on/off
+/// (`Light::casts_shadow`), and the directional cascade count, distance and
+/// catcher density (`Light::shadow_cascades` and friends).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ShadowSettings {
     /// Side of one shadow tile in texels (the cascade atlas is 2x2 tiles; the
     /// shared spot tile is one).
     pub resolution: u32,
-    /// Directional-light cascade count, 1..=MAX_CASCADES.
-    pub num_cascades: u32,
-    /// How far from the camera the directional cascades reach, in world units.
-    pub distance: f32,
-    /// Artist control over how black shadow-catcher shadows land: a multiplier
-    /// on the projected darkening amount.  1 = as projected; > 1 deepens toward
-    /// black; 0 disables the catcher darkening.
-    pub density: f32,
 }
 
 impl Default for ShadowSettings {
     fn default() -> Self {
-        ShadowSettings {
-            resolution: 1024,
-            num_cascades: 3,
-            distance: 75.0,
-            density: 1.0,
-        }
+        ShadowSettings { resolution: 1024 }
     }
 }
 
@@ -111,9 +100,6 @@ impl ShadowSettings {
     fn clamped(&self) -> Self {
         ShadowSettings {
             resolution: self.resolution.clamp(256, 2048),
-            num_cascades: self.num_cascades.clamp(1, MAX_CASCADES as u32),
-            distance: self.distance.max(5.0),
-            density: self.density.clamp(0.0, 4.0),
         }
     }
 }
@@ -524,6 +510,9 @@ enum MaskKind {
 pub struct ShadowPass {
     settings: ShadowSettings,
     pending_settings: Option<ShadowSettings>,
+    // This frame's catcher darkening multiplier, taken from the directional
+    // light that owns the cascades (see set_catcher_density).
+    catcher_density: f32,
 
     // Caster depth rendering.
     depth_pipeline: wgpu::RenderPipeline,
@@ -1032,6 +1021,7 @@ impl ShadowPass {
         ShadowPass {
             settings,
             pending_settings: None,
+            catcher_density: 1.0,
             depth_pipeline,
             atlas,
             spot_depth,
@@ -1189,6 +1179,12 @@ impl ShadowPass {
 
     pub fn settings(&self) -> ShadowSettings {
         self.pending_settings.unwrap_or(self.settings)
+    }
+
+    // Sets the catcher darkening multiplier for this frame's overlay; the
+    // lighting pass takes it from the directional light driving the shadows.
+    fn set_catcher_density(&mut self, density: f32) {
+        self.catcher_density = density.clamp(0.0, 4.0);
     }
 
     // Applies pending settings, recreating the shadow maps (and their mask
@@ -1594,7 +1590,7 @@ impl ShadowPass {
     pub fn render_catcher_overlay(&mut self, ctx: &mut RenderContext) {
         let device_resources = &mut *ctx.device;
         // Upload the current shadow density (padded to 16 bytes) for the overlay.
-        let params = [self.settings.density, 0.0, 0.0, 0.0];
+        let params = [self.catcher_density, 0.0, 0.0, 0.0];
         device_resources.queue.write_buffer(
             &self.overlay_params_buffer,
             0,
@@ -1631,7 +1627,7 @@ impl ShadowPass {
     }
 
     // Cascade tiles for the shadowed directional light: split the camera
-    // frustum out to settings.distance, fit a texel-snapped light-space ortho
+    // frustum out to the light's shadow distance, fit a texel-snapped light-space ortho
     // box around each slice's bounding sphere, and render the casters into
     // the 2x2 atlas.
     fn render_cascades(
@@ -1642,7 +1638,7 @@ impl ShadowPass {
     ) -> Vec<ShadowTile> {
         let camera = ctx.camera;
         let config = ctx.config;
-        let num_cascades = self.settings.num_cascades as usize;
+        let num_cascades = light.shadow_cascades().clamp(1, MAX_CASCADES as u32) as usize;
         let resolution = self.settings.resolution;
 
         let light_dir = {
@@ -1663,7 +1659,7 @@ impl ShadowPass {
 
         // Practical split scheme: halfway between uniform and logarithmic.
         let near = 0.1_f32;
-        let far = self.settings.distance;
+        let far = light.shadow_distance().max(5.0);
         let split = |t: f32| -> f32 {
             if t <= 0.0 {
                 return near;
@@ -2432,10 +2428,12 @@ impl LightingPass {
         // owns the cascade atlas (only one directional can cast per frame).
         let mut sorted_lights: Vec<&Light> = lights.values().collect();
         sorted_lights.sort_by_key(|light| light.id);
-        let cascade_owner = sorted_lights
+        let cascade_light = sorted_lights
             .iter()
-            .find(|l| l.get_light_type() == LightType::Directional && l.casts_shadow())
-            .map(|l| l.id);
+            .find(|l| l.get_light_type() == LightType::Directional && l.casts_shadow());
+        let cascade_owner = cascade_light.map(|l| l.id);
+        // The catcher overlay's darkness rides on that same light.
+        shadow_pass.set_catcher_density(cascade_light.map_or(1.0, |l| l.shadow_density()));
 
         for (slot, light) in sorted_lights.iter().enumerate().take(MAX_LIGHTS) {
             let position = light.get_position();

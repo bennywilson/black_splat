@@ -474,10 +474,21 @@ impl<'a> Renderer<'a> {
             } else {
                 ""
             };
+            // Loud banner while a splat stage is being skipped, so a bisect run
+            // can never be mistaken for a real frame time.  Empty when off.
+            let bisect_banner = self
+                .gaussian_splat_pass
+                .as_ref()
+                .map(|p| p.bisect())
+                .filter(|b| *b != SplatBisect::Off)
+                .map_or(String::new(), |b| {
+                    format!("*** SPLAT BISECT: {} ***\n", b.label())
+                });
+
             let frame_time_string = {
                 if self.display_debug_msg {
                     format!(
-                        "{hint}{}\n\
+                        "{hint}{bisect_banner}{}\n\
                         FPS: {:.0} \n\
                         Frame time: {:.2} ms\n\
                         Back End: {:?}\n\
@@ -491,7 +502,10 @@ impl<'a> Renderer<'a> {
                         self.game_hud_msg
                     )
                 } else {
-                    format!("{hint}FPS: {:.0}\n\n {}", frame_rate, self.game_hud_msg)
+                    format!(
+                        "{hint}{bisect_banner}FPS: {:.0}\n\n {}",
+                        frame_rate, self.game_hud_msg
+                    )
                 }
             };
 
@@ -694,20 +708,30 @@ impl<'a> Renderer<'a> {
         if let Some(splat_pass) = &mut self.gaussian_splat_pass {
             if splat_pass.has_model() {
                 PERF_SCOPE!("Gaussian Splats");
-                splat_pass.render(&mut ctx);
-                if let Some(composite_pass) = &mut self.splat_composite_pass {
-                    composite_pass.settings = pp_settings;
-                    composite_pass.render(&mut ctx);
+                // Only composite when the pass actually drew: a frustum-culled
+                // cloud leaves the scratch buffer untouched, and compositing it
+                // would put the previous frame's splats back on screen.
+                if splat_pass.render(&mut ctx) {
+                    if let Some(composite_pass) = &mut self.splat_composite_pass {
+                        composite_pass.settings = pp_settings;
+                        composite_pass.render(&mut ctx);
+                    }
+                    splats_rendered = true;
                 }
-                splats_rendered = true;
             }
         }
 
         // Shadow-catcher overlay: darkens the just-composited splats where an
         // invisible catcher proxy received a CG object's shadow this frame.
         // Only meaningful in the deferred path (which produced the catcher
-        // depth + shadow); a no-op where no catcher was rendered.
-        if splats_rendered && self.deferred_world_enabled {
+        // depth + shadow).  With no catcher in the scene the shader resolves to
+        // a multiply by 1, so skip the whole full-screen pass (and its submit)
+        // rather than pay for a guaranteed no-op every frame.
+        let has_shadow_catcher = self
+            .actor_map
+            .values()
+            .any(|actor| actor.is_shadow_catcher());
+        if splats_rendered && self.deferred_world_enabled && has_shadow_catcher {
             if let Some(shadow_pass) = self.shadow_pass.as_mut() {
                 PERF_SCOPE!("Shadow Catcher Overlay");
                 shadow_pass.render_catcher_overlay(&mut ctx);
@@ -965,8 +989,7 @@ impl<'a> Renderer<'a> {
                 &self.env_cubemaps,
             );
             if let Some(splat_pass) = &mut self.gaussian_splat_pass {
-                if splat_pass.has_model() {
-                    splat_pass.render(&mut ctx);
+                if splat_pass.has_model() && splat_pass.render(&mut ctx) {
                     if let Some(composite_pass) = &mut self.splat_composite_pass {
                         composite_pass.render(&mut ctx);
                     }
@@ -1328,9 +1351,10 @@ impl<'a> Renderer<'a> {
         self.deferred_world_enabled = enabled;
     }
 
-    /// Sets the shadow quality settings (cascade count, tile resolution,
-    /// cascade distance); applied at the start of the next frame. A no-op on
-    /// the GL backend, which has no shadow pass to configure.
+    /// Sets the global shadow quality settings (the shadow tile resolution);
+    /// applied at the start of the next frame. A no-op on the GL backend,
+    /// which has no shadow pass to configure. Cascade count, distance and
+    /// catcher density live on the directional light itself.
     pub fn set_shadow_settings(&mut self, settings: &ShadowSettings) {
         if let Some(shadow_pass) = self.shadow_pass.as_mut() {
             shadow_pass.request_settings(settings);
@@ -1640,6 +1664,14 @@ impl<'a> Renderer<'a> {
         self.gaussian_splat_pass
             .as_ref()
             .map_or(0, |g| g.active_splat_count())
+    }
+
+    /// Advances the splat pass's diagnostic bisect setting (see `SplatBisect`)
+    /// and returns its label for display.  Returns None with no splat pipeline.
+    pub fn cycle_splat_bisect(&mut self) -> Option<&'static str> {
+        self.gaussian_splat_pass
+            .as_mut()
+            .map(|p| p.cycle_bisect().label())
     }
 
     pub fn set_gaussian_splat_params(&mut self, params: &SplatParams) {

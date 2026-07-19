@@ -533,8 +533,8 @@ impl crate::editor::EditorChoice for LightType {
 /// A scene light, sampled by the deferred lighting pass (see
 /// `passes::deferred::LightingPass`).  `color2` is only used by skylights (the
 /// bottom hemisphere color); `range` only by point/spot lights; `spot_angle`
-/// (the cone's half-angle, degrees) only by spot lights.  No shadows yet --
-/// `casts_shadow` is carried for a future shadow pass.
+/// (the cone's half-angle, degrees) only by spot lights; the `shadow_*` fields
+/// only by directional lights.
 #[derive(Debug, Clone)]
 pub struct Light {
     pub id: u32,
@@ -548,6 +548,16 @@ pub struct Light {
     range: f32,
     spot_angle: f32,
     casts_shadow: bool,
+    // Cascaded-shadow-map controls, used only by directional lights (the one
+    // shadow-casting directional light owns the cascade atlas; see
+    // passes::deferred::ShadowPass::render_cascades). Tile resolution is not
+    // here -- it sizes the shared atlas, so it stays a global setting.
+    shadow_cascades: u32,
+    shadow_distance: f32,
+    // How black shadow-catcher shadows land: a multiplier on the projected
+    // darkening amount. 1 = as projected; > 1 deepens toward black; 0 disables
+    // the catcher darkening.
+    shadow_density: f32,
     // A one-shot trigger, checked and cleared by the game's tick: when true,
     // a skylight should (re)bake its environment cubemap from its current
     // position (see Renderer::bake_skylight_cubemap). Meaningless on other
@@ -584,6 +594,9 @@ crate::editor_properties!(Light {
     range: float("Range"),
     spot_angle: float("Spot Angle"),
     casts_shadow: bool("Casts Shadow"),
+    shadow_cascades: int("Shadow Cascades"),
+    shadow_distance: float("Shadow Distance"),
+    shadow_density: float("Shadow Density"),
     bake_cubemap_requested: bool("Bake Environment Cubemap"),
     use_env_cubemap: bool("Use Environment Cubemap"),
     show_env_as_skybox: bool("Show Cubemap as Skybox"),
@@ -615,6 +628,9 @@ impl Light {
             range: 10.0,
             spot_angle: 30.0,
             casts_shadow: true,
+            shadow_cascades: 3,
+            shadow_distance: 75.0,
+            shadow_density: 1.0,
             bake_cubemap_requested: false,
             use_env_cubemap: true,
             show_env_as_skybox: false,
@@ -709,6 +725,33 @@ impl Light {
 
     pub fn casts_shadow(&self) -> bool {
         self.casts_shadow
+    }
+
+    /// Directional-light cascade count, clamped to what the atlas holds.
+    pub fn set_shadow_cascades(&mut self, cascades: u32) {
+        self.shadow_cascades = cascades;
+    }
+
+    pub fn shadow_cascades(&self) -> u32 {
+        self.shadow_cascades
+    }
+
+    /// How far from the camera the directional cascades reach, in world units.
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        self.shadow_distance = distance;
+    }
+
+    pub fn shadow_distance(&self) -> f32 {
+        self.shadow_distance
+    }
+
+    /// Multiplier on how black this light's shadow-catcher shadows land.
+    pub fn set_shadow_density(&mut self, density: f32) {
+        self.shadow_density = density;
+    }
+
+    pub fn shadow_density(&self) -> f32 {
+        self.shadow_density
     }
 
     /// Reads and clears the one-shot bake trigger; the caller should start a

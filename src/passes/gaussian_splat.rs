@@ -42,6 +42,9 @@ pub struct SplatUniform {
     pub splat_params: [f32; 4],   // falloff, scale, contrast, num_splats
     pub splat_params_2: [f32; 4], // max_sh_degree, overall_scale, _, _
     pub model: [[f32; 4]; 4],     // cloud world transform (editor gizmo)
+    // Normalized world-space frustum planes, so the vertex shader can reject an
+    // off-screen splat with six dot products before doing any real work.
+    pub frustum_planes: [[f32; 4]; 6],
 }
 
 /// Matches `SortGlobals` in gaussian_splat_radix.wgsl.
@@ -53,6 +56,13 @@ struct SortGlobals {
     num_tiles: u32,       // ceil(num_elements / SORT_WORKGROUP_SIZE)
     _pad0: u32,
     _pad1: u32,
+    // Everything cs_compute_keys needs to frustum-cull a splat: the cloud
+    // transform to reach world space, the planes to test against, and the scales
+    // that size its billboard.
+    model: [[f32; 4]; 4],
+    frustum_planes: [[f32; 4]; 6],
+    // x: overall scale, y: splat scale, z: cloud scale, w: unused
+    cull_params: [f32; 4],
 }
 
 /// Outcome of a successful runtime splat load: how many splats made it onto the
@@ -116,6 +126,12 @@ pub struct SplatModel {
     // Per-tile bucket histogram (bucket-major) + the scan spine.
     hist_buffer: wgpu::Buffer,
     block_sums_buffer: wgpu::Buffer,
+    // Indirect draw args: [vertex_count, instance_count, first_vertex,
+    // first_instance].  vertex_count is a fixed 4 (one strip per splat);
+    // cs_compute_keys tallies the splats that survive the frustum cull into
+    // instance_count, so the draw covers exactly the visible prefix of the
+    // sorted index buffer without the CPU ever learning the count.
+    draw_args: wgpu::Buffer,
 
     // Draw bindings (group 1 of the draw pipeline): reads the vals buffer the sort
     // finishes in.  With RADIX_PASSES even, that is vals_a.
@@ -132,16 +148,18 @@ pub struct SplatModel {
     pass_stride: u32,
     pass_buffer: wgpu::Buffer,
     pass_bind_group: wgpu::BindGroup,
-    // View depth row used for the last sort; lets us skip re-sorting a static
-    // camera.  NaN forces a sort on the first frame.
-    last_sort_zc: [f32; 4],
-    // When the last sort ran.  Re-sorts are rate-limited (splat order tolerates
-    // being a few frames stale) to avoid flooding the GPU -- which on the browser
-    // also starves the rest of the UI.
+    // Model-view-projection the last sort ran against; a static camera and cloud
+    // reuse that sort's result.  NaN forces a sort on the first frame.  The whole
+    // MVP is the key (not just the depth row) because cs_compute_keys also culls,
+    // and visibility depends on translation as well as orientation.
+    last_sort_mvp: [[f32; 4]; 4],
+    // When the last sort ran.
     last_sort_time: instant::Instant,
 
     // World-space bounding sphere for view-frustum culling.  When the sphere is
     // entirely outside the frustum both the sort and the draw are skipped.
+    // Fitted to the cloud's core rather than its full extent -- see the
+    // CULL_PERCENTILE comment where these are computed.
     bounding_center: [f32; 3],
     bounding_radius: f32,
 }
@@ -392,15 +410,58 @@ pub fn parse_splat_ply(
     })
 }
 
-// Returns false when the sphere (world-space center + radius) is entirely outside
-// any of the six frustum planes extracted from the view-projection matrix
-// (Gribb-Hartmann method, column-major cgmath convention).
-fn sphere_in_frustum(vp: cgmath::Matrix4<f32>, center: [f32; 3], radius: f32) -> bool {
+// Splats past this fraction of the distance ordering are left outside the cull
+// sphere.  See fit_cull_sphere.
+const CULL_PERCENTILE: f32 = 0.99;
+
+// Fits the world-space bounding sphere used for view-frustum culling.
+//
+// 3DGS captures almost always carry a scatter of "floater" splats far outside
+// the real scene, and both a mean center and a max-distance radius get dragged
+// out to them -- giving a sphere big enough to contain the camera, so the cull
+// test passes no matter where you look.  The per-axis median and a percentile
+// distance both ignore that tail, giving a sphere that tracks the actual cloud.
+//
+// The tradeoff: splats past CULL_PERCENTILE fall outside the sphere and wink out
+// if the cloud leaves the frustum while they are still on screen.  Those are the
+// same stray floaters the tight fit exists to ignore, and the cull only fires
+// once the body of the cloud is already off screen.
+fn fit_cull_sphere(instances: &[SplatInstance]) -> ([f32; 3], f32) {
+    if instances.is_empty() {
+        return ([0.0; 3], 0.0);
+    }
+    let median_axis = |axis: usize| {
+        let mut v: Vec<f32> = instances.iter().map(|s| s.position[axis]).collect();
+        let mid = v.len() / 2;
+        v.select_nth_unstable_by(mid, f32::total_cmp);
+        v[mid]
+    };
+    let center = [median_axis(0), median_axis(1), median_axis(2)];
+    let mut dists: Vec<f32> = instances
+        .iter()
+        .map(|s| {
+            let dx = s.position[0] - center[0];
+            let dy = s.position[1] - center[1];
+            let dz = s.position[2] - center[2];
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        })
+        .collect();
+    let k = (((dists.len() - 1) as f32) * CULL_PERCENTILE).round() as usize;
+    dists.select_nth_unstable_by(k, f32::total_cmp);
+    (center, dists[k])
+}
+
+// The six world-space frustum planes (left, right, bottom, top, near, far) of a
+// view-projection matrix, Gribb-Hartmann in cgmath's column-major convention.
+// Normalized, so a plane dot a point is a true signed distance -- the splat
+// vertex shader relies on that to test each splat's bounding sphere with six
+// plain dot products (see gaussian_splat.wgsl).
+fn frustum_planes(vp: cgmath::Matrix4<f32>) -> [[f32; 4]; 6] {
     let r0 = [vp.x.x, vp.y.x, vp.z.x, vp.w.x];
     let r1 = [vp.x.y, vp.y.y, vp.z.y, vp.w.y];
     let r2 = [vp.x.z, vp.y.z, vp.z.z, vp.w.z];
     let r3 = [vp.x.w, vp.y.w, vp.z.w, vp.w.w];
-    let planes = [
+    let mut planes = [
         [r3[0]+r0[0], r3[1]+r0[1], r3[2]+r0[2], r3[3]+r0[3]], // left
         [r3[0]-r0[0], r3[1]-r0[1], r3[2]-r0[2], r3[3]-r0[3]], // right
         [r3[0]+r1[0], r3[1]+r1[1], r3[2]+r1[2], r3[3]+r1[3]], // bottom
@@ -408,19 +469,73 @@ fn sphere_in_frustum(vp: cgmath::Matrix4<f32>, center: [f32; 3], radius: f32) ->
         [r3[0]+r2[0], r3[1]+r2[1], r3[2]+r2[2], r3[3]+r2[3]], // near
         [r3[0]-r2[0], r3[1]-r2[1], r3[2]-r2[2], r3[3]-r2[3]], // far
     ];
-    let (cx, cy, cz) = (center[0], center[1], center[2]);
-    for p in &planes {
-        let dot = p[0]*cx + p[1]*cy + p[2]*cz + p[3];
+    for p in planes.iter_mut() {
         let len = (p[0]*p[0] + p[1]*p[1] + p[2]*p[2]).sqrt();
-        if dot + radius * len < 0.0 {
-            return false;
+        if len > 0.0 {
+            p[0] /= len;
+            p[1] /= len;
+            p[2] /= len;
+            p[3] /= len;
         }
     }
-    true
+    planes
+}
+
+// Returns false when the sphere (world-space center + radius) is entirely outside
+// any of the six frustum planes.
+fn sphere_in_frustum(vp: cgmath::Matrix4<f32>, center: [f32; 3], radius: f32) -> bool {
+    let (cx, cy, cz) = (center[0], center[1], center[2]);
+    frustum_planes(vp)
+        .iter()
+        .all(|p| p[0]*cx + p[1]*cy + p[2]*cz + p[3] + radius >= 0.0)
+}
+
+/// Diagnostic: which stage of the splat pass to skip, so frame time can be
+/// attributed to the part that actually costs it.  Each setting removes exactly
+/// one stage and leaves the rest running, so the fps delta against `Off` prices
+/// that stage on its own.
+///
+/// Cycled with [B] in the splat demo; the active setting shows on the debug HUD.
+/// Everything defaults to `Off`, so this costs nothing when unused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SplatBisect {
+    /// Normal rendering.
+    #[default]
+    Off,
+    /// Skip the draw call, keep the sort and the (clearing) render pass.  The
+    /// delta from `Off` is what the per-splat vertex invocations cost.
+    NoDraw,
+    /// Skip the 21 radix-sort dispatches; still draw, with a stale splat order.
+    /// The delta from `Off` is what the sort costs.
+    NoSort,
+    /// Skip the whole pass, and with it the composite.  Should land near the
+    /// no-splats-loaded baseline; anything short of that is cost elsewhere.
+    NoPass,
+}
+
+impl SplatBisect {
+    pub fn label(self) -> &'static str {
+        match self {
+            SplatBisect::Off => "off",
+            SplatBisect::NoDraw => "no draw (sort + composite only)",
+            SplatBisect::NoSort => "no sort (draw + composite only)",
+            SplatBisect::NoPass => "no splat pass at all",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            SplatBisect::Off => SplatBisect::NoDraw,
+            SplatBisect::NoDraw => SplatBisect::NoSort,
+            SplatBisect::NoSort => SplatBisect::NoPass,
+            SplatBisect::NoPass => SplatBisect::Off,
+        }
+    }
 }
 
 pub struct GaussianSplatPass {
     pipeline: wgpu::RenderPipeline,
+    bisect: SplatBisect,
     uniform: SplatUniform,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -542,7 +657,9 @@ impl GaussianSplatPass {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
+                // One 4-vertex strip per splat instance (see gaussian_splat.wgsl).
+                // strip_index_format stays None: the draw is non-indexed.
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -610,6 +727,7 @@ impl GaussianSplatPass {
                     storage_entry(5, false), // vals_out
                     storage_entry(6, false), // hist
                     storage_entry(7, false), // block_sums
+                    storage_entry(8, false), // indirect draw args (cull tally)
                 ],
             });
 
@@ -653,6 +771,7 @@ impl GaussianSplatPass {
 
         GaussianSplatPass {
             pipeline,
+            bisect: SplatBisect::default(),
             uniform,
             uniform_buffer,
             uniform_bind_group,
@@ -840,18 +959,30 @@ impl GaussianSplatPass {
             label: Some("Splat_storage_bind_group"),
         });
 
-        // Sort globals (depth row updated per frame; counts are constant).
+        // Sort globals: counts are constant, the depth row and the cull inputs are
+        // rewritten every time the sort runs.
         let sort_globals = SortGlobals {
             zc: [0.0; 4],
             num_elements: num_splats,
             num_tiles,
             _pad0: 0,
             _pad1: 0,
+            ..Default::default()
         };
         let sort_globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Splat_sort_globals_buffer"),
             contents: bytemuck::cast_slice(&[sort_globals]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // 4 strip vertices per splat; instance_count is refilled by the cull each
+        // time the sort runs.  Starts at 0 so nothing draws before the first sort.
+        let draw_args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Splat_draw_args"),
+            contents: bytemuck::cast_slice(&[4u32, 0u32, 0u32, 0u32]),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
         });
 
         // Two bind groups swapping the in/out key+val buffers between passes.
@@ -872,6 +1003,7 @@ impl GaussianSplatPass {
                     wgpu::BindGroupEntry { binding: 5, resource: vals_out.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: hist_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 7, resource: block_sums_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: draw_args.as_entire_binding() },
                 ],
             })
         };
@@ -907,24 +1039,7 @@ impl GaussianSplatPass {
             }],
         });
 
-        // Bounding sphere (world-space, for frustum culling).  Center = mean
-        // position; radius = max distance from center.
-        let (bounding_center, bounding_radius) = {
-            let n = instances.len() as f32;
-            let cx = instances.iter().map(|s| s.position[0]).sum::<f32>() / n;
-            let cy = instances.iter().map(|s| s.position[1]).sum::<f32>() / n;
-            let cz = instances.iter().map(|s| s.position[2]).sum::<f32>() / n;
-            let r = instances
-                .iter()
-                .map(|s| {
-                    let dx = s.position[0] - cx;
-                    let dy = s.position[1] - cy;
-                    let dz = s.position[2] - cz;
-                    (dx * dx + dy * dy + dz * dz).sqrt()
-                })
-                .fold(0.0_f32, f32::max);
-            ([cx, cy, cz], r)
-        };
+        let (bounding_center, bounding_radius) = fit_cull_sphere(&instances);
 
         self.models.push(SplatModel {
             splat_buffer,
@@ -935,6 +1050,7 @@ impl GaussianSplatPass {
             vals_b,
             hist_buffer,
             block_sums_buffer,
+            draw_args,
             storage_bind_group,
             num_tiles,
             sort_globals,
@@ -944,7 +1060,7 @@ impl GaussianSplatPass {
             pass_stride,
             pass_buffer,
             pass_bind_group,
-            last_sort_zc: [f32::NAN; 4],
+            last_sort_mvp: [[f32::NAN; 4]; 4],
             last_sort_time: instant::Instant::now(),
             bounding_center,
             bounding_radius,
@@ -955,16 +1071,35 @@ impl GaussianSplatPass {
         !self.models.is_empty()
     }
 
-    pub fn render(&mut self, ctx: &mut RenderContext) {
+    pub fn bisect(&self) -> SplatBisect {
+        self.bisect
+    }
+
+    /// Advances the diagnostic bisect setting and returns the new one.
+    pub fn cycle_bisect(&mut self) -> SplatBisect {
+        self.bisect = self.bisect.next();
+        self.bisect
+    }
+
+    /// Draws the active cloud into the splat scratch buffer.  Returns false when
+    /// nothing was drawn (no cloud, or the whole cloud is off-screen), in which
+    /// case the scratch buffer holds no fresh content and the caller must skip
+    /// the composite -- compositing it anyway would blend the previous frame's
+    /// splats back onto the scene.
+    pub fn render(&mut self, ctx: &mut RenderContext) -> bool {
+        if self.bisect == SplatBisect::NoPass {
+            return false;
+        }
+        let bisect = self.bisect;
         let device_resources = &mut *ctx.device;
         let game_camera = ctx.camera;
         let game_config = ctx.config;
         let model = match self.models.get_mut(self.active_model) {
             Some(m) => m,
-            None => return,
+            None => return false,
         };
         if model.num_splats == 0 {
-            return;
+            return false;
         }
 
         let (view_matrix, _, _) = game_camera.calculate_view_matrix();
@@ -995,38 +1130,49 @@ impl GaussianSplatPass {
             [world_center.x, world_center.y, world_center.z],
             world_radius,
         ) {
-            return;
+            return false;
         }
 
         // Depth ordering is keyed by the view-space depth of the transformed
-        // splat -- the third row of (view * model).  It depends only on that
-        // row's direction part, so we only re-run the GPU sort when the camera
-        // rotates or the cloud is rotated/scaled (pure translation of either
-        // shifts all depths equally and preserves order).
+        // splat -- the third row of (view * model).
         let vm = view_matrix * model_mat;
         let zc = [vm.x.z, vm.y.z, vm.z.z, vm.w.z];
-        // Sort order depends only on the view DIRECTION (zc[0..3]); zc[3] is the
-        // translation, which shifts every splat's depth equally and so never
-        // changes their order.  So only re-sort when the camera rotates -- pure
-        // translation (WASD, any direction) reuses the existing order for free.
-        // The radix sort is cheap enough to run every rotated frame (measured well
-        // over 200 fps sorting every frame), so there is no rate limit: re-sorting
-        // each frame keeps rotation smooth instead of updating in visible steps.
-        let first_sort = model.last_sort_zc[0].is_nan();
-        let needs_sort = first_sort
-            || model.last_sort_zc[0..3]
-                .iter()
-                .zip(zc[0..3].iter())
-                .any(|(a, b)| (a - b).abs() > 1e-6);
+        // cs_compute_keys both sorts and frustum-culls, and visibility depends on
+        // where the camera is, not just where it points -- so the trigger is the
+        // full MVP rather than the depth row alone.  In practice that means any
+        // camera or cloud movement re-runs it.  The whole sort measures ~0.5 ms
+        // for 700k splats, which is a fraction of what culling the draw saves.
+        let mvp: [[f32; 4]; 4] = (view_proj * model_mat).into();
+        let first_sort = model.last_sort_mvp[0][0].is_nan();
+        let moved = model
+            .last_sort_mvp
+            .iter()
+            .flatten()
+            .zip(mvp.iter().flatten())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        // NoSort leaves last_sort_mvp untouched, so turning the bisect back off
+        // re-sorts immediately rather than leaving a stale order on screen.
+        let needs_sort = bisect != SplatBisect::NoSort && (first_sort || moved);
 
         if needs_sort {
             model.sort_globals.zc = zc;
+            model.sort_globals.model = model_mat.into();
+            model.sort_globals.frustum_planes = frustum_planes(view_proj);
+            let cloud_scale = col_len(model_mat.x);
+            model.sort_globals.cull_params = [os, self.params.scale, cloud_scale, 0.0];
             device_resources.queue.write_buffer(
                 &model.sort_globals_buffer,
                 0,
                 bytemuck::cast_slice(&[model.sort_globals]),
             );
-            model.last_sort_zc = zc;
+            // Zero the survivor tally before the cull adds to it; vertex_count is
+            // the fixed 4-vertex strip.
+            device_resources.queue.write_buffer(
+                &model.draw_args,
+                0,
+                bytemuck::cast_slice(&[4u32, 0u32, 0u32, 0u32]),
+            );
+            model.last_sort_mvp = mvp;
             model.last_sort_time = instant::Instant::now();
         }
 
@@ -1047,6 +1193,7 @@ impl GaussianSplatPass {
             0.0,
         ];
         self.uniform.model = model_mat.into();
+        self.uniform.frustum_planes = frustum_planes(view_proj);
         device_resources.queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -1142,21 +1289,31 @@ impl GaussianSplatPass {
                 timestamp_writes: None,
             });
 
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_bind_group(1, &model.storage_bind_group, &[]);
-            // The sorted vals buffer holds exactly num_splats indices, back-to-front.
-            render_pass.draw(0..model.num_splats * 6, 0..1);
+            // NoDraw still enters (and so still clears) the render pass, leaving
+            // the composite a clean transparent buffer to blend: the only thing
+            // removed is the per-splat vertex work.
+            if bisect != SplatBisect::NoDraw {
+                render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &model.storage_bind_group, &[]);
+                // Indirect: the cull parked the off-screen splats past the end of
+                // the sorted buffer and wrote the survivor count into
+                // instance_count, so the draw covers exactly the visible prefix,
+                // back-to-front, without a GPU->CPU readback.
+                render_pass.draw_indirect(&model.draw_args, 0);
+            }
         }
 
         device_resources
             .queue
             .submit(std::iter::once(command_encoder.finish()));
+        true
     }
 }
 
-// Keep the GPU struct size in lockstep with the WGSL layout.
+// Keep the GPU struct sizes in lockstep with the WGSL layouts.
 const _: () = assert!(size_of::<SplatInstance>() == 160);
+const _: () = assert!(size_of::<SplatUniform>() == 336);
 
 #[cfg(test)]
 mod tests {
@@ -1183,6 +1340,71 @@ mod tests {
             }
         }
         bytes
+    }
+
+    // A SplatInstance at `pos`; only the position matters to the sphere fit.
+    fn at(pos: [f32; 3]) -> SplatInstance {
+        SplatInstance {
+            position: [pos[0], pos[1], pos[2], 1.0],
+            scale_opacity: [1.0, 1.0, 1.0, 0.5],
+            rotation: [1.0, 0.0, 0.0, 0.0],
+            sh0: [0.5, 0.5, 0.5, 0.0],
+            sh_rest: [0.0; 24],
+        }
+    }
+
+    // The whole point of the percentile fit: a handful of far floaters must not
+    // blow the cull sphere up to encompass them (which is what a mean centre and
+    // a max-distance radius did, defeating the cull entirely).
+    #[test]
+    fn cull_sphere_ignores_floaters() {
+        // 1000 splats in a unit-ish box around the origin, plus 5 floaters at 1000.
+        let mut instances: Vec<SplatInstance> = (0..1000)
+            .map(|i| {
+                let t = i as f32 / 1000.0;
+                at([t, -t, t * 0.5])
+            })
+            .collect();
+        for _ in 0..5 {
+            instances.push(at([1000.0, 1000.0, 1000.0]));
+        }
+
+        let (center, radius) = fit_cull_sphere(&instances);
+
+        // Centre stays with the body of the cloud, not dragged toward the floaters.
+        assert!(center[0].abs() < 2.0, "center pulled by floaters: {center:?}");
+        assert!(center[1].abs() < 2.0, "center pulled by floaters: {center:?}");
+        assert!(center[2].abs() < 2.0, "center pulled by floaters: {center:?}");
+        // Radius bounds the body, nowhere near the 1732 needed to reach a floater.
+        assert!(radius < 10.0, "radius pulled by floaters: {radius}");
+    }
+
+    // cgmath's perspective looks down -Z, so an identity view puts the camera at
+    // the origin facing -Z and the projection alone is a usable view-proj.
+    #[test]
+    fn frustum_test_accepts_and_rejects() {
+        let vp = cgmath::perspective(cgmath::Deg(60.0f32), 1.0, 0.1, 100.0);
+
+        // Straight ahead, well inside.
+        assert!(sphere_in_frustum(vp, [0.0, 0.0, -10.0], 0.5));
+        // Behind the camera.
+        assert!(!sphere_in_frustum(vp, [0.0, 0.0, 10.0], 0.5));
+        // Far off to the side.
+        assert!(!sphere_in_frustum(vp, [100.0, 0.0, -10.0], 0.5));
+        // Beyond the far plane.
+        assert!(!sphere_in_frustum(vp, [0.0, 0.0, -500.0], 0.5));
+        // Behind the camera, but big enough to reach into the frustum.  This is
+        // the case that only passes when the planes are normalized: the radius
+        // has to be comparable against a true signed distance.
+        assert!(sphere_in_frustum(vp, [0.0, 0.0, 10.0], 50.0));
+    }
+
+    #[test]
+    fn cull_sphere_handles_empty_and_single() {
+        assert_eq!(fit_cull_sphere(&[]), ([0.0, 0.0, 0.0], 0.0));
+        let (center, radius) = fit_cull_sphere(&[at([3.0, 4.0, 5.0])]);
+        assert_eq!(center, [3.0, 4.0, 5.0]);
+        assert_eq!(radius, 0.0);
     }
 
     #[test]

@@ -32,6 +32,22 @@ struct SortGlobals {
     num_tiles: u32,       // ceil(num_elements / WG)
     _pad0: u32,
     _pad1: u32,
+    // Frustum cull inputs (see cs_compute_keys).
+    model: mat4x4<f32>,
+    frustum_planes: array<vec4<f32>, 6>,
+    // x: overall scale, y: splat scale, z: cloud scale, w: unused
+    cull_params: vec4<f32>,
+};
+
+// Indirect draw args the splat draw reads: vertex_count is a fixed 4 (one
+// triangle strip per splat) and cs_compute_keys tallies the splats that survive
+// the frustum cull into instance_count.  Keeping the count on the GPU is the
+// point -- reading it back to pick a draw size would stall on the GPU finishing.
+struct DrawArgs {
+    vertex_count: u32,
+    instance_count: atomic<u32>,
+    first_vertex: u32,
+    first_instance: u32,
 };
 
 struct Splat {
@@ -58,6 +74,7 @@ struct PassInfo {
 @group(0) @binding(5) var<storage, read_write> g_vals_out: array<u32>;
 @group(0) @binding(6) var<storage, read_write> g_hist: array<u32>;
 @group(0) @binding(7) var<storage, read_write> g_block_sums: array<u32>;
+@group(0) @binding(8) var<storage, read_write> g_draw_args: DrawArgs;
 @group(1) @binding(0) var<uniform> pass_info: PassInfo;
 
 // Map an IEEE-754 float to a u32 whose unsigned order matches the float's order:
@@ -158,22 +175,73 @@ fn run_start_of(li: u32, active_count: u32, shift: u32) -> u32 {
     return s_scan[li];
 }
 
+// Per-workgroup tally of surviving splats.  Each visible lane bumps this shared
+// counter, then one lane folds the subtotal into the global draw args -- 256
+// contended atomics collapse to one, which matters at ~2700 workgroups.
+var<workgroup> s_visible: atomic<u32>;
+
+// True when the splat's billboard is at least partly inside the frustum.  The
+// radius bound matches the vertex shader's: the quad offset is two perpendicular
+// terms, neither exceeding long_scale, so sqrt(2) * long_scale covers its reach.
+fn splat_visible(i: u32) -> bool {
+    let overall_scale = g.cull_params.x;
+    let local_pos = g_splats[i].position.xyz * overall_scale;
+    let world_pos = (g.model * vec4<f32>(local_pos, 1.0)).xyz;
+
+    let s = g_splats[i].scale_opacity.xyz;
+    let long_scale = max(s.x, max(s.y, s.z));
+    let radius = 1.41422 * long_scale * g.cull_params.y * overall_scale * g.cull_params.z;
+
+    for (var pi = 0u; pi < 6u; pi = pi + 1u) {
+        let plane = g.frustum_planes[pi];
+        if (dot(plane.xyz, world_pos) + plane.w + radius < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // -----------------------------------------------------------------------------
-// Phase 0: compute keys + payloads (run once per sort, before the digit passes).
+// Phase 0: compute keys + payloads, and frustum-cull (run once per sort, before
+// the digit passes).
 // -----------------------------------------------------------------------------
 @compute @workgroup_size(256)
-fn cs_compute_keys(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= g.num_elements) {
-        return;
+fn cs_compute_keys(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_index) li: u32,
+) {
+    if (li == 0u) {
+        atomicStore(&s_visible, 0u);
     }
-    let p = g_splats[i].position.xyz;
-    let depth = g.zc.x * p.x + g.zc.y * p.y + g.zc.z * p.z + g.zc.w;
-    // Ascending by depth, exactly as the old bitonic sort did: index 0 ends up the
-    // farthest splat, so the draw (alpha blending in index order) composites
-    // back-to-front.
-    g_keys_out[i] = float_key(depth);
-    g_vals_out[i] = i;
+    workgroupBarrier();
+
+    let i = gid.x;
+    if (i < g.num_elements) {
+        let p = g_splats[i].position.xyz;
+        let depth = g.zc.x * p.x + g.zc.y * p.y + g.zc.z * p.z + g.zc.w;
+
+        // Ascending by depth: index 0 ends up the farthest splat, so the draw
+        // (alpha blending in index order) composites back-to-front.  Culled
+        // splats take the maximum key instead, which parks them past every
+        // survivor; the draw only covers the first instance_count entries, so
+        // they are never read.  Survivors are clamped one below that sentinel so
+        // a degenerate (NaN) depth can't collide with it.
+        var key = 0xFFFFFFFFu;
+        if (splat_visible(i)) {
+            key = min(float_key(depth), 0xFFFFFFFEu);
+            atomicAdd(&s_visible, 1u);
+        }
+        g_keys_out[i] = key;
+        g_vals_out[i] = i;
+    }
+
+    workgroupBarrier();
+    if (li == 0u) {
+        let n = atomicLoad(&s_visible);
+        if (n > 0u) {
+            atomicAdd(&g_draw_args.instance_count, n);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

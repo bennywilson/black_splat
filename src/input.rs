@@ -145,6 +145,7 @@ impl InputManager {
             PhysicalKey::Code(KeyCode::KeyS) => "s",
             PhysicalKey::Code(KeyCode::KeyD) => "d",
             PhysicalKey::Code(KeyCode::Space) => "space",
+            PhysicalKey::Code(KeyCode::KeyB) => "b",
             PhysicalKey::Code(KeyCode::KeyH) => "h",
             PhysicalKey::Code(KeyCode::KeyL) => "l",
             PhysicalKey::Code(KeyCode::KeyM) => "m",
@@ -217,5 +218,37 @@ impl InputManager {
 
     pub fn get_mouse_position(&self) -> (i32, i32) {
         self.cursor_position
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // set_key_state translates a physical key through a fixed allowlist, so a key
+    // the game binds but the list omits silently never fires (it maps to "none"
+    // and is dropped).  Pin the ones the splat demo's hotkeys depend on.
+    #[test]
+    fn bound_hotkeys_are_in_the_key_allowlist() {
+        for (code, name) in [
+            (KeyCode::KeyB, "b"), // splat perf bisect
+            (KeyCode::KeyH, "h"),
+            (KeyCode::KeyL, "l"),
+            (KeyCode::KeyV, "v"),
+            (KeyCode::KeyY, "y"),
+            (KeyCode::KeyZ, "z"),
+            (KeyCode::Space, "space"),
+        ] {
+            let mut input = InputManager::new();
+            assert!(
+                input.set_key_state(PhysicalKey::Code(code), ElementState::Pressed),
+                "{name}: key not in the set_key_state allowlist"
+            );
+            assert_eq!(
+                input.get_key_state(name),
+                ButtonState::JustPressed,
+                "{name}: pressed but did not register as just_pressed"
+            );
+        }
     }
 }

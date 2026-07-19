@@ -181,7 +181,8 @@ pub struct PostProcessUniform {
     // Tonemap curve params: x HighlightScale (A), y MidtoneScale (B),
     // z HighlightCurve (C), w MidtoneCurve (D).  See postprocess_uber.wgsl.
     pub tonemap_abcd: [f32; 4],
-    // x ShadowOffset (E), y exposure (pre-tonemap multiply), z/w unused.
+    // x ShadowOffset (E), y exposure (pre-tonemap multiply),
+    // z upscale sharpen strength, w unused.
     pub tonemap_e_exposure: [f32; 4],
 }
 

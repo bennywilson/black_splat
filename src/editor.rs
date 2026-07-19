@@ -18,6 +18,8 @@ pub trait PropertyVisitor {
     /// A single scalar, edited as a drag value (never taken below zero -- the
     /// engine's floats are physical quantities like intensity or scale).
     fn edit_float(&mut self, name: &str, value: &mut f32) -> bool;
+    /// A whole-number count, edited as a drag value.
+    fn edit_int(&mut self, name: &str, value: &mut u32) -> bool;
     /// A checkbox.
     fn edit_bool(&mut self, name: &str, value: &mut bool) -> bool;
     fn edit_vec3(&mut self, name: &str, value: &mut CgVec3) -> bool;
@@ -102,6 +104,9 @@ macro_rules! editor_property {
     };
     ($self:ident, $visitor:ident, $field:ident, float, $label:literal) => {
         $visitor.edit_float($label, &mut $self.$field)
+    };
+    ($self:ident, $visitor:ident, $field:ident, int, $label:literal) => {
+        $visitor.edit_int($label, &mut $self.$field)
     };
     ($self:ident, $visitor:ident, $field:ident, bool, $label:literal) => {
         $visitor.edit_bool($label, &mut $self.$field)
@@ -206,6 +211,13 @@ impl PropertyVisitor for EguiPropertyEditor<'_> {
                     .range(0.0..=f32::MAX)
                     .max_decimals(3),
             )
+            .changed()
+    }
+
+    fn edit_int(&mut self, name: &str, value: &mut u32) -> bool {
+        self.ui.label(name);
+        self.ui
+            .add(egui::DragValue::new(value).speed(0.1))
             .changed()
     }
 

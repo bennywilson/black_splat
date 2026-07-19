@@ -23,9 +23,6 @@ const ADD_OBJECT_DISTANCE: f32 = 5.0;
 fn shadow_settings_from_config(config: &EditorConfig) -> ShadowSettings {
     ShadowSettings {
         resolution: config.shadow_resolution,
-        num_cascades: config.shadow_cascades,
-        distance: config.shadow_distance,
-        density: config.shadow_density,
     }
 }
 
@@ -377,12 +374,19 @@ fn draw_mode_switch(ui: &mut egui::Ui, editor_mode: &mut bool) {
     }
 }
 
-/// Whether this browser reports a touch screen.  Finger-friendly GUI sizing
-/// should only kick in on actual touch devices; desktop browsers keep egui's
-/// defaults so the GUI matches the native desktop build.
+/// Whether a finger is this browser's *primary* pointer.  Finger-friendly GUI
+/// sizing should only kick in there; desktop browsers keep egui's defaults so
+/// the GUI matches the native desktop build.  `pointer: coarse` rather than
+/// `maxTouchPoints > 0` because the latter is true for any touch-capable
+/// laptop or touch monitor, whose users still drive the GUI with a trackpad.
 #[cfg(target_arch = "wasm32")]
 fn is_touch_device() -> bool {
-    web_sys::window().is_some_and(|w| w.navigator().max_touch_points() > 0)
+    web_sys::window().is_some_and(|w| {
+        w.match_media("(pointer: coarse)")
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.matches())
+    })
 }
 
 /// Saves `json` through the browser's File System Access API
@@ -819,6 +823,14 @@ struct PostProcessDto {
     highlight_curve: f32,
     midtone_curve: f32,
     shadow_offset: f32,
+    // Scenes saved before the upscale sharpen existed get the engine default
+    // rather than 0.0, which would silently leave them unsharpened.
+    #[serde(default = "default_sharpen_strength")]
+    sharpen_strength: f32,
+}
+
+fn default_sharpen_strength() -> f32 {
+    PostProcessSettings::default().sharpen_strength
 }
 
 impl PostProcessDto {
@@ -831,6 +843,7 @@ impl PostProcessDto {
             highlight_curve: s.highlight_curve,
             midtone_curve: s.midtone_curve,
             shadow_offset: s.shadow_offset,
+            sharpen_strength: s.sharpen_strength,
         }
     }
 
@@ -843,6 +856,7 @@ impl PostProcessDto {
             highlight_curve: self.highlight_curve,
             midtone_curve: self.midtone_curve,
             shadow_offset: self.shadow_offset,
+            sharpen_strength: self.sharpen_strength,
         };
         // A hand-edited file could carry a non-invertible curve; snap it back.
         s.enforce_invertible();
@@ -887,6 +901,13 @@ struct LightDto {
     #[serde(default = "default_light_spot_angle")]
     spot_angle: f32,
     casts_shadow: bool,
+    // Directional-light cascade controls.
+    #[serde(default = "default_light_shadow_cascades")]
+    shadow_cascades: u32,
+    #[serde(default = "default_light_shadow_distance")]
+    shadow_distance: f32,
+    #[serde(default = "default_light_shadow_density")]
+    shadow_density: f32,
 }
 
 // Serde defaults for lights in pre-lighting scene files (match Light::new).
@@ -898,6 +919,15 @@ fn default_light_range() -> f32 {
 }
 fn default_light_spot_angle() -> f32 {
     30.0
+}
+fn default_light_shadow_cascades() -> u32 {
+    3
+}
+fn default_light_shadow_distance() -> f32 {
+    75.0
+}
+fn default_light_shadow_density() -> f32 {
+    1.0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1007,6 +1037,9 @@ fn default_startup_scene() -> SceneFile {
             range: default_light_range(),
             spot_angle: default_light_spot_angle(),
             casts_shadow: false,
+            shadow_cascades: default_light_shadow_cascades(),
+            shadow_distance: default_light_shadow_distance(),
+            shadow_density: default_light_shadow_density(),
         }],
         particles: Vec::new(),
         splats: vec![SplatDto {
@@ -3266,6 +3299,9 @@ impl SplatGame {
                     range: l.get_range(),
                     spot_angle: l.get_spot_angle(),
                     casts_shadow: l.casts_shadow(),
+                    shadow_cascades: l.shadow_cascades(),
+                    shadow_distance: l.shadow_distance(),
+                    shadow_density: l.shadow_density(),
                 })
                 .collect(),
             particles: self
@@ -4037,24 +4073,20 @@ impl GameEngine for SplatGame {
         // --- GUI (egui, same on native + web) ---
         let ctx = renderer.egui_ctx().clone();
 
-        // Web pixels-per-point: egui defaults ppp to the browser's
-        // devicePixelRatio, so the UI's on-screen size swings with the user's
-        // monitor DPI / browser zoom -- on a HiDPI display (DPR 2) the fixed
-        // 1920x1080 canvas has half the layout "points" and every panel
-        // balloons, unlike native where the window is logical-sized. Pin ppp to
-        // a fixed design-space *height* instead so layout is deterministic
-        // regardless of DPR: a shorter design space = fewer points = bigger
-        // widgets. Desktop mirrors native's default 720-pt-tall window; phones
-        // and tablets get a shorter, finger-friendly space plus enlarged
-        // interactive sizing (on the global style so dropdown popups inherit
-        // it). Bump WEB_DESIGN_H down to make the desktop web UI larger.
+        // Web pixels-per-point: the canvas is sized in *physical* pixels
+        // (`css_px * devicePixelRatio`, see index.html), so egui needs ppp =
+        // DPR for one point to equal one CSS pixel -- which is what
+        // egui_winit's window-scale-factor ppp gives the native build, so the
+        // two match at any window size. Touch devices then get a flat zoom
+        // bump plus enlarged interactive sizing (on the global style so
+        // dropdown popups inherit it). Raise TOUCH_ZOOM for a bigger phone UI.
         #[cfg(target_arch = "wasm32")]
         {
-            const WEB_DESIGN_H: f32 = 720.0; // desktop: match native's default
-            const TOUCH_DESIGN_H: f32 = 480.0; // phones/tablets: bigger UI
+            const TOUCH_ZOOM: f32 = 1.5;
             let touch = is_touch_device();
-            let design_h = if touch { TOUCH_DESIGN_H } else { WEB_DESIGN_H };
-            ctx.set_pixels_per_point((game_config.window_height as f32 / design_h).max(0.5));
+            let dpr = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio() as f32);
+            let zoom = if touch { TOUCH_ZOOM } else { 1.0 };
+            ctx.set_pixels_per_point((dpr * zoom).max(0.5));
             if touch {
                 ctx.all_styles_mut(|s| {
                     s.spacing.button_padding = egui::vec2(16.0, 12.0);
@@ -5461,9 +5493,9 @@ impl GameEngine for SplatGame {
                                             .text("sprint ×"),
                                         );
 
-                                        // Global shadow quality; per-light
-                                        // casting stays on the light's own
-                                        // "Casts Shadow" checkbox in Details.
+                                        // Global shadow map size; casting and
+                                        // the cascade controls stay on the
+                                        // light's own properties in Details.
                                         ui.add_space(12.0);
                                         ui.label(egui::RichText::new("Shadows").strong());
                                         let mut shadows_changed = false;
@@ -5485,36 +5517,6 @@ impl GameEngine for SplatGame {
                                                         .changed();
                                                 }
                                             });
-                                        shadows_changed |= ui
-                                            .add(
-                                                egui::Slider::new(
-                                                    &mut self.editor_config.shadow_cascades,
-                                                    1..=4,
-                                                )
-                                                .text("cascades"),
-                                            )
-                                            .changed();
-                                        shadows_changed |= ui
-                                            .add(
-                                                egui::Slider::new(
-                                                    &mut self.editor_config.shadow_distance,
-                                                    10.0..=300.0,
-                                                )
-                                                .logarithmic(true)
-                                                .text("distance"),
-                                            )
-                                            .changed();
-                                        // Shadow-catcher darkness: how black the
-                                        // CG objects' shadows land on the splats.
-                                        shadows_changed |= ui
-                                            .add(
-                                                egui::Slider::new(
-                                                    &mut self.editor_config.shadow_density,
-                                                    0.0..=4.0,
-                                                )
-                                                .text("density"),
-                                            )
-                                            .changed();
                                         if shadows_changed {
                                             renderer.set_shadow_settings(
                                                 &shadow_settings_from_config(
@@ -6639,6 +6641,15 @@ impl GameEngine for SplatGame {
         // whose result arrives via `picked_ply` on a later tick.
         if do_load || (raw_hotkeys_ok && input_manager.get_key_state("l").just_pressed()) {
             self.open_ply_picker();
+        }
+
+        // [B] cycles the splat perf bisect (see SplatBisect): each step drops one
+        // stage of the splat pass so the fps delta prices that stage.  The HUD
+        // banners whichever stage is currently being skipped.
+        if raw_hotkeys_ok && input_manager.get_key_state("b").just_pressed() {
+            if let Some(label) = renderer.cycle_splat_bisect() {
+                log!("Splat bisect: {label}");
+            }
         }
         let picked = self.picked_ply.lock().unwrap().take();
         if let Some((file_name, path, bytes)) = picked {

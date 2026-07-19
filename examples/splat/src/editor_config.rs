@@ -33,14 +33,10 @@ const CONFIG_KEYS: [&str; 3] = ["gizmo_translate", "gizmo_rotate", "gizmo_scale"
 pub struct EditorConfig {
     /// Hotkey per [`GIZMO_ACTIONS`] slot.  Kept distinct by [`rebind`](Self::rebind).
     pub gizmo_keys: [egui::Key; 3],
-    /// Shadow quality (Settings tab > Shadows), pushed to the renderer's
-    /// `ShadowSettings` at startup and whenever edited.
+    /// Shadow tile resolution (Settings tab > Shadows), pushed to the
+    /// renderer's `ShadowSettings` at startup and whenever edited.  The rest of
+    /// the shadow controls are per-light and live in the scene, not here.
     pub shadow_resolution: u32,
-    pub shadow_cascades: u32,
-    pub shadow_distance: f32,
-    /// How black shadow-catcher shadows land (a multiplier on the projected
-    /// darkening); 1 = as projected, higher = darker.
-    pub shadow_density: f32,
 }
 
 impl Default for EditorConfig {
@@ -50,9 +46,6 @@ impl Default for EditorConfig {
             gizmo_keys: [egui::Key::W, egui::Key::E, egui::Key::R],
             // Mirrors black_splat::passes::deferred::ShadowSettings::default().
             shadow_resolution: 1024,
-            shadow_cascades: 3,
-            shadow_distance: 75.0,
-            shadow_density: 1.0,
         }
     }
 }
@@ -82,9 +75,6 @@ impl EditorConfig {
             text.push_str(&format!("{id} = {}\n", self.gizmo_keys[slot].name()));
         }
         text.push_str(&format!("shadow_resolution = {}\n", self.shadow_resolution));
-        text.push_str(&format!("shadow_cascades = {}\n", self.shadow_cascades));
-        text.push_str(&format!("shadow_distance = {}\n", self.shadow_distance));
-        text.push_str(&format!("shadow_density = {}\n", self.shadow_density));
         text
     }
 
@@ -108,18 +98,6 @@ impl EditorConfig {
             } else if name == "shadow_resolution" {
                 if let Ok(v) = value.parse() {
                     config.shadow_resolution = v;
-                }
-            } else if name == "shadow_cascades" {
-                if let Ok(v) = value.parse() {
-                    config.shadow_cascades = v;
-                }
-            } else if name == "shadow_distance" {
-                if let Ok(v) = value.parse() {
-                    config.shadow_distance = v;
-                }
-            } else if name == "shadow_density" {
-                if let Ok(v) = value.parse() {
-                    config.shadow_density = v;
                 }
             }
         }

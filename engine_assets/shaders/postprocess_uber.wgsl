@@ -40,7 +40,8 @@ struct PostProcessUniform {
     // Tonemap curve: x A (HighlightScale), y B (MidtoneScale),
     // z C (HighlightCurve), w D (MidtoneCurve).
     tonemap_abcd: vec4<f32>,
-    // x E (ShadowOffset), y exposure (pre-tonemap multiply).
+    // x E (ShadowOffset), y exposure (pre-tonemap multiply),
+    // z upscale sharpen strength (0 disables).
     tonemap_e_exposure: vec4<f32>,
 };
 @group(1) @binding(0)
@@ -86,16 +87,99 @@ fn tonemap(in_c: vec3<f32>) -> vec3<f32> {
     return clamp(num / denom, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// `s_diffuse` is shared with the (Repeat-addressed) filter texture, so scene
+// taps that reach past the edge have to be clamped here instead -- the wide
+// Catmull-Rom kernel below reads up to 2 texels outside the fragment's uv.
+fn clamp_scene_uv(uv: vec2<f32>) -> vec2<f32> {
+    let half_texel = 0.5 / vec2<f32>(textureDimensions(t_scene_color));
+    return clamp(uv, half_texel, vec2<f32>(1.0) - half_texel);
+}
+
+// The scene renders at `render_scale` and this pass runs at surface size, so
+// every fragment is an upscale tap.  Catmull-Rom keeps far more edge definition
+// than the bilinear the sampler would give us on its own; the standard 9-tap
+// form leans on bilinear filtering to fold the 4x4 kernel into 3x3 fetches.
+fn sample_scene_catmull_rom(uv: vec2<f32>) -> vec4<f32> {
+    let tex_size = vec2<f32>(textureDimensions(t_scene_color));
+    let sample_pos = uv * tex_size;
+    let tex_pos1 = floor(sample_pos - 0.5) + 0.5;
+    let f = sample_pos - tex_pos1;
+
+    // Catmull-Rom basis weights for the 4 taps along each axis.
+    let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    let w3 = f * f * (-0.5 + 0.5 * f);
+
+    // Middle two taps collapse into one bilinear fetch at their weighted centre.
+    let w12 = w1 + w2;
+    let offset12 = w2 / w12;
+
+    let tex_pos0 = (tex_pos1 - 1.0) / tex_size;
+    let tex_pos3 = (tex_pos1 + 2.0) / tex_size;
+    let tex_pos12 = (tex_pos1 + offset12) / tex_size;
+
+    var result = vec4<f32>(0.0);
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos0.x, tex_pos0.y))) * w0.x * w0.y;
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos12.x, tex_pos0.y))) * w12.x * w0.y;
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos3.x, tex_pos0.y))) * w3.x * w0.y;
+
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos0.x, tex_pos12.y))) * w0.x * w12.y;
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos12.x, tex_pos12.y))) * w12.x * w12.y;
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos3.x, tex_pos12.y))) * w3.x * w12.y;
+
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos0.x, tex_pos3.y))) * w0.x * w3.y;
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos12.x, tex_pos3.y))) * w12.x * w3.y;
+    result += textureSample(t_scene_color, s_diffuse, clamp_scene_uv(vec2<f32>(tex_pos3.x, tex_pos3.y))) * w3.x * w3.y;
+
+    // The w0/w3 lobes are negative, so the sum can undershoot into negatives on
+    // a hard edge -- clamping keeps the HDR value physical for the tonemapper.
+    return max(result, vec4<f32>(0.0));
+}
+
+// Scene colour in display space (post-tonemap), for the sharpen taps below.
+fn scene_display(uv: vec2<f32>) -> vec3<f32> {
+    var c = textureSample(t_scene_color, s_diffuse, clamp_scene_uv(uv)).rgb;
+    if (postprocess_buffer.time_mode_srgb_tonemap.w > 0.5) {
+        c = tonemap(c);
+    }
+    return c;
+}
+
+// RCAS-style contrast-limited sharpen, recovering the acutance the upscale
+// costs.  A plain unsharp mask rings on high-contrast edges, so the result is
+// clamped to the neighbourhood's own min/max -- it can steepen an edge but
+// never overshoot past the values already there.
+//
+// Taps are spaced one *source* texel apart: the source resolution is the real
+// detail limit, so that is the scale worth sharpening.  Centre comes from the
+// Catmull-Rom fetch while the neighbours are plain bilinear, which the limiter
+// tolerates and which keeps this to 4 extra taps.
+fn sharpen(center: vec3<f32>, uv: vec2<f32>, strength: f32) -> vec3<f32> {
+    let texel = 1.0 / vec2<f32>(textureDimensions(t_scene_color));
+
+    let up = scene_display(uv - vec2<f32>(0.0, texel.y));
+    let down = scene_display(uv + vec2<f32>(0.0, texel.y));
+    let left = scene_display(uv - vec2<f32>(texel.x, 0.0));
+    let right = scene_display(uv + vec2<f32>(texel.x, 0.0));
+
+    let laplacian = center * 4.0 - (up + down + left + right);
+    let sharpened = center + laplacian * strength;
+
+    let lo = min(min(up, down), min(left, right));
+    let hi = max(max(up, down), max(left, right));
+    return clamp(sharpened, min(lo, center), max(hi, center));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var uv : vec2<f32> = in.tex_coords;
-    var outColor: vec4<f32> = textureSample(t_scene_color, s_diffuse, uv);
+    var outColor: vec4<f32> = sample_scene_catmull_rom(uv);
 
     var postprocess_mode: i32 = get_postprocess_mode(postprocess_buffer.time_mode_srgb_tonemap.y);
 
     if (postprocess_mode == 1) {
-        outColor = textureSample(t_scene_color, s_diffuse, uv);
         outColor.x = dot(outColor.xyz, vec3<f32>(0.3,0.59,0.11));
         outColor.y = outColor.x;
         outColor.z = outColor.x;
@@ -122,6 +206,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Tonemap in linear space before any sRGB encode (w > 0.5 enables it).
     if (postprocess_buffer.time_mode_srgb_tonemap.w > 0.5) {
         outColor = vec4<f32>(tonemap(outColor.rgb), outColor.a);
+    }
+
+    // Sharpen in display space, where the curve has already compressed the
+    // highlights -- sharpening raw HDR lets one bright pixel dominate its
+    // neighbourhood.  Mode 0 only: the CRT/warp modes resample or overlay on
+    // their own terms and a sharpen filter just fights them.
+    let sharpen_strength = postprocess_buffer.tonemap_e_exposure.z;
+    if (postprocess_mode == 0 && sharpen_strength > 0.0) {
+        outColor = vec4<f32>(sharpen(outColor.rgb, uv, sharpen_strength), outColor.a);
     }
 
     // .z flags a non-sRGB surface: encode here so colors aren't displayed dark.

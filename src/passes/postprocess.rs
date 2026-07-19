@@ -25,6 +25,11 @@ pub struct PostProcessSettings {
     pub highlight_curve: f32, // C
     pub midtone_curve: f32,   // D
     pub shadow_offset: f32,   // E
+    /// Strength of the post-upscale sharpen (0 disables).  The scene renders at
+    /// `render_scale` and the postprocess pass upscales it with a Catmull-Rom
+    /// kernel; this wins back the acutance that costs.  Above ~0.5 the limiter
+    /// stops hiding the sharpening halos.
+    pub sharpen_strength: f32,
 }
 
 impl Default for PostProcessSettings {
@@ -39,6 +44,7 @@ impl Default for PostProcessSettings {
             highlight_curve: 2.43,
             midtone_curve: 0.59,
             shadow_offset: 0.14,
+            sharpen_strength: 0.25,
         }
     }
 }
@@ -57,6 +63,7 @@ impl PostProcessSettings {
         self.midtone_scale = self.midtone_scale.max(0.0);
         self.midtone_curve = self.midtone_curve.max(0.0);
         self.exposure = self.exposure.max(1e-3);
+        self.sharpen_strength = self.sharpen_strength.clamp(0.0, 1.0);
 
         // A/C >= 1: display white is reachable.
         self.highlight_scale = self.highlight_scale.max(self.highlight_curve);
@@ -74,6 +81,7 @@ crate::editor_properties!(PostProcessSettings {
     highlight_curve: float("Highlight Curve"),
     midtone_curve: float("Midtone Curve"),
     shadow_offset: float("Shadow Offset"),
+    sharpen_strength: float("Upscale Sharpen"),
 });
 
 pub struct PostprocessPass {
@@ -357,7 +365,8 @@ impl PostprocessPass {
             s.highlight_curve,
             s.midtone_curve,
         ];
-        self.postprocess_uniform.tonemap_e_exposure = [s.shadow_offset, s.exposure, 0.0, 0.0];
+        self.postprocess_uniform.tonemap_e_exposure =
+            [s.shadow_offset, s.exposure, s.sharpen_strength, 0.0];
 
         device_resources.queue.write_buffer(
             &self.uniform_buffer,
