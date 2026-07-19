@@ -8,6 +8,7 @@ use black_splat::{
     egui, assets::*, config::*, editor::{self, EditorChoice, GizmoSpace, TransformGizmo}, engine::*,
     fly_camera::*, game_object::*, input::*, mujoco::{MjcfBundle, MujocoScene}, renderer::*, resource::SceneLayer,
     touch_pads::*, trajectory::RetargetedClip, utils::*, log,
+    passes::ambient::AmbientSettings,
     passes::deferred::ShadowSettings,
     passes::gaussian_splat::SplatParams,
     passes::postprocess::PostProcessSettings,
@@ -811,6 +812,8 @@ struct SceneFile {
     mujoco_actors: Vec<MujocoActorDto>,
     #[serde(default)]
     post_process: Option<PostProcessDto>,
+    #[serde(default)]
+    ambient: Option<AmbientDto>,
 }
 
 /// Serialized scene-wide post-process / tonemap settings (see PostProcessSettings).
@@ -861,6 +864,39 @@ impl PostProcessDto {
         // A hand-edited file could carry a non-invertible curve; snap it back.
         s.enforce_invertible();
         s
+    }
+}
+
+/// Serialized screen-space AO / diffuse-GI toggles (see AmbientSettings).
+#[derive(Serialize, Deserialize)]
+struct AmbientDto {
+    ssao_enabled: bool,
+    ssgi_enabled: bool,
+    // Scenes saved before this existed get the engine default (1.0) rather
+    // than 0.0, which would silently zero out their GI.
+    #[serde(default = "default_gi_intensity")]
+    gi_intensity: f32,
+}
+
+fn default_gi_intensity() -> f32 {
+    AmbientSettings::default().gi_intensity
+}
+
+impl AmbientDto {
+    fn from_settings(s: &AmbientSettings) -> Self {
+        Self {
+            ssao_enabled: s.ssao_enabled,
+            ssgi_enabled: s.ssgi_enabled,
+            gi_intensity: s.gi_intensity,
+        }
+    }
+
+    fn to_settings(&self) -> AmbientSettings {
+        AmbientSettings {
+            ssao_enabled: self.ssao_enabled,
+            ssgi_enabled: self.ssgi_enabled,
+            gi_intensity: self.gi_intensity,
+        }
     }
 }
 
@@ -1054,6 +1090,7 @@ fn default_startup_scene() -> SceneFile {
         }],
         mujoco_actors: Vec::new(),
         post_process: None,
+        ambient: None,
     }
 }
 
@@ -1518,6 +1555,10 @@ pub struct SplatGame {
     // Scene-wide post-process / tonemap settings -- the singleton "Post Process"
     // scene object.  Pushed to the renderer each frame
     scene_post_process: PostProcessSettings,
+    // Screen-space AO / diffuse-GI toggles, edited alongside Post Process in
+    // the same panel. Not a selectable scene object (no undo/redo) -- it's a
+    // renderer-wide switch, not per-scene-object state.
+    scene_ambient: AmbientSettings,
 
     // Undo/redo history
     undo_stack: UndoStack,
@@ -3351,6 +3392,7 @@ impl SplatGame {
                 })
                 .collect(),
             post_process: Some(PostProcessDto::from_settings(&self.scene_post_process)),
+            ambient: Some(AmbientDto::from_settings(&self.scene_ambient)),
         }
     }
 
@@ -3444,6 +3486,8 @@ impl SplatGame {
         // it in apply_scene_objects.
         self.scene_post_process = PostProcessSettings::default();
         renderer.set_post_process_settings(&self.scene_post_process);
+        self.scene_ambient = AmbientSettings::default();
+        renderer.set_ambient_settings(&self.scene_ambient);
     }
 
     /// Rebuilds the editable scene objects (actors / lights / particles +
@@ -3552,6 +3596,12 @@ impl SplatGame {
             self.scene_post_process = pp.to_settings();
         }
         renderer.set_post_process_settings(&self.scene_post_process);
+        // Same story for the ambient AO/GI toggles: absent in older scenes,
+        // keep whatever's currently running.
+        if let Some(amb) = &scene.ambient {
+            self.scene_ambient = amb.to_settings();
+        }
+        renderer.set_ambient_settings(&self.scene_ambient);
     }
 
     /// The world transform a splat DTO describes (scale collapsed to uniform).
@@ -3811,6 +3861,7 @@ impl GameEngine for SplatGame {
             scene_lights: Vec::new(),
             scene_particles: Vec::new(),
             scene_post_process: PostProcessSettings::default(),
+            scene_ambient: AmbientSettings::default(),
             undo_stack: UndoStack::default(),
             pending_gizmo_edit: None,
             pending_property_edit: None,
@@ -5279,6 +5330,23 @@ impl GameEngine for SplatGame {
                                             }
                                             selection_edited |= changed;
                                             details_edited |= changed;
+
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new("Screen-Space Ambient")
+                                                    .strong(),
+                                            );
+                                            let ambient_changed = editor::draw_properties(
+                                                ui,
+                                                &mut self.scene_ambient,
+                                                &model_catalog,
+                                                &material_resources,
+                                                selected_model,
+                                                &mut model_pick_request,
+                                            );
+                                            if ambient_changed {
+                                                renderer.set_ambient_settings(&self.scene_ambient);
+                                            }
                                         }
                                         None => {
                                             ui.label("Nothing selected.");

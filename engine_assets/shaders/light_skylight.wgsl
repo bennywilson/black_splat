@@ -29,6 +29,13 @@ var t_normal: texture_2d<f32>;
 var t_spec: texture_2d<f32>;
 @group(0) @binding(3)
 var t_depth: texture_depth_2d;
+// AmbientPass's per-frame screen-space AO + single-bounce diffuse GI (see
+// ambient.rs / ambient_probe.wgsl) -- local, dynamic ambient on top of this
+// baked cubemap's static SH/reflection terms.
+@group(0) @binding(5)
+var t_ao: texture_2d<f32>;
+@group(0) @binding(6)
+var t_gi: texture_2d<f32>;
 
 @group(1) @binding(0)
 var<uniform> light: LightUniform;
@@ -130,6 +137,18 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let refl_up_ness = bent_reflect_dir.y * 0.5 + 0.5;
         refl = mix(light.color2.rgb, light.color_cone.rgb, refl_up_ness);
     }
+
+    // Local, dynamic ambient from AmbientPass on top of the static term
+    // above: AO darkens creases/contact points, GI adds nearby color bleed
+    // (or the baked SH irradiance again, for rays that miss all on-screen
+    // geometry -- see ambient_probe.wgsl). Specular is left unmodified by
+    // AO for now.
+    // GI is also multiplied by AO: a crease occluded from the sky is occluded
+    // from bounce light too, and without this GI's speckle noise showed
+    // through untouched in exactly the corners AO was supposed to darken.
+    let ao = textureLoad(t_ao, coords, 0).r;
+    let gi = textureLoad(t_gi, coords, 0).rgb;
+    sky = (sky + gi) * ao;
 
     // Schlick Fresnel split between diffuse ambient (rolls off with
     // metallic) and the specular reflection above -- otherwise fully

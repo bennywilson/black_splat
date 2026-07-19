@@ -1826,6 +1826,7 @@ impl LightingPass {
         device_resources: &DeviceResources<'_>,
         asset_manager: &mut AssetManager,
         shadow_pass: &ShadowPass,
+        ambient_pass: &crate::passes::ambient::AmbientPass,
     ) -> Self {
         log!("Creating LightingPass");
         let device = &device_resources.device;
@@ -1885,6 +1886,29 @@ impl LightingPass {
                         },
                         count: None,
                     },
+                    // AmbientPass's per-frame AO + screen-space diffuse GI
+                    // (see ambient.rs / ambient_probe.wgsl), sampled by the
+                    // skylight shader alongside its baked-cubemap ambient.
+                    BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: false },
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("LightingPass_gbuffer_bind_group_layout"),
             });
@@ -1892,6 +1916,7 @@ impl LightingPass {
             device_resources,
             &gbuffer_bind_group_layout,
             shadow_pass,
+            ambient_pass,
         );
 
         let light_bind_group_layout =
@@ -2435,6 +2460,7 @@ impl LightingPass {
         device_resources: &DeviceResources,
         layout: &wgpu::BindGroupLayout,
         shadow_pass: &ShadowPass,
+        ambient_pass: &crate::passes::ambient::AmbientPass,
     ) -> wgpu::BindGroup {
         device_resources
             .device
@@ -2471,18 +2497,32 @@ impl LightingPass {
                             &shadow_pass.mask_temp.view,
                         ),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&ambient_pass.ao_texture.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&ambient_pass.gi_texture.view),
+                    },
                 ],
                 label: Some("LightingPass_gbuffer_bind_group"),
             })
     }
 
-    /// Rebind the (recreated) G-buffer / depth / shadow-mask textures after a
-    /// window resize.
-    pub fn resize(&mut self, device_resources: &DeviceResources, shadow_pass: &ShadowPass) {
+    /// Rebind the (recreated) G-buffer / depth / shadow-mask / ambient AO+GI
+    /// textures after a window resize.
+    pub fn resize(
+        &mut self,
+        device_resources: &DeviceResources,
+        shadow_pass: &ShadowPass,
+        ambient_pass: &crate::passes::ambient::AmbientPass,
+    ) {
         self.gbuffer_bind_group = Self::make_gbuffer_bind_group(
             device_resources,
             &self.gbuffer_bind_group_layout,
             shadow_pass,
+            ambient_pass,
         );
     }
 

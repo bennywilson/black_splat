@@ -29,6 +29,7 @@ pub mod text_agent;
 pub mod touch_pads;
 pub mod utils;
 pub mod passes {
+    pub mod ambient;
     pub mod bullet_hole;
     pub mod deferred;
     pub mod gaussian_splat;

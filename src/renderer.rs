@@ -10,7 +10,7 @@ use crate::{
     utils::*,
     log,
     passes::{
-        bullet_hole::*, deferred::*, gaussian_splat::*, line::*, model::*,
+        ambient::*, bullet_hole::*, deferred::*, gaussian_splat::*, line::*, model::*,
         postprocess::*, splat_composite::*, sprite::*, sunbeam::*,
     },
     PERF_SCOPE,
@@ -36,6 +36,10 @@ pub struct Renderer<'a> {
     // gaussian_splat_pass below).
     gbuffer_pass: Option<GBufferPass>,
     shadow_pass: Option<ShadowPass>,
+    // Local screen-space AO + diffuse GI, read by lighting_pass's skylight
+    // shader (see passes::ambient). Built/rendered alongside the rest of the
+    // deferred trio; None wherever they are.
+    ambient_pass: Option<AmbientPass>,
     lighting_pass: Option<LightingPass>,
     // Games opt in via set_deferred_world_enabled (the splat editor does; it
     // registers scene lights).  Off, World-layer actors render through the
@@ -172,14 +176,25 @@ impl<'a> Renderer<'a> {
         // GL (the 2D demo's backend) can't run the deferred shadow/lighting
         // pipeline -- see the field comments on gbuffer_pass et al.
         let deferred_supported = device_resources.adapter.get_info().backend != wgpu::Backend::Gl;
-        let (gbuffer_pass, shadow_pass, lighting_pass) = if deferred_supported {
+        let (gbuffer_pass, shadow_pass, ambient_pass, lighting_pass) = if deferred_supported {
             let gbuffer_pass = GBufferPass::new(&device_resources, &mut asset_manager).await;
             let shadow_pass = ShadowPass::new(&device_resources, &mut asset_manager).await;
-            let lighting_pass =
-                LightingPass::new(&device_resources, &mut asset_manager, &shadow_pass).await;
-            (Some(gbuffer_pass), Some(shadow_pass), Some(lighting_pass))
+            let ambient_pass = AmbientPass::new(&device_resources, &mut asset_manager).await;
+            let lighting_pass = LightingPass::new(
+                &device_resources,
+                &mut asset_manager,
+                &shadow_pass,
+                &ambient_pass,
+            )
+            .await;
+            (
+                Some(gbuffer_pass),
+                Some(shadow_pass),
+                Some(ambient_pass),
+                Some(lighting_pass),
+            )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let debug_lines = Vec::<Line>::new();
@@ -200,6 +215,7 @@ impl<'a> Renderer<'a> {
             model_with_holes_pass,
             gbuffer_pass,
             shadow_pass,
+            ambient_pass,
             lighting_pass,
             deferred_world_enabled: false,
             postprocess_pass,
@@ -653,6 +669,14 @@ impl<'a> Renderer<'a> {
                 gbuffer_pass.render(&mut ctx, &self.actor_map);
             }
             {
+                PERF_SCOPE!("Ambient AO+GI");
+                self.ambient_pass.as_mut().unwrap().render(
+                    &mut ctx,
+                    &self.light_map,
+                    &self.env_cubemaps,
+                );
+            }
+            {
                 PERF_SCOPE!("Deferred Lighting");
                 self.lighting_pass.as_mut().unwrap().render(
                     &mut ctx,
@@ -859,10 +883,15 @@ impl<'a> Renderer<'a> {
         if let Some(shadow_pass) = self.shadow_pass.as_mut() {
             shadow_pass.resize(&self.device_resources);
         }
-        if let (Some(lighting_pass), Some(shadow_pass)) =
-            (self.lighting_pass.as_mut(), self.shadow_pass.as_ref())
-        {
-            lighting_pass.resize(&self.device_resources, shadow_pass);
+        if let Some(ambient_pass) = self.ambient_pass.as_mut() {
+            ambient_pass.resize(&self.device_resources);
+        }
+        if let (Some(lighting_pass), Some(shadow_pass), Some(ambient_pass)) = (
+            self.lighting_pass.as_mut(),
+            self.shadow_pass.as_ref(),
+            self.ambient_pass.as_ref(),
+        ) {
+            lighting_pass.resize(&self.device_resources, shadow_pass, ambient_pass);
         }
         self.sunbeam_pass.resize(&mut self.device_resources, &self.asset_manager);
         if let Some(composite_pass) = self.splat_composite_pass.as_mut() {
@@ -978,6 +1007,11 @@ impl<'a> Renderer<'a> {
                 .as_mut()
                 .unwrap()
                 .render(&mut ctx, &filtered_actors);
+            self.ambient_pass.as_mut().unwrap().render(
+                &mut ctx,
+                &self.light_map,
+                &self.env_cubemaps,
+            );
             self.lighting_pass.as_mut().unwrap().render(
                 &mut ctx,
                 &self.light_map,
@@ -1742,6 +1776,16 @@ impl<'a> Renderer<'a> {
     /// The current scene post-process/tonemap settings.
     pub fn post_process_settings(&self) -> PostProcessSettings {
         self.postprocess_pass.settings
+    }
+
+    /// Sets the screen-space AO / diffuse-GI toggles (see `AmbientSettings`).
+    pub fn set_ambient_settings(&mut self, settings: &AmbientSettings) {
+        self.ambient_pass.as_mut().unwrap().settings = *settings;
+    }
+
+    /// The current screen-space AO / diffuse-GI toggles.
+    pub fn ambient_settings(&self) -> AmbientSettings {
+        self.ambient_pass.as_ref().unwrap().settings
     }
 
     pub async fn add_sprite_pass(
