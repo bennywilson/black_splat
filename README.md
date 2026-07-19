@@ -55,6 +55,24 @@ no-cache headers so you always get the fresh build — no incognito needed).
 | 2D / 3D | WebGL2 | Any modern browser; works over plain http |
 | Gaussian splats | WebGPU | A WebGPU browser (iOS 18.2+ / Chrome / Safari 18+) **and an HTTPS (secure) context** — the GPU radix sort uses compute shaders + storage buffers, which WebGL2 lacks |
 
+### Laptops: point the browser at the discrete GPU
+
+On a laptop with switchable graphics, Windows decides per-application which GPU a
+process gets, and browsers usually default to the integrated one. The native
+build asks for the discrete GPU itself (`"graphics_power_pref": "high"`), but
+that setting lives inside our process and cannot move Chrome — so the same scene
+can be an order of magnitude slower in the browser than natively on the *same
+machine*. The splat pass is fragment-bound, which is the worst case for an iGPU.
+
+To check: open `chrome://gpu` and look at the `GPU0`/`GPU1` lines for which one
+is marked `*ACTIVE*`. ("WebGPU: Hardware accelerated" only rules out a software
+fallback; it does not tell you which adapter.)
+
+To fix: **Settings → System → Display → Graphics**, add the browser, set it to
+**High performance** (or use the NVIDIA Control Panel's Program Settings). Then
+quit *every* browser process and relaunch — a background one keeps the old
+assignment alive — and re-check `chrome://gpu`.
+
 ### Testing on a phone
 
 The `serve.py` server binds all interfaces, so any device on your Wi-Fi can reach it.
@@ -72,6 +90,18 @@ The `serve.py` server binds all interfaces, so any device on your Wi-Fi can reac
   the phone camera to skip typing the URL. The tunnel URL stays valid across
   rebuilds, so you can bookmark it once and just refresh; it only changes when you
   restart the tunnel.
+
+**If the canvas is black but the tunnel URL loads,** the phone's browser probably
+doesn't have WebGPU on. It ships enabled on recent versions, so updating the OS or
+browser is the first thing to try; failing that:
+
+- **iOS/iPadOS Safari:** enabled by default on 18.2+. On older versions,
+  **Settings → Apps → Safari → Advanced → Feature Flags → WebGPU**.
+- **Android Chrome:** enabled by default on recent builds. Otherwise open
+  `chrome://flags`, search for `#enable-unsafe-webgpu`, enable it, and relaunch.
+
+To confirm from the phone itself, load <https://webgpureport.org> — it reports
+whether `navigator.gpu` exists and which adapter it got.
 
 ## Config File
 

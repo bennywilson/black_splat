@@ -51,14 +51,25 @@ fn quat_axes(q_in: vec4<f32>) -> array<vec3<f32>, 3> {
 // instead of the six a triangle list needs, so the vertex shader runs 4x per
 // splat rather than 6x.  Winding alternates between the two triangles, which is
 // fine here -- the splat pipeline sets cull_mode: None.
+//
+// Derived arithmetically rather than looked up in a local array: the corner id's
+// low bit is the x sign and its second bit is the y sign, which lands the same
+// four corners with no indexable storage.  See pick3 for why that matters.
 fn get_vertex_corner(corner_id: u32) -> vec2<f32> {
-    var offsets = array<vec2<f32>, 4>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>( 1.0,  1.0),
-    );
-    return offsets[corner_id];
+    let sx = f32(corner_id & 1u);
+    let sy = f32((corner_id >> 1u) & 1u);
+    return vec2<f32>(sx * 2.0 - 1.0, sy * 2.0 - 1.0);
+}
+
+// Select one of three vectors by a runtime index without an array.
+//
+// Indexing a local array by a non-constant makes the array addressable, so it
+// cannot live in registers; WebGPU's mandated bounds clamps make backends
+// especially reluctant to promote it, and it lands in per-invocation scratch
+// memory instead.  Two `select`s compile to branchless register moves, which
+// keeps the axes in registers.
+fn pick3(a0: vec3<f32>, a1: vec3<f32>, a2: vec3<f32>, idx: i32) -> vec3<f32> {
+    return select(select(a0, a1, idx == 1), a2, idx == 2);
 }
 
 // RGB triple of higher-order SH coefficient `n` (0..7), read straight from storage.
@@ -154,11 +165,11 @@ fn vs_main(
 
     let cloud_rot = mat3x3<f32>(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz) * (1.0 / max(cloud_scale, 0.000001));
 
-    // Note: Dynamic indexing into an array requires a var instead of let on naga/Vulkan
-    var axes = quat_axes(g_splats[splat_id].rotation);
-    axes[0] = cloud_rot * axes[0];
-    axes[1] = cloud_rot * axes[1];
-    axes[2] = cloud_rot * axes[2];
+    // Constant indices only, so these stay in registers.
+    let raw_axes = quat_axes(g_splats[splat_id].rotation);
+    let axis0 = cloud_rot * raw_axes[0];
+    let axis1 = cloud_rot * raw_axes[1];
+    let axis2 = cloud_rot * raw_axes[2];
 
     // Major/minor/intermediate axis selection.
     var long_axis_idx = 0;
@@ -175,7 +186,7 @@ fn vs_main(
     }
     let mid_axis_idx = 3 - long_axis_idx - short_axis_idx;
 
-    let long_axis = normalize(axes[long_axis_idx]);
+    let long_axis = normalize(pick3(axis0, axis1, axis2, long_axis_idx));
 
     let short_scale = min(splat_scale.x, min(splat_scale.y, splat_scale.z));
     let mid_scale = splat_scale.x + splat_scale.y + splat_scale.z - short_scale - long_scale;
@@ -184,8 +195,8 @@ fn vs_main(
     let cam_forward = normalize(u.camera_pos.xyz - splat_pos);
     let cam_right = normalize(cross(cam_forward, long_axis));
 
-    let mid_alignment = abs(dot(cam_forward, axes[mid_axis_idx]));
-    let short_alignment = abs(dot(cam_forward, axes[short_axis_idx]));
+    let mid_alignment = abs(dot(cam_forward, pick3(axis0, axis1, axis2, mid_axis_idx)));
+    let short_alignment = abs(dot(cam_forward, pick3(axis0, axis1, axis2, short_axis_idx)));
     let t = clamp(short_alignment / (mid_alignment + short_alignment + 0.0001), 0.0, 1.0);
     let billboard_width = mix(short_scale, mid_scale, t);
 

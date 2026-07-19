@@ -879,6 +879,8 @@ struct ActorDto {
     #[serde(default)]
     model: Option<String>, // resource display name, or none for an empty actor
     #[serde(default)]
+    material: Option<String>, // material library name, or none for the model's default
+    #[serde(default)]
     layer: u32, // SceneLayer choice index
     #[serde(default)]
     shadow_catcher: bool,
@@ -3266,6 +3268,12 @@ impl SplatGame {
                 .find(|(_, h)| *h == handle)
                 .map(|(name, _)| name.clone())
         };
+        let material_name = |handle: MaterialHandle| -> Option<String> {
+            self.material_library
+                .iter()
+                .find(|m| m.handle == handle)
+                .map(|m| m.name.clone())
+        };
         SceneFile {
             version: SCENE_FORMAT_VERSION,
             camera: Some(CameraDto {
@@ -3281,6 +3289,7 @@ impl SplatGame {
                     rotation: quat_arr(a.get_rotation()),
                     scale: vec3_arr(a.get_scale()),
                     model: model_name(a.get_model()),
+                    material: material_name(a.get_material()),
                     layer: a.get_layer().0.choice_index() as u32,
                     shadow_catcher: a.is_shadow_catcher(),
                 })
@@ -3466,6 +3475,11 @@ impl SplatGame {
                         .push((self.scene_actors.len(), model.clone())),
                 }
             }
+            if let Some(material) = &dto.material {
+                if let Some(res) = self.material_library.iter().find(|m| &m.name == material) {
+                    actor.set_material(&res.handle);
+                }
+            }
             actor.set_layer(&SceneLayer::from_choice_index(dto.layer as usize), &None);
             actor.set_shadow_catcher(dto.shadow_catcher);
             renderer.add_or_update_actor(&actor);
@@ -3484,6 +3498,9 @@ impl SplatGame {
             light.set_range(dto.range);
             light.set_spot_angle(dto.spot_angle);
             light.set_casts_shadow(dto.casts_shadow);
+            light.set_shadow_cascades(dto.shadow_cascades);
+            light.set_shadow_distance(dto.shadow_distance);
+            light.set_shadow_density(dto.shadow_density);
             renderer.add_or_update_light(&light);
             self.scene_lights.push(light);
         }

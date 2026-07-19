@@ -298,10 +298,19 @@
 		};
 	}
 
+	// Optional ?rscale=N multiplier on the drawing-buffer size, for telling
+	// fragment-bound from vertex-bound: the canvas keeps its on-screen size
+	// (the CSS is 100%/100%) but renders fewer pixels and is scaled back up.
+	// Applied at startup, so it needs a page load rather than a resize.
+	function renderScale() {
+		const raw = parseFloat(new URLSearchParams(location.search).get("rscale"));
+		return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 1) : 1;
+	}
+
 	function resizeCanvas() {
 		const canvas = document.getElementById("target");
 		if (!canvas) return;
-		const dpr = window.devicePixelRatio || 1;
+		const dpr = (window.devicePixelRatio || 1) * renderScale();
 		const { width, height } = viewportSize();
 		// Always size the drawing buffer as a landscape (wide) view: the longer
 		// viewport edge is the width, the shorter is the height. Because
