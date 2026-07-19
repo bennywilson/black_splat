@@ -19,7 +19,7 @@ struct AmbientUniform {
     inv_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,   // xyz world position, w: 1.0 if a baked skylight exists
     target_dims: vec4<f32>, // xy render target size in pixels, z: ssao_enabled, w: ssgi_enabled
-    gi_params: vec4<f32>,   // x: gi_intensity
+    gi_params: vec4<f32>,   // x: gi_intensity, y: ao_samples, z: gi_samples, w unused
 };
 
 @group(0) @binding(0)
@@ -96,7 +96,10 @@ fn build_basis(n: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(tangent, bitangent, n);
 }
 
-const AO_SAMPLES: u32 = 12u;
+// Fixed kernel size -- AO_KERNEL below only has 12 entries. ambient.gi_params.y
+// (AmbientSettings::ao_samples) picks how many of those 12 to actually use
+// per pixel, clamped to this range on the Rust side.
+const AO_KERNEL_SIZE: u32 = 12u;
 const AO_RADIUS: f32 = 0.5;
 const AO_BIAS: f32 = 0.02;
 // Fixed hemisphere-biased kernel (unit sphere points, |k| in (0,1]). Without
@@ -114,11 +117,11 @@ const AO_KERNEL: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
     vec3<f32>(-0.402, 0.219, 0.874), vec3<f32>(0.331, -0.126, 0.945),
 );
 
-fn sample_ao(world_pos: vec3<f32>, tbn: mat3x3<f32>, rotation: f32) -> f32 {
+fn sample_ao(world_pos: vec3<f32>, tbn: mat3x3<f32>, rotation: f32, ao_samples: u32) -> f32 {
     let cos_r = cos(rotation);
     let sin_r = sin(rotation);
     var occlusion = 0.0;
-    for (var i = 0u; i < AO_SAMPLES; i = i + 1u) {
+    for (var i = 0u; i < ao_samples; i = i + 1u) {
         let k = AO_KERNEL[i];
         let rotated_k = vec3<f32>(k.x * cos_r - k.y * sin_r, k.x * sin_r + k.y * cos_r, k.z);
         let sample_world = world_pos + tbn * rotated_k * AO_RADIUS;
@@ -140,7 +143,7 @@ fn sample_ao(world_pos: vec3<f32>, tbn: mat3x3<f32>, rotation: f32) -> f32 {
             occlusion += range_check;
         }
     }
-    return 1.0 - clamp(occlusion / f32(AO_SAMPLES), 0.0, 1.0);
+    return 1.0 - clamp(occlusion / f32(ao_samples), 0.0, 1.0);
 }
 
 const GI_STEPS: u32 = 16u;
@@ -176,8 +179,6 @@ fn trace_gi_ray(world_pos: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
-const GI_RAYS: u32 = 4u;
-
 struct FsOut {
     @location(0) ao: f32,
     @location(1) gi: vec4<f32>,
@@ -195,6 +196,13 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> FsOut {
     let world_pos = reconstruct_world_pos(coords, depth);
     let tbn = build_basis(normal);
 
+    // AmbientSettings::ao_samples / gi_samples (see ambient.rs) -- how many
+    // AO kernel taps / GI rays to spend per pixel this frame. Clamped on the
+    // Rust side (ao_samples <= AO_KERNEL_SIZE; gi_samples has no such cap
+    // since GI rays aren't indexed into a fixed array).
+    let ao_samples = clamp(u32(ambient.gi_params.y), 1u, AO_KERNEL_SIZE);
+    let gi_samples = max(u32(ambient.gi_params.z), 1u);
+
     // See AmbientSettings in ambient.rs -- packed into the otherwise-unused
     // target_dims.zw rather than growing the uniform.
     var ao = 1.0;
@@ -202,7 +210,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> FsOut {
         // Offset seed from the GI rotation below so the two effects' noise
         // doesn't line up pixel-for-pixel.
         let ao_rotation = hash13(pos.xy + vec2<f32>(17.0, 31.0)) * 6.28318530718;
-        ao = sample_ao(world_pos, tbn, ao_rotation);
+        ao = sample_ao(world_pos, tbn, ao_rotation, ao_samples);
     }
 
     var gi = vec3<f32>(0.0);
@@ -210,11 +218,11 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> FsOut {
         let rotation = hash13(pos.xy) * 6.28318530718;
         let cos_r = cos(rotation);
         let sin_r = sin(rotation);
-        for (var i = 0u; i < GI_RAYS; i = i + 1u) {
+        for (var i = 0u; i < gi_samples; i = i + 1u) {
             // Interleaved Fibonacci-ish hemisphere directions, rotated per-pixel.
             let fi = f32(i) + 0.5;
             let phi = fi * 2.39996323;
-            let cos_theta = sqrt(1.0 - fi / f32(GI_RAYS));
+            let cos_theta = sqrt(1.0 - fi / f32(gi_samples));
             let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
             let lx = cos(phi) * sin_theta;
             let ly = sin(phi) * sin_theta;
@@ -222,7 +230,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> FsOut {
             let dir = normalize(tbn * rotated);
             gi += trace_gi_ray(world_pos, dir);
         }
-        gi /= f32(GI_RAYS);
+        gi /= f32(gi_samples);
         gi *= ambient.gi_params.x;
     }
 

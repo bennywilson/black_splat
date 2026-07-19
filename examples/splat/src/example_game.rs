@@ -876,10 +876,43 @@ struct AmbientDto {
     // than 0.0, which would silently zero out their GI.
     #[serde(default = "default_gi_intensity")]
     gi_intensity: f32,
+    // Scenes saved before sample/blur controls existed get the engine
+    // defaults rather than 0, which would zero out AO/GI or disable the
+    // denoise blur entirely.
+    #[serde(default = "default_ao_samples")]
+    ao_samples: u32,
+    #[serde(default = "default_gi_samples")]
+    gi_samples: u32,
+    #[serde(default = "default_denoise_radius")]
+    denoise_radius: u32,
+    #[serde(default = "default_denoise_strength")]
+    denoise_strength: f32,
+    #[serde(default = "default_denoise_iterations")]
+    denoise_iterations: u32,
 }
 
 fn default_gi_intensity() -> f32 {
     AmbientSettings::default().gi_intensity
+}
+
+fn default_ao_samples() -> u32 {
+    AmbientSettings::default().ao_samples
+}
+
+fn default_gi_samples() -> u32 {
+    AmbientSettings::default().gi_samples
+}
+
+fn default_denoise_radius() -> u32 {
+    AmbientSettings::default().denoise_radius
+}
+
+fn default_denoise_strength() -> f32 {
+    AmbientSettings::default().denoise_strength
+}
+
+fn default_denoise_iterations() -> u32 {
+    AmbientSettings::default().denoise_iterations
 }
 
 impl AmbientDto {
@@ -888,6 +921,11 @@ impl AmbientDto {
             ssao_enabled: s.ssao_enabled,
             ssgi_enabled: s.ssgi_enabled,
             gi_intensity: s.gi_intensity,
+            ao_samples: s.ao_samples,
+            gi_samples: s.gi_samples,
+            denoise_radius: s.denoise_radius,
+            denoise_strength: s.denoise_strength,
+            denoise_iterations: s.denoise_iterations,
         }
     }
 
@@ -896,6 +934,11 @@ impl AmbientDto {
             ssao_enabled: self.ssao_enabled,
             ssgi_enabled: self.ssgi_enabled,
             gi_intensity: self.gi_intensity,
+            ao_samples: self.ao_samples,
+            gi_samples: self.gi_samples,
+            denoise_radius: self.denoise_radius,
+            denoise_strength: self.denoise_strength,
+            denoise_iterations: self.denoise_iterations,
         }
     }
 }

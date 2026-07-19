@@ -2,13 +2,13 @@
   "version": 1,
   "camera": {
     "position": [
-      0.15377085,
-      1.199024,
-      0.35529295
+      0.18088159,
+      1.2000579,
+      0.39854848
     ],
     "rotation": [
-      -181.66032,
-      20.55999,
+      -174.82034,
+      13.179992,
       0.0
     ]
   },
@@ -187,5 +187,15 @@
     "midtone_curve": 0.59,
     "shadow_offset": 0.14,
     "sharpen_strength": 0.25
+  },
+  "ambient": {
+    "ssao_enabled": true,
+    "ssgi_enabled": true,
+    "gi_intensity": 0.2,
+    "ao_samples": 12,
+    "gi_samples": 32,
+    "denoise_radius": 4,
+    "denoise_strength": 1.0,
+    "denoise_iterations": 5
   }
 }
