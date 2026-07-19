@@ -468,8 +468,9 @@ impl Texture {
 /// `mip` (see `Texture::CUBE_FACE_DIRECTIONS` for the face order); `cube_view`
 /// (Cube, all mips, all 6 layers) is what a lighting shader samples as a
 /// `texture_cube<f32>`. Mip 0 is the raw capture; mips 1.. are a GGX-prefiltered
-/// roughness chain and `sh_coeffs` is a 9-term spherical-harmonic projection of
-/// mip 0 for diffuse irradiance -- both filled in by a skylight's
+/// roughness chain and `sh_buffer` is a 9-term spherical-harmonic projection of
+/// mip 0 for diffuse irradiance, written directly by a GPU compute pass and
+/// bound straight into the lighting shader -- both filled in by a skylight's
 /// environment-capture bake (see `Renderer::bake_skylight_cubemap`).
 pub struct CubeTexture {
     pub texture: wgpu::Texture,
@@ -477,7 +478,7 @@ pub struct CubeTexture {
     pub face_views: Vec<[wgpu::TextureView; 6]>,
     pub sampler: wgpu::Sampler,
     pub mip_count: u32,
-    pub sh_coeffs: [[f32; 4]; 9],
+    pub sh_buffer: wgpu::Buffer,
 }
 
 impl CubeTexture {
@@ -549,15 +550,25 @@ impl CubeTexture {
             ..Default::default()
         });
 
+        // 9 * vec4<f32>, written by the GPU SH-projection compute pass (see
+        // LightingPass::project_skylight_sh_gpu) and bound directly into the
+        // lighting shader -- no CPU readback. A fresh (unbaked) buffer is
+        // zero-initialized per the WebGPU spec, giving a flat-black diffuse
+        // term until a real bake fills it in.
+        let sh_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Skylight Env SH Coefficients"),
+            size: (9 * std::mem::size_of::<[f32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         CubeTexture {
             texture,
             cube_view,
             face_views,
             sampler,
             mip_count,
-            // Flat white DC term until a real bake fills this in, so a fresh
-            // (unbaked) skylight's diffuse term isn't pitch black.
-            sh_coeffs: [[0.0; 4]; 9],
+            sh_buffer,
         }
     }
 }

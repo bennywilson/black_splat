@@ -16,10 +16,8 @@ struct LightUniform {
     target_dims: vec4<f32>       // xy render target size in pixels
 };
 
-// Diffuse irradiance SH coefficients (band 0..2, RGB in xyz) plus the mip
-// chain's roughness range. See Renderer::bake_skylight_cubemap.
+// Mip chain's roughness range. See Renderer::bake_skylight_cubemap.
 struct SkylightEnvUniform {
-    sh: array<vec4<f32>, 9>,
     mip_params: vec4<f32>,   // x: highest mip index (roughness 1.0 samples this level)
 };
 
@@ -39,25 +37,28 @@ var t_env: texture_cube<f32>;
 @group(1) @binding(2)
 var s_env: sampler;
 @group(1) @binding(3)
+var<storage, read> sh_coeffs: array<vec4<f32>, 9>;
+@group(1) @binding(4)
 var<uniform> sky_env: SkylightEnvUniform;
 
-// Standard real-SH irradiance evaluation (Ramamoorthi & Hanrahan): `sh` holds
-// raw radiance projection coefficients; the A0/A1/A2 constants below fold in
-// the cosine-lobe convolution so this directly returns cosine-weighted
+// Standard real-SH irradiance evaluation (Ramamoorthi & Hanrahan): `sh_coeffs`
+// holds raw radiance projection coefficients (written by
+// skylight_sh_project.wgsl); the A0/A1/A2 constants below fold in the
+// cosine-lobe convolution so this directly returns cosine-weighted
 // irradiance, not raw radiance.
 fn eval_sh_irradiance(n: vec3<f32>) -> vec3<f32> {
     let a0 = 3.141593;
     let a1 = 2.094395;
     let a2 = 0.785398;
-    var res = sky_env.sh[0].rgb * (0.282095 * a0);
-    res += sky_env.sh[1].rgb * (0.488603 * n.y * a1);
-    res += sky_env.sh[2].rgb * (0.488603 * n.z * a1);
-    res += sky_env.sh[3].rgb * (0.488603 * n.x * a1);
-    res += sky_env.sh[4].rgb * (1.092548 * n.x * n.y * a2);
-    res += sky_env.sh[5].rgb * (1.092548 * n.y * n.z * a2);
-    res += sky_env.sh[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0) * a2);
-    res += sky_env.sh[7].rgb * (1.092548 * n.x * n.z * a2);
-    res += sky_env.sh[8].rgb * (0.546274 * (n.x * n.x - n.y * n.y) * a2);
+    var res = sh_coeffs[0].rgb * (0.282095 * a0);
+    res += sh_coeffs[1].rgb * (0.488603 * n.y * a1);
+    res += sh_coeffs[2].rgb * (0.488603 * n.z * a1);
+    res += sh_coeffs[3].rgb * (0.488603 * n.x * a1);
+    res += sh_coeffs[4].rgb * (1.092548 * n.x * n.y * a2);
+    res += sh_coeffs[5].rgb * (1.092548 * n.y * n.z * a2);
+    res += sh_coeffs[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0) * a2);
+    res += sh_coeffs[7].rgb * (1.092548 * n.x * n.z * a2);
+    res += sh_coeffs[8].rgb * (0.546274 * (n.x * n.x - n.y * n.y) * a2);
     // Divide the cosine-convolved projection by pi to turn irradiance into
     // the outgoing Lambertian radiance a diffuse albedo multiplies against.
     return max(res / 3.141593, vec3<f32>(0.0));
@@ -114,17 +115,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // The captured cubemap is already full-color radiance -- scale by
         // plain intensity only, not the Color swatch (that's baked into the
         // capture's exposure, not a tint to reapply on top of real pixels).
-        if (sky_env.mip_params.z > 0.5) {
-            sky = eval_sh_irradiance(normal) * light.direction_cone.a;
-        } else {
-            // No CPU-projected SH available (wasm -- see
-            // Renderer::bake_skylight_cubemap). Sample the roughest
-            // GPU-prefiltered mip by normal as a cheaper, GPU-only stand-in:
-            // not a true cosine-weighted irradiance convolution, but far
-            // softer than a mip-0 mirror sample.
-            sky = textureSampleLevel(t_env, s_env, normal, sky_env.mip_params.x).rgb
-                * light.direction_cone.a;
-        }
+        sky = eval_sh_irradiance(normal) * light.direction_cone.a;
         // Sample the GGX-prefiltered mip matching this surface's roughness
         // (mip 0 = mirror, sky_env.mip_params.x = roughest available level).
         let mip = roughness * sky_env.mip_params.x;

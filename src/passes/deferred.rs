@@ -38,16 +38,17 @@ const SHADOW_DEPTH_BIAS: f32 = 0.0015;
 const SHADOW_DRAW_STRIDE: usize = 256;
 const MAX_SHADOW_DRAWS: usize = 1024;
 
-/// Skylight-only extra data: a 9-term spherical-harmonic projection of the
-/// baked cube (diffuse irradiance) plus the mip chain's roughness range.
-/// Kept separate from `LightUniform` (rather than appended to it) since that
-/// struct's tail is shared shadow-tile data every other light type writes --
-/// inserting fields there would shift offsets in every light's WGSL struct.
+/// Skylight-only extra data: the mip chain's roughness range. The 9-term SH
+/// diffuse-irradiance projection lives in `CubeTexture::sh_buffer` instead
+/// (a GPU storage buffer written once at bake time by
+/// `LightingPass::project_skylight_sh_gpu` and bound directly here -- see
+/// `light_skylight.wgsl`'s `sh_coeffs` binding). Kept separate from
+/// `LightUniform` (rather than appended to it) since that struct's tail is
+/// shared shadow-tile data every other light type writes -- inserting fields
+/// there would shift offsets in every light's WGSL struct.
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkylightEnvUniform {
-    // 9 SH band coefficients, RGB in xyz (w unused, kept for 16-byte align).
-    pub sh: [[f32; 4]; 9],
     // x: highest mip index (roughness 1.0 samples this level).
     pub mip_params: [f32; 4],
 }
@@ -1797,6 +1798,13 @@ pub struct LightingPass {
     // only ever invoked from the one-shot bake, not per frame.
     skylight_prefilter_pipeline: wgpu::RenderPipeline,
     skylight_prefilter_bind_group_layout: wgpu::BindGroupLayout,
+    // Reduces a skylight's baked mip-0 cube into 9 SH coefficients on the GPU
+    // (see Renderer::bake_skylight_cubemap), writing straight into
+    // CubeTexture::sh_buffer -- no CPU readback, so this runs identically on
+    // native and wasm. Built once here for the same reason as the prefilter
+    // pipeline above.
+    skylight_sh_project_pipeline: wgpu::ComputePipeline,
+    skylight_sh_project_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 #[repr(C)]
@@ -1805,6 +1813,12 @@ struct SkylightPrefilterUniform {
     inv_view_proj: [[f32; 4]; 4],
     // x: roughness for this mip, y: this mip's face size in texels.
     params: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkylightShFaceMatrices {
+    inv_view_proj: [[[f32; 4]; 4]; 6],
 }
 
 impl LightingPass {
@@ -1957,6 +1971,16 @@ impl LightingPass {
                         binding: 3,
                         visibility: ShaderStages::FRAGMENT,
                         ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: None,
@@ -2000,6 +2024,7 @@ impl LightingPass {
             "/engine_assets/shaders/light_point.wgsl",
             "/engine_assets/shaders/light_spot.wgsl",
             "/engine_assets/shaders/skylight_prefilter.wgsl",
+            "/engine_assets/shaders/skylight_sh_project.wgsl",
         ];
         let mut shader_handles = Vec::with_capacity(shader_paths.len());
         for path in shader_paths {
@@ -2144,6 +2169,69 @@ impl LightingPass {
                 cache: None,
             });
 
+        // SH-projection compute pass: same face uniform + source cube +
+        // sampler as the prefilter pass, plus a read_write storage buffer
+        // the compute shader reduces the whole cube into (see
+        // LightingPass::project_skylight_sh_gpu).
+        let skylight_sh_project_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("LightingPass_skylight_sh_project_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::Cube,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let skylight_sh_project_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("LightingPass_skylight_sh_project_pipeline_layout"),
+                bind_group_layouts: &[Some(&skylight_sh_project_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let sh_project_shader = asset_manager.get_shader(&shader_handles[5]);
+        let skylight_sh_project_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("LightingPass_skylight_sh_project"),
+                layout: Some(&skylight_sh_project_pipeline_layout),
+                module: sh_project_shader,
+                entry_point: Some("cs_project"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
         LightingPass {
             skylight_pipeline,
             directional_pipeline,
@@ -2156,6 +2244,8 @@ impl LightingPass {
             fallback_cube,
             skylight_prefilter_pipeline,
             skylight_prefilter_bind_group_layout,
+            skylight_sh_project_pipeline,
+            skylight_sh_project_bind_group_layout,
         }
     }
 
@@ -2258,6 +2348,87 @@ impl LightingPass {
                 device_resources.queue.submit(std::iter::once(encoder.finish()));
             }
         }
+    }
+
+    /// GPU-reduces `cube_texture`'s mip-0 capture into 9 SH coefficients for
+    /// diffuse irradiance, writing them into `cube_texture.sh_buffer` (see
+    /// `skylight_sh_project.wgsl`). Runs identically on native and wasm --
+    /// unlike the prefilter mips, this involves no readback of any kind: the
+    /// lighting shader binds `sh_buffer` directly. One-shot cost, called only
+    /// from `Renderer::bake_skylight_cubemap`.
+    pub fn project_skylight_sh_gpu(
+        &self,
+        device_resources: &DeviceResources,
+        cube_texture: &CubeTexture,
+    ) {
+        let device = &device_resources.device;
+
+        let source_view = cube_texture.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Skylight Env Cubemap Mip0 Source View (SH)"),
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            array_layer_count: Some(6),
+            ..Default::default()
+        });
+
+        let inv_view_proj: [[[f32; 4]; 4]; 6] = std::array::from_fn(|face| {
+            let (dir, up) = Texture::CUBE_FACE_DIRECTIONS[face];
+            let cam = Camera::from_look(
+                CgVec3::new(0.0, 0.0, 0.0),
+                CgVec3::new(dir[0], dir[1], dir[2]),
+                CgVec3::new(up[0], up[1], up[2]),
+            );
+            let (view_matrix, _, _) = cam.calculate_view_matrix();
+            let proj_matrix = cgmath::perspective(cgmath::Deg(90.0), 1.0, 0.1, 10.0);
+            (proj_matrix * view_matrix)
+                .invert()
+                .unwrap_or_else(cgmath::Matrix4::identity)
+                .into()
+        });
+        let faces_uniform = SkylightShFaceMatrices { inv_view_proj };
+        let faces_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("LightingPass_skylight_sh_project_faces"),
+            contents: bytemuck::cast_slice(&[faces_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.skylight_sh_project_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: faces_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&cube_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: cube_texture.sh_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("LightingPass_skylight_sh_project_bind_group"),
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("skylight SH project"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("skylight SH project"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.skylight_sh_project_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        device_resources.queue.submit(std::iter::once(encoder.finish()));
     }
 
     fn make_gbuffer_bind_group(
@@ -2550,18 +2721,7 @@ impl LightingPass {
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
                 let env_uniform = SkylightEnvUniform {
-                    sh: env.sh_coeffs,
-                    // z: 1.0 if `sh` holds a real SH projection. wasm never
-                    // populates it (see Renderer::bake_skylight_cubemap --
-                    // the CPU readback it needs isn't available there), so
-                    // the shader falls back to sampling the roughest
-                    // GPU-prefiltered mip by normal instead.
-                    mip_params: [
-                        (env.mip_count.max(1) - 1) as f32,
-                        0.0,
-                        if cfg!(target_arch = "wasm32") { 0.0 } else { 1.0 },
-                        0.0,
-                    ],
+                    mip_params: [(env.mip_count.max(1) - 1) as f32, 0.0, 0.0, 0.0],
                 };
                 let env_buffer = ctx.device.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("LightingPass_skylight_env_uniform"),
@@ -2583,8 +2743,15 @@ impl LightingPass {
                             binding: 2,
                             resource: wgpu::BindingResource::Sampler(&env.sampler),
                         },
+                        // GPU-written by LightingPass::project_skylight_sh_gpu at
+                        // bake time -- bound straight through, no per-frame
+                        // upload.
                         wgpu::BindGroupEntry {
                             binding: 3,
+                            resource: env.sh_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
                             resource: env_buffer.as_entire_binding(),
                         },
                     ],
