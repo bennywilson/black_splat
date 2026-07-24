@@ -100,6 +100,9 @@ Each example uses a config file that controls several parameters. There is an ex
 }
 ```
 
+### TODO MUJOCO
+$ npm install @mujoco/mujoco
+
 ## Resources
 
 - [Project repository](https://github.com/bennywilson/kbEngine3)

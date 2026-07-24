@@ -1,0 +1,4 @@
+[env]
+# mujoco-rs's build script downloads and extracts the MuJoCo binaries here on
+# first build (auto-download-mujoco feature). Must be an absolute path.
+MUJOCO_DOWNLOAD_DIR = "D:/black_splat/examples/mujoco_test/.mujoco_dl"

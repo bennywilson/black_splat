@@ -3,6 +3,8 @@
 debug/
 target/
 
+*.ply
+
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
 Cargo.lock
@@ -14,11 +16,30 @@ Cargo.lock
 *.pdb
 *.blend1
 
+*.hdf5
+
 .vs/
 target/
+target_check/
 # Build artifacts
 *.exe
 
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# mujoco-rs auto-downloaded native binaries (examples/mujoco_test)
+.mujoco_dl/
+
+# Retargeted trajectory clips, regenerated on demand from the source JSON
+# (see trajectory::cache)
+**/resources/trajectory_cache/
+
+# Robomimic demo datasets. These are converter input only -- the engine reads
+# the committed JSON under examples/splat/game_assets/mujoco/trajectories/,
+# never the HDF5 (see tools/robomimic_to_trajectory.py, which documents the
+# source URL + demo id for each). Re-download only if you need to convert a
+# different demo. lift_ph_low_dim.hdf5 predates this rule and stays tracked.
+source_assets/mujoco_trajectories/*.hdf5
+
+node_modules/

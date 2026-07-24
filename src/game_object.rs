@@ -1,5 +1,5 @@
+use cgmath::InnerSpace;
 use instant::Instant;
-//use cgmath::InnerSpace;
 
 use crate::{
     assets::*, config::*, resource::*, utils::*, passes::model::*,
@@ -346,6 +346,13 @@ pub struct Actor {
     // inserted CG objects' shadows onto it and darken the Gaussian splats
     // behind it -- grounding those objects in the splat scene.
     shadow_catcher: bool,
+
+    // When true this actor is skipped while baking a skylight's environment
+    // cubemap (see Light::bake_cubemap / passes::deferred). Shadow catchers
+    // are always skipped regardless of this flag; MuJoCo-spawned mesh actors
+    // set this automatically (see tick_mujoco_actors) since a robot shouldn't
+    // appear baked into its own scene lighting.
+    exclude_from_env_capture: bool,
 }
 
 // Editor markup: the fields the editor's Details panel shows and how each is
@@ -359,6 +366,7 @@ crate::editor_properties!(Actor {
     model_handle: model("Model"),
     material_handle: material("Material"),
     shadow_catcher: bool("Shadow Catcher"),
+    exclude_from_env_capture: bool("Exclude From Env Capture"),
 });
 
 impl Default for Actor {
@@ -386,6 +394,7 @@ impl Actor {
             model_handle: ModelHandle::make_invalid(),
             material_handle: MaterialHandle::make_invalid(),
             shadow_catcher: false,
+            exclude_from_env_capture: false,
         }
     }
 
@@ -474,6 +483,14 @@ impl Actor {
     pub fn is_shadow_catcher(&self) -> bool {
         self.shadow_catcher
     }
+
+    pub fn set_exclude_from_env_capture(&mut self, exclude: bool) {
+        self.exclude_from_env_capture = exclude;
+    }
+
+    pub fn is_excluded_from_env_capture(&self) -> bool {
+        self.exclude_from_env_capture
+    }
 }
 
 static mut NEXT_LIGHT_ID: u32 = 0;
@@ -531,6 +548,28 @@ pub struct Light {
     range: f32,
     spot_angle: f32,
     casts_shadow: bool,
+    // A one-shot trigger, checked and cleared by the game's tick: when true,
+    // a skylight should (re)bake its environment cubemap from its current
+    // position (see Renderer::bake_skylight_cubemap). Meaningless on other
+    // light types.
+    bake_cubemap_requested: bool,
+    // Soft on/off for a skylight's baked cubemap: when false, the deferred
+    // pass falls back to the analytic top/bottom gradient even if a bake is
+    // still held in memory (see Renderer::env_cubemaps). Meaningless on other
+    // light types.
+    use_env_cubemap: bool,
+    // Debug view: draws a skylight's baked cubemap as the background wherever
+    // no geometry was rendered, so the capture can be eyeballed directly. The
+    // bake is taken from the skylight's position, not the camera's, so the
+    // parallax is wrong -- it's an inspection aid, not a real skybox.
+    // Meaningless on other light types.
+    show_env_as_skybox: bool,
+    // A one-shot trigger, checked and cleared by the game's tick: when true,
+    // a skylight's baked cubemap (if any) is freed from
+    // `Renderer::env_cubemaps` -- unlike `use_env_cubemap` this actually
+    // discards the GPU texture rather than just hiding it. Meaningless on
+    // other light types.
+    clear_cubemap_requested: bool,
 }
 
 // Editor markup: the fields the Details panel shows and how each is edited.
@@ -545,6 +584,10 @@ crate::editor_properties!(Light {
     range: float("Range"),
     spot_angle: float("Spot Angle"),
     casts_shadow: bool("Casts Shadow"),
+    bake_cubemap_requested: bool("Bake Environment Cubemap"),
+    use_env_cubemap: bool("Use Environment Cubemap"),
+    show_env_as_skybox: bool("Show Cubemap as Skybox"),
+    clear_cubemap_requested: bool("Clear Environment Cubemap"),
 });
 
 impl Default for Light {
@@ -572,6 +615,10 @@ impl Light {
             range: 10.0,
             spot_angle: 30.0,
             casts_shadow: true,
+            bake_cubemap_requested: false,
+            use_env_cubemap: true,
+            show_env_as_skybox: false,
+            clear_cubemap_requested: false,
         }
     }
 
@@ -663,12 +710,47 @@ impl Light {
     pub fn casts_shadow(&self) -> bool {
         self.casts_shadow
     }
+
+    /// Reads and clears the one-shot bake trigger; the caller should start a
+    /// cubemap bake for this light iff this returns true.
+    pub fn take_cubemap_bake_request(&mut self) -> bool {
+        let requested = self.bake_cubemap_requested;
+        self.bake_cubemap_requested = false;
+        requested
+    }
+
+    /// Whether a skylight's baked cubemap (if any) should currently be used
+    /// in place of the analytic gradient.
+    pub fn use_env_cubemap(&self) -> bool {
+        self.use_env_cubemap
+    }
+
+    /// Whether a skylight's baked cubemap should also be drawn as the
+    /// background where no geometry was rendered (a debug view).
+    pub fn show_env_as_skybox(&self) -> bool {
+        self.show_env_as_skybox
+    }
+
+    /// Reads and clears the one-shot clear trigger; the caller should drop
+    /// this light's baked cubemap from `Renderer::env_cubemaps` iff this
+    /// returns true.
+    pub fn take_cubemap_clear_request(&mut self) -> bool {
+        let requested = self.clear_cubemap_requested;
+        self.clear_cubemap_requested = false;
+        requested
+    }
 }
 
 #[derive(Clone)]
 pub struct Camera {
     position: CgVec3,
     rotation: CgVec3,
+    // Bypasses the pitch/heading Euler computation below when set: an
+    // explicit (view_dir, up) pair. Needed for cases the Euler form can't
+    // express, e.g. a cubemap capture's +Y/-Y faces, where `up` would have to
+    // be parallel to `view_dir` and the hardcoded `up = unit_y` in
+    // `calculate_view_matrix` degenerates.
+    look_override: Option<(CgVec3, CgVec3)>,
 }
 
 impl Default for Camera {
@@ -682,6 +764,17 @@ impl Camera {
         Camera {
             position: CG_VEC3_ZERO,
             rotation: CG_VEC3_ZERO,
+            look_override: None,
+        }
+    }
+
+    /// A camera pointed explicitly at `view_dir` with the given `up`,
+    /// bypassing pitch/heading -- see `look_override`.
+    pub fn from_look(position: CgVec3, view_dir: CgVec3, up: CgVec3) -> Self {
+        Camera {
+            position,
+            rotation: CG_VEC3_ZERO,
+            look_override: Some((view_dir, up)),
         }
     }
 
@@ -717,6 +810,12 @@ impl Camera {
     pub fn calculate_view_matrix(&self) -> (CgMat4, CgVec3, CgVec3) {
         let cam_pos = self.get_position();
         let eye: CgPoint = CgPoint::new(cam_pos.x, cam_pos.y, cam_pos.z);
+
+        if let Some((view_dir, up)) = self.look_override {
+            let target = eye + view_dir;
+            let right_dir = view_dir.cross(up).normalize();
+            return (CgMat4::look_at_rh(eye, target, up), view_dir, right_dir);
+        }
 
         let pitch_rad = cgmath::Rad::from(cgmath::Deg(self.rotation.x));
         let pitch_mat = CgMat4::from_angle_y(pitch_rad);

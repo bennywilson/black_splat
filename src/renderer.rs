@@ -85,6 +85,10 @@ pub struct Renderer<'a> {
     // Scene lights mirrored from the game/editor (see add_or_update_light),
     // consumed by the deferred lighting pass each frame.
     light_map: HashMap<u32, Light>,
+    // Baked environment cubemaps, keyed by skylight id (see
+    // bake_skylight_cubemap): sampled by the deferred lighting pass in place
+    // of a skylight's top/bottom gradient once present.
+    env_cubemaps: HashMap<u32, CubeTexture>,
 
     particle_map: HashMap<ParticleHandle, ParticleActor>,
     next_particle_id: ParticleHandle,
@@ -219,6 +223,7 @@ impl<'a> Renderer<'a> {
             asset_manager,
             actor_map: HashMap::<u32, Actor>::new(),
             light_map: HashMap::<u32, Light>::new(),
+            env_cubemaps: HashMap::new(),
             particle_map: HashMap::<ParticleHandle, ParticleActor>::new(),
             next_particle_id: INVALID_PARTICLE_HANDLE,
             active_particles: 0,
@@ -640,6 +645,7 @@ impl<'a> Renderer<'a> {
                     &self.light_map,
                     &self.actor_map,
                     self.shadow_pass.as_mut().unwrap(),
+                    &self.env_cubemaps,
                 );
             }
         } else {
@@ -867,6 +873,275 @@ impl<'a> Renderer<'a> {
         self.light_map.clear();
     }
 
+    /// Bakes an HDR environment cubemap for the skylight `light_id`, capturing
+    /// the full composited scene (World-layer actors + the active Gaussian
+    /// splat model, lit by every other light) from that skylight's current
+    /// position -- 6 faces, one 90-degree-FOV render each. Actors flagged
+    /// `exclude_from_env_capture` and shadow-catcher proxies are skipped, so a
+    /// MuJoCo robot or other inserted prop doesn't get baked into the
+    /// lighting it's about to be lit by. A no-op if `light_id` isn't a
+    /// Skylight in `light_map`, or the GL backend (no deferred passes).
+    ///
+    /// This is a one-shot, editor-triggered bake (see
+    /// `Light::take_cubemap_bake_request`), not a per-frame probe: it
+    /// temporarily resizes every render target (and reconfigures the window
+    /// surface) to the capture resolution and back, which would be far too
+    /// costly to repeat every frame with Gaussian splats in the scene.
+    pub fn bake_skylight_cubemap(&mut self, light_id: u32, game_config: &Config) {
+        const FACE_SIZE: u32 = 128;
+
+        log!("bake_skylight_cubemap: starting for light {light_id}");
+
+        let (Some(light), true) = (
+            self.light_map.get(&light_id).cloned(),
+            self.deferred_world_enabled,
+        ) else {
+            log!(
+                "bake_skylight_cubemap: ABORT -- light {} in light_map: {}, deferred_world_enabled: {}",
+                light_id,
+                self.light_map.contains_key(&light_id),
+                self.deferred_world_enabled
+            );
+            return;
+        };
+        if light.get_light_type() != LightType::Skylight {
+            log!(
+                "bake_skylight_cubemap: ABORT -- light {} is not a Skylight",
+                light_id
+            );
+            return;
+        }
+        let (Some(_), Some(_)) = (self.gbuffer_pass.as_ref(), self.lighting_pass.as_ref()) else {
+            log!("bake_skylight_cubemap: ABORT -- deferred passes missing (GL backend?)");
+            return;
+        };
+
+        let filtered_actors: HashMap<u32, Actor> = self
+            .actor_map
+            .iter()
+            .filter(|(_, actor)| {
+                !actor.is_shadow_catcher() && !actor.is_excluded_from_env_capture()
+            })
+            .map(|(id, actor)| (*id, actor.clone()))
+            .collect();
+
+        let saved_camera = self.game_camera.clone();
+
+        let mut capture_config = game_config.clone();
+        capture_config.window_width = FACE_SIZE;
+        capture_config.window_height = FACE_SIZE;
+        capture_config.render_scale = 1.0;
+        capture_config.fov = 90.0;
+        self.resize(&capture_config);
+
+        let cube_texture = CubeTexture::new(&self.device_resources.device, SCENE_COLOR_FORMAT, FACE_SIZE);
+        let position = light.get_position();
+
+        for (face, (dir, up)) in Texture::CUBE_FACE_DIRECTIONS.iter().enumerate() {
+            self.game_camera = Camera::from_look(
+                position,
+                CgVec3::new(dir[0], dir[1], dir[2]),
+                CgVec3::new(up[0], up[1], up[2]),
+            );
+
+            let mut ctx = RenderContext {
+                device: &mut self.device_resources,
+                assets: &mut self.asset_manager,
+                camera: &self.game_camera,
+                config: &capture_config,
+            };
+            self.gbuffer_pass
+                .as_mut()
+                .unwrap()
+                .render(&mut ctx, &filtered_actors);
+            self.lighting_pass.as_mut().unwrap().render(
+                &mut ctx,
+                &self.light_map,
+                &filtered_actors,
+                self.shadow_pass.as_mut().unwrap(),
+                &self.env_cubemaps,
+            );
+            if let Some(splat_pass) = &mut self.gaussian_splat_pass {
+                if splat_pass.has_model() {
+                    splat_pass.render(&mut ctx);
+                    if let Some(composite_pass) = &mut self.splat_composite_pass {
+                        composite_pass.render(&mut ctx);
+                    }
+                }
+            }
+
+            let mut encoder = self.device_resources.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor {
+                    label: Some("bake_skylight_cubemap face copy"),
+                },
+            );
+            encoder.copy_texture_to_texture(
+                self.device_resources.render_textures[0].texture.as_image_copy(),
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cube_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: face as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: FACE_SIZE,
+                    height: FACE_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.device_resources
+                .queue
+                .submit(std::iter::once(encoder.finish()));
+        }
+
+        // Debug: dump the six faces to PNG so the capture can be eyeballed
+        // (a chrome surface reflecting a flat background means the bake caught
+        // an empty scene, not that the shader is wrong).
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::dump_cube_texture_to_disk(&self.device_resources, &cube_texture, FACE_SIZE, light_id);
+
+        self.env_cubemaps.insert(light_id, cube_texture);
+        self.game_camera = saved_camera;
+        self.resize(game_config);
+    }
+
+    /// Reads a freshly-baked `Rgba16Float` cubemap back to the CPU and writes
+    /// each face as a tonemapped PNG next to the running binary. Purely a
+    /// debugging aid for the skylight bake -- not part of normal rendering.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dump_cube_texture_to_disk(
+        device_resources: &DeviceResources,
+        cube_texture: &CubeTexture,
+        face_size: u32,
+        light_id: u32,
+    ) {
+        let device = &device_resources.device;
+        let queue = &device_resources.queue;
+        // Rgba16Float = 8 bytes/texel; 128*8 = 1024 is already 256-aligned, so
+        // no per-row padding to unravel.
+        let bytes_per_row = face_size * 8;
+        let face_bytes = (bytes_per_row * face_size) as u64;
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cubemap dump readback"),
+            size: face_bytes * 6,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cubemap dump copy"),
+        });
+        for face in 0..6u32 {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cube_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: face },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: face_bytes * face as u64,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(face_size),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: face_size,
+                    height: face_size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let mapped = slice.get_mapped_range();
+
+        // Absolute path, created if missing, and logged -- relative paths land
+        // in whatever directory the editor happened to be launched from.
+        let out_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("skylight_bake_dump");
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            log!("bake dump: could not create {}: {e}", out_dir.display());
+            return;
+        }
+        log!("bake dump: writing 6 faces to {}", out_dir.display());
+
+        const FACE_NAMES: [&str; 6] = ["px", "nx", "py", "ny", "pz", "nz"];
+        for face in 0..6usize {
+            let start = (face_bytes * face as u64) as usize;
+            let end = start + face_bytes as usize;
+            let halfs: &[u16] = bytemuck::cast_slice(&mapped[start..end]);
+            let mut rgba = vec![0u8; (face_size * face_size * 4) as usize];
+            for px in 0..(face_size * face_size) as usize {
+                for c in 0..3usize {
+                    let lin = f16_to_f32(halfs[px * 4 + c]);
+                    // Reinhard tonemap + gamma so HDR radiance is viewable.
+                    let mapped_v = lin / (lin + 1.0);
+                    let srgb = mapped_v.powf(1.0 / 2.2);
+                    rgba[px * 4 + c] = (srgb.clamp(0.0, 1.0) * 255.0) as u8;
+                }
+                rgba[px * 4 + 3] = 255;
+            }
+            // Report the min/max linear luminance so an all-black capture is
+            // obvious from the log without opening the PNGs.
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for px in 0..(face_size * face_size) as usize {
+                for c in 0..3usize {
+                    let v = f16_to_f32(halfs[px * 4 + c]);
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
+
+            let path = out_dir.join(format!(
+                "skylight_bake_light{}_{}.png",
+                light_id, FACE_NAMES[face]
+            ));
+            match image::save_buffer(
+                &path,
+                &rgba,
+                face_size,
+                face_size,
+                image::ColorType::Rgba8,
+            ) {
+                Ok(()) => {
+                    log!(
+                        "bake dump: wrote {} (linear range {lo:.4} .. {hi:.4})",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    log!("bake dump: FAILED to write {}: {e}", path.display());
+                }
+            }
+        }
+        drop(mapped);
+        readback.unmap();
+    }
+
+    /// Frees a skylight's baked environment cubemap, if it has one. Unlike
+    /// `Light::use_env_cubemap` (a soft, reversible toggle), this drops the
+    /// GPU texture; the light falls back to its analytic gradient until
+    /// baked again.
+    pub fn clear_skylight_cubemap(&mut self, light_id: u32) {
+        self.env_cubemaps.remove(&light_id);
+    }
+
     /// Routes World-layer actors through the deferred G-buffer + lighting
     /// pipeline instead of the classic forward model pass.  Only makes sense
     /// for games that register scene lights (add_or_update_light) -- without
@@ -1020,9 +1295,9 @@ impl<'a> Renderer<'a> {
             .await
     }
 
-    /// Registers a model from in-memory glb/gltf bytes (see
+    /// Registers a model from in-memory glb/gltf or .obj bytes (see
     /// [`AssetManager::add_model_from_bytes`]).  Synchronous, for the web
-    /// editor's model import from the frame tick.
+    /// editor's model import and MuJoCo mesh geoms, both from the frame tick.
     #[cfg(target_arch = "wasm32")]
     pub fn load_model_from_bytes(
         &mut self,
@@ -1393,4 +1668,26 @@ impl<'a> Renderer<'a> {
         self.custom_sprite_passes.push(pass);
         new_index
     }
+}
+
+/// Decodes an IEEE 754 half-precision float to `f32`. Used to read back the
+/// `Rgba16Float` skylight-bake cubemap for the PNG debug dump.
+#[cfg(not(target_arch = "wasm32"))]
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 0x1;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let val = match exp {
+        0 => {
+            // Subnormal (or zero).
+            (mant as f32) * 2f32.powi(-24)
+        }
+        0x1f => {
+            // Inf / NaN -- clamp to a finite large value; the dump only needs
+            // to be viewable, not bit-exact.
+            if mant == 0 { 65504.0 } else { 0.0 }
+        }
+        _ => (mant as f32 / 1024.0 + 1.0) * 2f32.powi(exp as i32 - 15),
+    };
+    if sign == 1 { -val } else { val }
 }

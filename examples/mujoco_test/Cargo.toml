@@ -1,0 +1,25 @@
+[package]
+name = "black_splat_mujoco_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cgmath = "0.18"
+instant = { version = "0.1.12", features = ["wasm-bindgen"] }
+pollster = "0.3"
+
+# MJCF loading/wireframing lives in the engine (src/mujoco.rs): native drives
+# mujoco-rs directly, wasm bridges to a sibling `@mujoco/mujoco` wasm module
+# (see that module's doc comment).
+black_splat = { path = "../../", features = ["mujoco"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4.42"
+# Untyped JS interop for the File System Access API save dialog (the typed
+# web-sys bindings for it sit behind the unstable-APIs cfg flag).
+js-sys = "0.3"
+# The engine's log! macro expands to web_sys::console at the call site.
+# Window/Navigator are for the touch-device check (GUI sizing); Storage is the
+# localStorage that persists the startup scene.
+web-sys =  { version = "0.3.69", features = ["Window", "Navigator", "Storage"] }

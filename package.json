@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@mujoco/mujoco": "^3.10.0"
+  }
+}

@@ -21,7 +21,271 @@
      canvas -- the page is just a host for the wasm module. -->
 
 <script type="module">
-	import init from "./black_splat_splat_demo.js";
+	import init, * as bsApp from "./black_splat_splat_demo.js";
+
+	// MuJoCo (MujocoActor, see src/mujoco.rs) is a second, independent wasm
+	// module with its own linear memory and its own requestAnimationFrame
+	// loop; it hands geom snapshots to the Rust side via the mj_bridge_*
+	// wasm-bindgen exports, matching examples/mujoco_test/index.html. Unlike
+	// that fixed single-scene example, the editor can add/retarget a
+	// MujocoActor's XML path at any time, so this polls for the *current*
+	// model text each frame and reloads whenever it changes, rather than
+	// loading once at boot. Only the most recently loaded MJCF actually
+	// simulates -- src/mujoco.rs's wasm bridge is a single global sim, a
+	// known limitation for scenes with multiple simultaneous MujocoActors.
+	async function startMujocoBridge() {
+		let mujoco = null;
+		let model = null;
+		let data = null;
+		let lastGeneration = 0;
+		let geomType, geomSize, geomRgba;
+		let accumulator = 0;
+		let lastTime = performance.now();
+		const SIM_TIMESTEP = 0.005;
+		const MAX_STEPS_PER_FRAME = 8;
+
+		// MuJoCo resolves an MJCF's <include>/<mesh>/<texture> references by
+		// opening them relative to the model file, which means it needs a
+		// filesystem -- from_xml_string has no base directory, so every
+		// relative reference in a string-loaded model fails. The wasm build
+		// ships an emscripten in-memory FS for exactly this: write the files
+		// there, then load by path. The Rust side gathers them (see
+		// MujocoScene::load_bundle) since it owns asset fetching.
+		function mkdirp(dir) {
+			const parts = dir.split("/").filter((p) => p.length > 0);
+			let path = "";
+			for (const part of parts) {
+				path += "/" + part;
+				try {
+					mujoco.FS.mkdir(path);
+				} catch (err) {
+					// Already exists (EEXIST) -- expected, since sibling files
+					// share parent dirs.
+				}
+			}
+		}
+
+		function stageModelFiles() {
+			for (const path of bsApp.mj_bridge_model_file_paths()) {
+				// Takes ownership: the bytes are dropped Rust-side as they
+				// cross, so a 30MB arm isn't resident in both wasm heaps.
+				const bytes = bsApp.mj_bridge_take_model_file_bytes(path);
+				const absolute = path.startsWith("/") ? path : "/" + path;
+				mkdirp(absolute.substring(0, absolute.lastIndexOf("/")));
+				mujoco.FS.writeFile(absolute, bytes);
+			}
+		}
+
+		// Mesh geoms are drawn as real triangle meshes by the Rust side, which
+		// loads the .obj itself -- but the three things it needs to know per
+		// geom live only in MuJoCo's memory: which <mesh> asset the geom
+		// draws, the geom's <material> colour, and the asset transform MuJoCo
+		// baked into the mesh at compile time. Reported once per load; none of
+		// it changes as the sim runs. See MujocoScene::mesh_geoms.
+		const MJ_GEOM_MESH = 7;
+
+		function reportMeshGeoms() {
+			const geomType = new Uint32Array(model.geom_type);
+			const geomDataId = new Int32Array(model.geom_dataid);
+			const geomMatId = new Int32Array(model.geom_matid);
+			const geomRgba = new Float32Array(model.geom_rgba);
+			const matRgba = new Float32Array(model.mat_rgba);
+			const matReflectance = new Float32Array(model.mat_reflectance);
+			const matShininess = new Float32Array(model.mat_shininess);
+			const meshPos = new Float32Array(model.mesh_pos);
+			const meshQuat = new Float32Array(model.mesh_quat);
+
+			for (let i = 0; i < geomType.length; i++) {
+				if (geomType[i] !== MJ_GEOM_MESH) continue;
+				const meshId = geomDataId[i];
+				if (meshId < 0) continue;
+
+				const mesh = model.mesh(meshId);
+				const name = mesh.name;
+				mesh.delete();
+
+				// A geom with a material takes the material's rgba (and its
+				// reflectance/shininess); geom_rgba stays at its unset default
+				// in that case (MuJoCo never copies one into the other), so
+				// reading it would paint everything the same default grey.
+				// With no material, fall back to the same values the engine's
+				// own no-material default uses (see assets::MaterialDesc).
+				const matId = geomMatId[i];
+				const rgba =
+					matId >= 0
+						? matRgba.subarray(matId * 4, matId * 4 + 4)
+						: geomRgba.subarray(i * 4, i * 4 + 4);
+				const metallic = matId >= 0 ? matReflectance[matId] : 0.0;
+				const roughness = matId >= 0 ? 1.0 - matShininess[matId] : 0.85;
+
+				bsApp.mj_bridge_set_mesh_geom(
+					i,
+					name,
+					rgba,
+					meshPos.subarray(meshId * 3, meshId * 3 + 3),
+					meshQuat.subarray(meshId * 4, meshId * 4 + 4),
+					metallic,
+					roughness,
+				);
+			}
+		}
+
+		// Trajectory playback needs the model's joint layout on the Rust side
+		// (to retarget a clip onto) and a qpos address per joint (to write it
+		// back). Both live in MuJoCo's memory. Reported once per load, like
+		// the mesh table above. See MujocoScene::joint_tracks.
+		const MJ_JNT_FREE = 0;
+		const MJ_JNT_BALL = 1;
+
+		// How many qpos entries a joint owns: a free joint is 3 translation +
+		// a 4-component quaternion, a ball is just the quaternion, and hinge
+		// and slide are scalar. Mirrors joint_tracks' native arm.
+		function jointQposWidth(jntType) {
+			if (jntType === MJ_JNT_FREE) return 7;
+			if (jntType === MJ_JNT_BALL) return 4;
+			return 1;
+		}
+
+		function reportJointTracks() {
+			const jntType = new Int32Array(model.jnt_type);
+			const jntQposAdr = new Int32Array(model.jnt_qposadr);
+
+			for (let i = 0; i < jntType.length; i++) {
+				const joint = model.jnt(i);
+				const name = joint.name;
+				joint.delete();
+				// A clip addresses joints by name, so an unnamed one can never
+				// be a retarget target -- native skips these too.
+				if (!name) continue;
+
+				bsApp.mj_bridge_set_joint_track(
+					i,
+					name,
+					jointQposWidth(jntType[i]),
+					jntQposAdr[i],
+				);
+			}
+		}
+
+		function loadModel(root) {
+			if (model) {
+				model.delete();
+				data.delete();
+			}
+			stageModelFiles();
+			model = mujoco.MjModel.from_xml_path(
+				root.startsWith("/") ? root : "/" + root
+			);
+			data = new mujoco.MjData(model);
+			geomType = new Uint32Array(model.geom_type);
+			geomSize = new Float32Array(model.geom_size);
+			geomRgba = new Float32Array(model.geom_rgba);
+			accumulator = 0;
+
+			reportMeshGeoms();
+			// Isolated: a throw in here would otherwise propagate out of
+			// loadModel and cost us the whole scene, when all that's actually
+			// lost is trajectory playback.
+			try {
+				reportJointTracks();
+			} catch (err) {
+				console.error("MuJoCo bridge: failed to report joint tracks:", err);
+			}
+
+			for (const name of bsApp.mj_bridge_watched_geom_names()) {
+				const geom = model.geom(name);
+				bsApp.mj_bridge_report_geom_id(name, geom.id);
+				geom.delete();
+			}
+			for (const name of bsApp.mj_bridge_watched_joint_names()) {
+				const joint = model.jnt(name);
+				bsApp.mj_bridge_report_joint_dof(name, joint.dofadr);
+				joint.delete();
+			}
+		}
+
+		window.__bsMujocoApplyQvel = (dofIndex, amount) => {
+			if (data) data.qvel[dofIndex] += amount;
+		};
+
+		// One frame of a replayed trajectory, already resolved to qpos
+		// addresses by MujocoScene::apply_trajectory_frame.
+		window.__bsMujocoSetQpos = (adrs, values) => {
+			if (!model || !data) return;
+			const qpos = data.qpos;
+			for (let i = 0; i < adrs.length; i++) qpos[adrs[i]] = values[i];
+			// qpos alone moves nothing the renderer can see -- geom_xpos/xmat
+			// are outputs of forward kinematics, and the Rust side draws from
+			// those. The sim isn't stepping while a clip is bound (kinematic),
+			// so nothing else will run this for us.
+			mujoco.mj_forward(model, data);
+		};
+
+		function frame(now) {
+			const generation = bsApp.mj_bridge_model_generation();
+			if (generation !== lastGeneration) {
+				lastGeneration = generation;
+				try {
+					loadModel(bsApp.mj_bridge_model_root());
+				} catch (err) {
+					console.error("MuJoCo bridge: failed to load MJCF:", err);
+				}
+			}
+
+			if (model) {
+				if (bsApp.mj_bridge_take_reset_requested()) {
+					mujoco.mj_resetData(model, data);
+					accumulator = 0;
+				}
+
+				const dt = Math.min((now - lastTime) / 1000, 0.1);
+				// A bound clip owns qpos; stepping would haul the arm back
+				// toward the position servos' targets and destroy the replay.
+				// Drop the accumulator rather than let it bank time and fire a
+				// burst of catch-up steps the moment the clip is cleared.
+				if (bsApp.mj_bridge_kinematic()) {
+					accumulator = 0;
+				} else if (bsApp.mj_bridge_playing()) {
+					accumulator += dt * bsApp.mj_bridge_speed();
+				}
+
+				let steps = 0;
+				while (accumulator >= SIM_TIMESTEP && steps < MAX_STEPS_PER_FRAME) {
+					mujoco.mj_step(model, data);
+					accumulator -= SIM_TIMESTEP;
+					steps++;
+				}
+				if (bsApp.mj_bridge_take_single_step_requested()) {
+					mujoco.mj_step(model, data);
+				}
+
+				bsApp.mj_bridge_set_geoms(
+					geomType,
+					geomSize,
+					geomRgba,
+					new Float32Array(data.geom_xpos),
+					new Float32Array(data.geom_xmat),
+				);
+			}
+
+			lastTime = now;
+			requestAnimationFrame(frame);
+		}
+
+		// Loading the MuJoCo wasm module itself is deferred until a
+		// MujocoActor actually exists (a model has been staged), so scenes
+		// without one don't pay for it.
+		async function waitForFirstModel() {
+			for (;;) {
+				if (bsApp.mj_bridge_model_generation() > 0) return;
+				await new Promise((r) => setTimeout(r, 250));
+			}
+		}
+		await waitForFirstModel();
+		const loadMujoco = (await import("./mujoco_web/mujoco.js")).default;
+		mujoco = await loadMujoco();
+		requestAnimationFrame(frame);
+	}
 
 	function viewportSize() {
 		// visualViewport reflects the actual visible area on mobile (accounts
@@ -75,6 +339,10 @@
                 `./black_splat_splat_demo_bg.wasm?v=${Date.now()}`,
                 import.meta.url
             ),
+        }).then(() => {
+            startMujocoBridge().catch((err) =>
+                console.error("MuJoCo bridge failed to start:", err)
+            );
         });
     });
 

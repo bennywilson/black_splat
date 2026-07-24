@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use black_splat::{
     egui, assets::*, config::*, editor::{self, EditorChoice, GizmoSpace, TransformGizmo}, engine::*,
-    fly_camera::*, game_object::*, input::*, renderer::*, resource::SceneLayer, touch_pads::*,
-    utils::*, log,
+    fly_camera::*, game_object::*, input::*, mujoco::{MjcfBundle, MujocoScene}, renderer::*, resource::SceneLayer,
+    touch_pads::*, trajectory::RetargetedClip, utils::*, log,
     passes::deferred::ShadowSettings,
     passes::gaussian_splat::SplatParams,
     passes::postprocess::PostProcessSettings,
@@ -543,6 +543,7 @@ enum Selection {
     Light(usize),
     Particle(usize),
     Splat(usize),
+    MujocoActor(usize),
     // The scene-wide post-process settings.  A singleton (no index): one per
     // scene for now, though it is shaped to become a per-volume list later.
     PostProcess,
@@ -568,6 +569,10 @@ enum ObjectRef {
     // in the same synchronous frame as other list edits, so name collisions
     // aren't a practical concern here.
     Splat(String),
+    // Same by-name identity as Splat: a MujocoActor's live sim can't survive
+    // a delete/recreate cycle either (see MujocoSceneActor), so it's reloaded
+    // fresh from its xml_path just like a splat reloads its .ply.
+    MujocoActor(String),
     PostProcess,
 }
 
@@ -579,7 +584,25 @@ enum ObjectSnapshot {
     Light(Light),
     Particle(SceneParticle),
     Splat(SceneSplat),
+    MujocoActor(MujocoActorSnapshot),
     PostProcess(PostProcessSettings),
+}
+
+/// Everything about a `MujocoSceneActor` except its live sim (see
+/// `MujocoSceneActor::scene`) -- what an undo/redo entry restores.  Restoring
+/// re-triggers a reload from `xml_path` rather than trying to resurrect the
+/// simulation state itself.
+#[derive(Clone)]
+struct MujocoActorSnapshot {
+    name: String,
+    xml_path: String,
+    trajectory_path: String,
+    position: CgVec3,
+    rotation: CgQuat,
+    playing: bool,
+    speed: f32,
+    looping: bool,
+    wireframe: bool,
 }
 
 /// One undoable editor action.  `Edit` covers both gizmo-transform drags and
@@ -632,6 +655,7 @@ enum AddKind {
     Light(LightType),
     Particle(usize), // index into SplatGame::particle_resources
     Splat,           // opens the .ply picker
+    MujocoActor,
 }
 
 /// A loaded splat cloud as a scene object: a display name plus its own render
@@ -640,11 +664,112 @@ enum AddKind {
 #[derive(Clone)]
 struct SceneSplat {
     name: String,
-    // Where the .ply came from (stored in saved scenes so they can reload it).
-    // Empty when there is no re-readable source (browser file picks).
+    // Where the .ply came from (stored in saved scenes so they can reload
+    // it): a real filesystem path on native, an IndexedDB cache key on web.
+    // Empty only for scenes saved before this was tracked.
     path: String,
     params: SplatParams,
     transform: ActorTransform,
+}
+
+/// A MuJoCo physics scene as a scene object: an MJCF file rendered as
+/// wireframe lines (see `black_splat::mujoco::MujocoScene`), placed by a
+/// rigid transform on top of the MJCF's own local coordinates, with live
+/// playback controls. `scene` is the live sim -- not serializable and not
+/// snapshotted for undo (see `MujocoActorSnapshot`); `loaded_path` tracks
+/// which path `scene` currently reflects so the per-frame reconcile in
+/// `tick_mujoco_actors` knows when to kick off a (re)load.
+struct MujocoSceneActor {
+    name: String,
+    xml_path: String,
+    loaded_path: String,
+    // The path an in-flight async load was dispatched for, if any -- lets
+    // tick_mujoco_actors avoid spawning a new load every frame while one is
+    // already in flight for the current xml_path.
+    pending_path: Option<String>,
+    // A recorded joint trajectory to replay over the sim instead of stepping
+    // physics (see `MujocoScene::set_kinematic`). Empty means "just simulate".
+    // These mirror the xml_path/loaded_path/pending_path reconcile above, but
+    // can only be dispatched once `scene` exists -- retargeting needs the
+    // loaded model's joint layout.
+    trajectory_path: String,
+    loaded_trajectory_path: String,
+    pending_trajectory_path: Option<String>,
+    clip: Option<RetargetedClip>,
+    // Seconds into `clip`, advanced by delta_time * speed. Not snapshotted for
+    // undo -- playback position is transient, like the sim state itself.
+    clip_time: f32,
+    looping: bool,
+    position: CgVec3,
+    rotation: CgQuat,
+    playing: bool,
+    speed: f32,
+    // Whether primitive geoms draw as wireframe lines (mesh geoms always
+    // render regardless -- see `MujocoScene::set_wireframe`).
+    wireframe: bool,
+    scene: Option<MujocoScene>,
+    // Real triangle-mesh actors for the scene's mesh-type geoms (registered
+    // into the renderer's own actor map, see `tick_mujoco_actors`) -- index-
+    // aligned with `MujocoScene::mesh_geoms`'s output, which is stable across
+    // frames since a loaded model's geom set never changes. Rebuilt whenever
+    // `scene` is (re)loaded.
+    mesh_geom_actors: Vec<Actor>,
+    // mesh .obj path -> loaded Model, so each unique mesh is only loaded once
+    // per scene load instead of every frame.
+    mesh_model_cache: std::collections::HashMap<String, ModelHandle>,
+    // Mesh paths a fetch has already been dispatched for, so a mesh isn't
+    // re-requested every frame while its load is in flight (wasm only --
+    // native loads meshes inline, see `tick_mujoco_actors`).
+    #[cfg(target_arch = "wasm32")]
+    requested_meshes: std::collections::HashSet<String>,
+}
+
+impl MujocoSceneActor {
+    fn new(name: String) -> Self {
+        MujocoSceneActor {
+            name,
+            xml_path: String::new(),
+            loaded_path: String::new(),
+            pending_path: None,
+            trajectory_path: String::new(),
+            loaded_trajectory_path: String::new(),
+            pending_trajectory_path: None,
+            clip: None,
+            clip_time: 0.0,
+            looping: true,
+            position: CG_VEC3_ZERO,
+            rotation: CG_QUAT_IDENT,
+            playing: true,
+            speed: 1.0,
+            wireframe: true,
+            scene: None,
+            mesh_geom_actors: Vec::new(),
+            mesh_model_cache: std::collections::HashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            requested_meshes: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl editor::EditorInspect for MujocoSceneActor {
+    fn inspect_properties(&mut self, visitor: &mut dyn editor::PropertyVisitor) -> bool {
+        let mut changed = false;
+        changed |= visitor.edit_text("Name", &mut self.name);
+        // XML Path is set only via the Details panel's Browse… button (see
+        // the custom UI in EditorTab::Details), not typed here.
+        changed |= visitor.edit_vec3("Position", &mut self.position);
+        changed |= visitor.edit_rotation("Rotation", &mut self.rotation);
+        changed |= visitor.edit_bool("Playing", &mut self.playing);
+        changed |= visitor.edit_float("Speed", &mut self.speed);
+        changed |= visitor.edit_bool("Looping", &mut self.looping);
+        changed |= visitor.edit_bool("Wireframe", &mut self.wireframe);
+        if let Some(scene) = &mut self.scene {
+            scene.set_playing(self.playing);
+            scene.set_speed(self.speed);
+            scene.set_wireframe(self.wireframe);
+        }
+        changed
+    }
 }
 
 /// Default render params for splat clouds
@@ -678,6 +803,8 @@ struct SceneFile {
     particles: Vec<ParticleDto>,
     #[serde(default)]
     splats: Vec<SplatDto>,
+    #[serde(default)]
+    mujoco_actors: Vec<MujocoActorDto>,
     #[serde(default)]
     post_process: Option<PostProcessDto>,
 }
@@ -833,6 +960,34 @@ impl SplatParamsDto {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct MujocoActorDto {
+    name: String,
+    #[serde(default)]
+    xml_path: String,
+    #[serde(default)]
+    trajectory_path: String,
+    #[serde(default)]
+    position: [f32; 3],
+    #[serde(default = "ident_quat")]
+    rotation: [f32; 4],
+    #[serde(default = "default_true")]
+    playing: bool,
+    #[serde(default = "default_speed_one")]
+    speed: f32,
+    #[serde(default = "default_true")]
+    looping: bool,
+    #[serde(default = "default_true")]
+    wireframe: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_speed_one() -> f32 {
+    1.0
+}
+
 /// The scene the editor opens when the user hasn't saved a startup scene of
 /// their own: the church cloud plus the default skylight, camera left at the
 /// config's start pose.
@@ -862,6 +1017,7 @@ fn default_startup_scene() -> SceneFile {
             rotation: ident_quat(),
             scale: ones3(),
         }],
+        mujoco_actors: Vec::new(),
         post_process: None,
     }
 }
@@ -1001,6 +1157,9 @@ fn add_menu_ui(ui: &mut egui::Ui, add: &mut Option<AddKind>, particle_names: &[S
     ui.separator();
     if ui.button("Gaussian Splat…").clicked() {
         *add = Some(AddKind::Splat);
+    }
+    if ui.button("Mujoco Actor").clicked() {
+        *add = Some(AddKind::MujocoActor);
     }
 }
 
@@ -1382,6 +1541,14 @@ pub struct SplatGame {
     // here for a later tick to copy into game_assets/textures/ and load
     // (mirrors picked_ply).  Native only; wasm can't write project assets.
     picked_texture: Arc<Mutex<Option<(String, Vec<u8>)>>>,
+    // "Browse…" plumbing for a MujocoSceneActor's XML Path field: (actor
+    // name, resolved xml_path) lands here for a later tick to assign. The
+    // path is a real filesystem path on native, or an IndexedDB cache key on
+    // web (see `open_mujoco_xml_picker`).
+    picked_mujoco_xml: Arc<Mutex<Option<(String, String)>>>,
+    // The same, for a MujocoSceneActor's Trajectory field (see
+    // `open_mujoco_trajectory_picker`).
+    picked_mujoco_trajectory: Arc<Mutex<Option<(String, String)>>>,
     // Object currently being renamed (double-click in the Scene tab).
     name_edit: Option<Selection>,
     // The rename field's working text.  Persists across frames -- re-deriving
@@ -1429,6 +1596,25 @@ pub struct SplatGame {
     // shown (only one renders at a time).
     scene_splats: Vec<SceneSplat>,
     active_splat: usize,
+    // MuJoCo physics actors (see MujocoSceneActor): each owns its own live
+    // sim, loaded/reloaded from xml_path by tick_mujoco_actors.
+    scene_mujoco_actors: Vec<MujocoSceneActor>,
+    // MJCF fetches that finished since the last tick: (actor name, requested
+    // path, fetch result). MujocoScene itself is only ever built on the main
+    // thread (mujoco-rs FFI state isn't Send), so the background task only
+    // gathers the model's files; tick_mujoco_actors does the parse.
+    pending_mujoco_loads: Arc<Mutex<Vec<(String, String, anyhow::Result<MjcfBundle>)>>>,
+    // Trajectory clips that finished loading + retargeting since the last
+    // tick: (actor name, requested path, result). Unlike the MJCF fetch above
+    // this does do its real work off-thread -- retargeting only touches plain
+    // data (see `trajectory::cache::load_retargeted`), no FFI state.
+    pending_mujoco_trajectories: Arc<Mutex<Vec<(String, String, anyhow::Result<RetargetedClip>)>>>,
+    // MuJoCo mesh geom .obj bytes that finished loading: (actor name, mesh
+    // path, bytes). Web only -- the renderer's own load_model suspends on
+    // IndexedDB, which the frame tick can't do, so the fetch is spawned and a
+    // later tick turns the bytes into a Model (see `tick_mujoco_actors`).
+    #[cfg(target_arch = "wasm32")]
+    pending_mujoco_meshes: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
     // "Load .ply" plumbing.  The file dialog must run asynchronously (a browser
     // file input can't block the frame loop), so it drops its result here and
     // tick_frame picks it up: (file name, source path if one exists -- native
@@ -1499,14 +1685,23 @@ impl SplatGame {
         let pick = async move {
             if let Some(file) = dialog.pick_file().await {
                 let name = file.file_name();
+                *picker_state.lock().unwrap() = PickerState::Reading(name.clone());
+                let bytes = file.read().await;
                 // Remember where the file lives when the platform can tell us
-                // (native), so saved scenes can reload the cloud by path.
+                // (native), so saved scenes can reload the cloud by path. The
+                // web build has no filesystem path, so cache the bytes into
+                // IndexedDB under a synthetic key instead -- `load_binary`
+                // checks there first, so saved scenes can reload it the same
+                // way MuJoCo trajectory picks do (see
+                // `open_mujoco_trajectory_picker`).
                 #[cfg(not(target_arch = "wasm32"))]
                 let path = Some(file.path().to_string_lossy().to_string());
                 #[cfg(target_arch = "wasm32")]
-                let path = None;
-                *picker_state.lock().unwrap() = PickerState::Reading(name.clone());
-                let bytes = file.read().await;
+                let path = {
+                    let key = format!("splats/{name}");
+                    black_splat::idb::put(&key, &bytes).await;
+                    Some(key)
+                };
                 *picked.lock().unwrap() = Some((name, path, bytes));
             }
             *picker_state.lock().unwrap() = PickerState::Idle;
@@ -1537,6 +1732,74 @@ impl SplatGame {
             };
             std::thread::spawn(move || pollster::block_on(pick));
         }
+    }
+
+    /// Opens the file dialog to pick a MuJoCo scene XML for a
+    /// MujocoSceneActor's XML Path field. Works on both platforms: native
+    /// resolves to the file's real path (read straight off disk by
+    /// `assets::load_string`); web has no real path, so the bytes are cached
+    /// into IndexedDB under a synthetic key that `load_string` also checks.
+    /// Either way, the resulting path/key lands in `picked_mujoco_xml` for a
+    /// later tick to assign.
+    fn open_mujoco_xml_picker(&self, actor_name: String) {
+        let picked = self.picked_mujoco_xml.clone();
+
+        // Native hands back the .xml's real path and stops there: MuJoCo
+        // opens the model's <include>s and meshes off disk relative to it.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dialog = rfd::AsyncFileDialog::new().add_filter("MuJoCo XML", &["xml"]);
+            let pick = async move {
+                if let Some(file) = dialog.pick_file().await {
+                    let path = file.path().to_string_lossy().into_owned();
+                    *picked.lock().unwrap() = Some((actor_name, path));
+                }
+            };
+            std::thread::spawn(move || pollster::block_on(pick));
+        }
+
+        // The web build has no filesystem behind the picked file, so it
+        // imports the model's whole folder instead (see
+        // `import_mujoco_model_folder`). Picking a lone .xml can't work: every
+        // real model references siblings, and they'd all dangle.
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            match import_mujoco_model_folder().await {
+                Ok(Some(root)) => *picked.lock().unwrap() = Some((actor_name, root)),
+                // Dialog dismissed, or an empty folder.
+                Ok(None) => {}
+                Err(e) => log!("MuJoCo model import failed: {e:?}"),
+            }
+        });
+    }
+
+    /// Opens the file dialog to pick a trajectory clip JSON for a
+    /// MujocoSceneActor's Trajectory field, landing the result in
+    /// `picked_mujoco_trajectory`. Same native/web path-vs-IndexedDB-key
+    /// split as [`open_mujoco_xml_picker`](Self::open_mujoco_xml_picker).
+    fn open_mujoco_trajectory_picker(&self, actor_name: String) {
+        let picked = self.picked_mujoco_trajectory.clone();
+        let dialog = rfd::AsyncFileDialog::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        let dialog = dialog.add_filter("Trajectory clip", &["json"]);
+        let pick = async move {
+            if let Some(file) = dialog.pick_file().await {
+                #[cfg(not(target_arch = "wasm32"))]
+                let path = file.path().to_string_lossy().into_owned();
+                #[cfg(target_arch = "wasm32")]
+                let path = {
+                    let key = format!("mujoco_trajectories/{}", file.file_name());
+                    let bytes = file.read().await;
+                    black_splat::idb::put(&key, &bytes).await;
+                    key
+                };
+                *picked.lock().unwrap() = Some((actor_name, path));
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(pick);
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || pollster::block_on(pick));
     }
 
     /// Opens the file dialog to import a glb model.  The picked file's name +
@@ -1589,6 +1852,9 @@ impl SplatGame {
             Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_name().to_string()),
             Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.name.clone()),
             Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.name.clone()),
+            Selection::MujocoActor(i) => {
+                self.scene_mujoco_actors.get(i).map(|m| m.name.clone())
+            }
             Selection::PostProcess => Some("Post Process".to_string()),
         }
     }
@@ -1600,6 +1866,7 @@ impl SplatGame {
             Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_position()),
             Selection::Particle(i) => self.scene_particles.get(i).map(|p| p.position),
             Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.transform.position),
+            Selection::MujocoActor(i) => self.scene_mujoco_actors.get(i).map(|m| m.position),
             // The post-process singleton has no world position.
             Selection::PostProcess => None,
         }
@@ -1614,6 +1881,7 @@ impl SplatGame {
             Selection::Light(i) => self.scene_lights.get(i).map(|l| l.get_rotation()),
             Selection::Particle(i) => self.scene_particles.get(i).map(|_| CG_QUAT_IDENT),
             Selection::Splat(i) => self.scene_splats.get(i).map(|s| s.transform.rotation),
+            Selection::MujocoActor(i) => self.scene_mujoco_actors.get(i).map(|m| m.rotation),
             Selection::PostProcess => None,
         }
     }
@@ -1646,6 +1914,11 @@ impl SplatGame {
                     if i == self.active_splat {
                         renderer.set_gaussian_splat_transform(&splat.transform);
                     }
+                }
+            }
+            Selection::MujocoActor(i) => {
+                if let Some(m) = self.scene_mujoco_actors.get_mut(i) {
+                    m.position = *pos;
                 }
             }
             Selection::PostProcess => {}
@@ -1712,6 +1985,12 @@ impl SplatGame {
                     }
                 }
             }
+            Selection::MujocoActor(i) => {
+                if let Some(m) = self.scene_mujoco_actors.get_mut(i) {
+                    m.position = new_pos;
+                    m.rotation = (delta_rot * m.rotation).normalize();
+                }
+            }
             Selection::PostProcess => {}
         }
     }
@@ -1738,6 +2017,10 @@ impl SplatGame {
                 .scene_splats
                 .get(i)
                 .map(|s| (s.transform.position, 4.0)),
+            Selection::MujocoActor(i) => self
+                .scene_mujoco_actors
+                .get(i)
+                .map(|m| (m.position, 1.5)),
             Selection::PostProcess => None,
         }
     }
@@ -1792,6 +2075,25 @@ impl SplatGame {
         let index = self.scene_lights.len() - 1;
         self.select_after_add(Selection::Light(index));
         if let Some((obj, snapshot)) = self.snapshot_object(Selection::Light(index)) {
+            self.undo_stack.push(UndoAction::Create {
+                obj,
+                snapshot,
+                index_hint: index,
+            });
+        }
+    }
+
+    /// Adds a new (initially unloaded) MuJoCo actor ahead of the camera and
+    /// selects it. Its Details panel's XML Path field is where the user
+    /// points it at an MJCF file -- tick_mujoco_actors loads it once set.
+    fn add_mujoco_actor(&mut self) {
+        self.next_object_num += 1;
+        let mut actor = MujocoSceneActor::new(format!("Mujoco Actor {}", self.next_object_num));
+        actor.position = self.spawn_point();
+        self.scene_mujoco_actors.push(actor);
+        let index = self.scene_mujoco_actors.len() - 1;
+        self.select_after_add(Selection::MujocoActor(index));
+        if let Some((obj, snapshot)) = self.snapshot_object(Selection::MujocoActor(index)) {
             self.undo_stack.push(UndoAction::Create {
                 obj,
                 snapshot,
@@ -1942,6 +2244,17 @@ impl SplatGame {
                     Some(i)
                 }
             }
+            Selection::MujocoActor(i) => {
+                if i >= self.scene_mujoco_actors.len() {
+                    None
+                } else {
+                    let actor = self.scene_mujoco_actors.remove(i);
+                    for mesh_actor in &actor.mesh_geom_actors {
+                        renderer.remove_actor(mesh_actor);
+                    }
+                    Some(i)
+                }
+            }
             // The post-process singleton is always present; it can't be deleted.
             Selection::PostProcess => None,
         };
@@ -1983,6 +2296,22 @@ impl SplatGame {
                 .scene_splats
                 .get(i)
                 .map(|s| (ObjectRef::Splat(s.name.clone()), ObjectSnapshot::Splat(s.clone()))),
+            Selection::MujocoActor(i) => self.scene_mujoco_actors.get(i).map(|m| {
+                (
+                    ObjectRef::MujocoActor(m.name.clone()),
+                    ObjectSnapshot::MujocoActor(MujocoActorSnapshot {
+                        name: m.name.clone(),
+                        xml_path: m.xml_path.clone(),
+                        trajectory_path: m.trajectory_path.clone(),
+                        position: m.position,
+                        rotation: m.rotation,
+                        playing: m.playing,
+                        speed: m.speed,
+                        looping: m.looping,
+                        wireframe: m.wireframe,
+                    }),
+                )
+            }),
             Selection::PostProcess => Some((
                 ObjectRef::PostProcess,
                 ObjectSnapshot::PostProcess(self.scene_post_process),
@@ -2014,6 +2343,11 @@ impl SplatGame {
                 .iter()
                 .position(|s| &s.name == name)
                 .map(Selection::Splat),
+            ObjectRef::MujocoActor(name) => self
+                .scene_mujoco_actors
+                .iter()
+                .position(|m| &m.name == name)
+                .map(Selection::MujocoActor),
             ObjectRef::PostProcess => Some(Selection::PostProcess),
         }
     }
@@ -2065,6 +2399,27 @@ impl SplatGame {
                     }
                 }
             }
+            (Selection::MujocoActor(i), ObjectSnapshot::MujocoActor(m)) => {
+                if let Some(slot) = self.scene_mujoco_actors.get_mut(i) {
+                    slot.name = m.name.clone();
+                    slot.xml_path = m.xml_path.clone();
+                    slot.trajectory_path = m.trajectory_path.clone();
+                    slot.position = m.position;
+                    slot.rotation = m.rotation;
+                    slot.playing = m.playing;
+                    slot.speed = m.speed;
+                    slot.looping = m.looping;
+                    slot.wireframe = m.wireframe;
+                    // scene/loaded_path and clip/loaded_trajectory_path are
+                    // left alone -- tick_mujoco_actors reconciles a changed
+                    // xml_path/trajectory_path against the live sim.
+                    if let Some(scene) = &mut slot.scene {
+                        scene.set_playing(slot.playing);
+                        scene.set_speed(slot.speed);
+                        scene.set_wireframe(slot.wireframe);
+                    }
+                }
+            }
             (Selection::PostProcess, ObjectSnapshot::PostProcess(pp)) => {
                 self.scene_post_process = *pp;
                 renderer.set_post_process_settings(&self.scene_post_process);
@@ -2110,6 +2465,12 @@ impl SplatGame {
                         renderer.set_gaussian_splat_params(&active.params);
                         renderer.set_gaussian_splat_transform(&active.transform);
                     }
+                }
+            }
+            Selection::MujocoActor(i) => {
+                let actor = self.scene_mujoco_actors.remove(i);
+                for mesh_actor in &actor.mesh_geom_actors {
+                    renderer.remove_actor(mesh_actor);
                 }
             }
             Selection::PostProcess => {}
@@ -2183,6 +2544,34 @@ impl SplatGame {
                 });
                 // Lands asynchronously via drain_pending_splats, which selects
                 // it once the reload completes.
+                None
+            }
+            ObjectSnapshot::MujocoActor(m) => {
+                self.scene_mujoco_actors.push(MujocoSceneActor {
+                    name: m.name.clone(),
+                    xml_path: m.xml_path.clone(),
+                    loaded_path: String::new(),
+                    pending_path: None,
+                    trajectory_path: m.trajectory_path.clone(),
+                    loaded_trajectory_path: String::new(),
+                    pending_trajectory_path: None,
+                    clip: None,
+                    clip_time: 0.0,
+                    looping: m.looping,
+                    position: m.position,
+                    rotation: m.rotation,
+                    playing: m.playing,
+                    speed: m.speed,
+                    wireframe: m.wireframe,
+                    scene: None,
+                    mesh_geom_actors: Vec::new(),
+                    mesh_model_cache: std::collections::HashMap::new(),
+                    #[cfg(target_arch = "wasm32")]
+                    requested_meshes: std::collections::HashSet::new(),
+                });
+                // scene is None / loaded_path empty, so tick_mujoco_actors
+                // reloads it from xml_path on the next tick.
+                self.select_after_add(Selection::MujocoActor(self.scene_mujoco_actors.len() - 1));
                 None
             }
             // The singleton is never deleted/recreated, only edited.
@@ -2348,6 +2737,313 @@ impl SplatGame {
         }
     }
 
+    /// Reconciles each MujocoSceneActor's live sim against its `xml_path`
+    /// field (kicking off an async reload when they diverge -- after a
+    /// Details-panel edit, undo/redo, or scene load) and steps + wireframes
+    /// every loaded one. Called once per frame from tick_frame_internal.
+    fn tick_mujoco_actors(&mut self, renderer: &mut Renderer, game_config: &Config) {
+        // Mesh .obj bytes that arrived since the last tick, turned into Models
+        // here on the render thread. Dropped on the floor if the actor is gone
+        // or has since reloaded (a stale mesh belongs to a model that no
+        // longer exists).
+        #[cfg(target_arch = "wasm32")]
+        {
+            let fetched: Vec<(String, String, Vec<u8>)> =
+                std::mem::take(&mut *self.pending_mujoco_meshes.lock().unwrap());
+            for (name, path, bytes) in fetched {
+                if !self
+                    .scene_mujoco_actors
+                    .iter()
+                    .any(|a| a.name == name && a.requested_meshes.contains(&path))
+                {
+                    continue;
+                }
+                let handle = renderer.load_model_from_bytes(&path, &bytes, false);
+                if let Some(actor) = self.scene_mujoco_actors.iter_mut().find(|a| a.name == name) {
+                    actor.mesh_model_cache.insert(path, handle);
+                }
+            }
+        }
+
+        let finished: Vec<(String, String, anyhow::Result<MjcfBundle>)> =
+            std::mem::take(&mut *self.pending_mujoco_loads.lock().unwrap());
+        for (name, path, result) in finished {
+            if let Some(actor) = self.scene_mujoco_actors.iter_mut().find(|a| a.name == name) {
+                if actor.pending_path.as_deref() == Some(path.as_str()) {
+                    actor.pending_path = None;
+                }
+                // Only apply if xml_path still matches what was requested --
+                // a further edit in the meantime gets its own load below.
+                if actor.xml_path == path {
+                    match result.and_then(MujocoScene::from_bundle) {
+                        Ok(mut scene) => {
+                            scene.set_playing(actor.playing);
+                            scene.set_speed(actor.speed);
+                            scene.set_wireframe(actor.wireframe);
+                            actor.scene = Some(scene);
+                            actor.loaded_path = path;
+                            // A clip is retargeted onto one specific model's
+                            // joint layout, so it can't carry over to a
+                            // different sim -- drop it and let the reconcile
+                            // below re-retarget against the new model.
+                            actor.clip = None;
+                            actor.loaded_trajectory_path = String::new();
+                            actor.clip_time = 0.0;
+                            // The old sim's mesh geoms (if any) no longer
+                            // correspond to anything -- drop them from the
+                            // renderer; the loop below rebuilds fresh ones
+                            // from the new scene.
+                            for mesh_actor in actor.mesh_geom_actors.drain(..) {
+                                renderer.remove_actor(&mesh_actor);
+                            }
+                            actor.mesh_model_cache.clear();
+                            // Else the new model's meshes would look already
+                            // requested and never be fetched.
+                            #[cfg(target_arch = "wasm32")]
+                            actor.requested_meshes.clear();
+                        }
+                        Err(e) => {
+                            log!("Mujoco actor '{name}' failed to load '{path}': {e}");
+                            // Mark handled so this path isn't retried every
+                            // frame; changing xml_path again will retry.
+                            actor.loaded_path = path;
+                        }
+                    }
+                }
+            }
+        }
+
+        for actor in &mut self.scene_mujoco_actors {
+            if actor.xml_path.is_empty()
+                || actor.xml_path == actor.loaded_path
+                || actor.pending_path.as_deref() == Some(actor.xml_path.as_str())
+            {
+                continue;
+            }
+            actor.pending_path = Some(actor.xml_path.clone());
+            let name = actor.name.clone();
+            let path = actor.xml_path.clone();
+            let pending = self.pending_mujoco_loads.clone();
+            let task = async move {
+                let result = MujocoScene::load_bundle(&path).await;
+                pending.lock().unwrap().push((name, path, result));
+            };
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(task);
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::spawn(move || pollster::block_on(task));
+        }
+
+        // Trajectory clips that finished loading. Same "still wanted?" guard as
+        // the MJCF drain above: an edit while the load was in flight wins.
+        let finished_clips: Vec<(String, String, anyhow::Result<RetargetedClip>)> =
+            std::mem::take(&mut *self.pending_mujoco_trajectories.lock().unwrap());
+        for (name, path, result) in finished_clips {
+            if let Some(actor) = self.scene_mujoco_actors.iter_mut().find(|a| a.name == name) {
+                if actor.pending_trajectory_path.as_deref() == Some(path.as_str()) {
+                    actor.pending_trajectory_path = None;
+                }
+                if actor.trajectory_path != path {
+                    continue;
+                }
+                actor.loaded_trajectory_path = path.clone();
+                match result {
+                    Ok(clip) => {
+                        if clip.joints.is_empty() {
+                            // Retargeting matched nothing, so playback would
+                            // silently leave the arm limp -- the usual cause is
+                            // a clip recorded against a different robot's joint
+                            // names. Say so rather than looking like a hang.
+                            log!(
+                                "Mujoco actor '{name}': trajectory '{path}' shares no joint names \
+                                 with the loaded model -- not playing it."
+                            );
+                            actor.clip = None;
+                        } else {
+                            log!(
+                                "Mujoco actor '{name}': playing '{path}' -- {} joints, {} frames.",
+                                clip.joints.len(),
+                                clip.frame_count()
+                            );
+                            actor.clip = Some(clip);
+                            actor.clip_time = 0.0;
+                        }
+                    }
+                    Err(e) => {
+                        log!("Mujoco actor '{name}' failed to load trajectory '{path}': {e}");
+                        actor.clip = None;
+                    }
+                }
+                // A clip takes the sim off physics; clearing one hands it back.
+                if let Some(scene) = &mut actor.scene {
+                    scene.set_kinematic(actor.clip.is_some());
+                }
+            }
+        }
+
+        // Dispatch trajectory loads. Unlike the MJCF reconcile this also waits
+        // on `scene` -- retargeting needs the loaded model's joint layout.
+        for actor in &mut self.scene_mujoco_actors {
+            if actor.trajectory_path == actor.loaded_trajectory_path
+                || actor.pending_trajectory_path.as_deref() == Some(actor.trajectory_path.as_str())
+            {
+                continue;
+            }
+            // Cleared field: drop the clip and resume simulating.
+            if actor.trajectory_path.is_empty() {
+                actor.clip = None;
+                actor.clip_time = 0.0;
+                actor.loaded_trajectory_path = String::new();
+                if let Some(scene) = &mut actor.scene {
+                    scene.set_kinematic(false);
+                }
+                continue;
+            }
+            let Some(scene) = &actor.scene else {
+                continue; // Retry once the sim finishes loading.
+            };
+            let target_joints = scene.joint_tracks();
+            if target_joints.is_empty() {
+                // On wasm `scene` exists as soon as the files are staged, but
+                // the joint layout only arrives once the JS side has actually
+                // parsed the model a few frames later. Retargeting against an
+                // empty layout matches nothing and would drop the clip for
+                // good, since the dispatch guard above won't fire twice for
+                // the same path. Wait for the layout instead.
+                continue;
+            }
+            actor.pending_trajectory_path = Some(actor.trajectory_path.clone());
+            let name = actor.name.clone();
+            let path = actor.trajectory_path.clone();
+            let pending = self.pending_mujoco_trajectories.clone();
+            let task = async move {
+                let result =
+                    black_splat::trajectory::cache::load_retargeted(&path, &target_joints).await;
+                pending.lock().unwrap().push((name, path, result));
+            };
+            #[cfg(target_arch = "wasm32")]
+            wasm_bindgen_futures::spawn_local(task);
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::spawn(move || pollster::block_on(task));
+        }
+
+        for actor in &mut self.scene_mujoco_actors {
+            // Drive the pose from the clip before drawing, so the wireframe and
+            // mesh geoms below both read the frame we just wrote. The sim won't
+            // step out from under it -- a bound clip sets `kinematic`. Also
+            // remembers the frame index so the unmatched-object placeholder
+            // draw below (a separate call, since it doesn't touch the sim)
+            // can read the same frame.
+            let mut clip_frame_idx = None;
+            if let (Some(scene), Some(clip)) = (&mut actor.scene, &actor.clip) {
+                let total = clip.frame_count() as f32 * clip.dt;
+                if total > 0.0 {
+                    if actor.playing {
+                        actor.clip_time += game_config.delta_time * actor.speed;
+                    }
+                    actor.clip_time = if actor.looping {
+                        actor.clip_time.rem_euclid(total)
+                    } else {
+                        actor.clip_time.clamp(0.0, total - clip.dt)
+                    };
+                    let frame = (actor.clip_time / clip.dt) as usize;
+                    let frame = frame.min(clip.frame_count() - 1);
+                    scene.apply_trajectory_frame(clip, frame);
+                    clip_frame_idx = Some(frame);
+                }
+            }
+
+            if let Some(scene) = &mut actor.scene {
+                scene.tick_and_draw_at(renderer, game_config, actor.position, actor.rotation);
+
+                if let (Some(clip), Some(frame)) = (&actor.clip, clip_frame_idx) {
+                    scene.draw_unmatched_objects(
+                        renderer,
+                        game_config,
+                        clip,
+                        frame,
+                        actor.position,
+                        actor.rotation,
+                    );
+                }
+
+                let mesh_geoms = scene.mesh_geoms(actor.position, actor.rotation);
+
+                // Native reads the .obj straight off disk, so the load can
+                // just happen here.
+                #[cfg(not(target_arch = "wasm32"))]
+                for geom in &mesh_geoms {
+                    if !actor.mesh_model_cache.contains_key(&geom.mesh_path) {
+                        let handle = pollster::block_on(renderer.load_model(&geom.mesh_path, false));
+                        actor.mesh_model_cache.insert(geom.mesh_path.clone(), handle);
+                    }
+                }
+
+                // Wasm can't: the .obj lives in IndexedDB and reading it
+                // suspends, which the frame tick can't do. Dispatch the fetch
+                // and let a later tick register the model (see the drain at
+                // the top of this function).
+                #[cfg(target_arch = "wasm32")]
+                for geom in &mesh_geoms {
+                    if actor.mesh_model_cache.contains_key(&geom.mesh_path)
+                        || !actor.requested_meshes.insert(geom.mesh_path.clone())
+                    {
+                        continue;
+                    }
+                    let name = actor.name.clone();
+                    let path = geom.mesh_path.clone();
+                    let pending = self.pending_mujoco_meshes.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match black_splat::assets::load_binary(&path).await {
+                            Ok(bytes) => pending.lock().unwrap().push((name, path, bytes)),
+                            Err(e) => log!("MuJoCo mesh {path} failed to load: {e}"),
+                        }
+                    });
+                }
+
+                // One Actor per mesh geom, index-aligned with `mesh_geoms`
+                // (stable across frames -- see the field comment on
+                // `mesh_geom_actors`). Held back until every mesh has a model:
+                // the alignment is by index, so a partial build would pair
+                // actors with the wrong geoms.
+                if actor.mesh_geom_actors.is_empty()
+                    && !mesh_geoms.is_empty()
+                    && mesh_geoms.iter().all(|g| actor.mesh_model_cache.contains_key(&g.mesh_path))
+                {
+                    for geom in &mesh_geoms {
+                        let handle = actor.mesh_model_cache[&geom.mesh_path];
+                        let mut mesh_actor = Actor::new();
+                        mesh_actor.set_model(&handle);
+                        mesh_actor.set_layer(&SceneLayer::World, &None);
+                        mesh_actor.set_exclude_from_env_capture(true);
+                        // Named by its (metallic, roughness) pair so geoms
+                        // sharing a MJCF <material> share one Material too --
+                        // create_material returns the existing handle for a
+                        // name it's already seen.
+                        let material_name =
+                            format!("mj_mr_{:.3}_{:.3}", geom.metallic, geom.roughness);
+                        let material = renderer.create_material(
+                            &material_name,
+                            &MaterialDesc {
+                                mr_constant: CgVec4::new(geom.metallic, geom.roughness, 0.0, 0.0),
+                                ..Default::default()
+                            },
+                        );
+                        mesh_actor.set_material(&material);
+                        actor.mesh_geom_actors.push(mesh_actor);
+                    }
+                }
+
+                for (mesh_actor, geom) in actor.mesh_geom_actors.iter_mut().zip(mesh_geoms.iter()) {
+                    mesh_actor.set_position(&geom.position);
+                    mesh_actor.set_rotation(&geom.rotation);
+                    mesh_actor.set_color(geom.rgba.into());
+                    renderer.add_or_update_actor(mesh_actor);
+                }
+            }
+        }
+    }
+
     /// Draws editor billboard icons for every light over the 3D view, and
     /// returns the index of a light whose icon was clicked this frame (for
     /// selection).  Point lights show a tinted disc; directional/spot lights add
@@ -2505,6 +3201,12 @@ impl SplatGame {
                     .iter()
                     .enumerate()
                     .map(|(i, p)| (Selection::Particle(i), p.position, radius_of(p.scale))),
+            )
+            .chain(
+                self.scene_mujoco_actors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| (Selection::MujocoActor(i), m.position, 1.0)),
             );
         let mut best: Option<(Selection, f32)> = None;
         for (sel, center, radius) in candidates {
@@ -2588,6 +3290,21 @@ impl SplatGame {
                     scale: vec3_arr(s.transform.scale),
                 })
                 .collect(),
+            mujoco_actors: self
+                .scene_mujoco_actors
+                .iter()
+                .map(|m| MujocoActorDto {
+                    name: m.name.clone(),
+                    xml_path: m.xml_path.clone(),
+                    trajectory_path: m.trajectory_path.clone(),
+                    position: vec3_arr(m.position),
+                    rotation: quat_arr(m.rotation),
+                    playing: m.playing,
+                    speed: m.speed,
+                    looping: m.looping,
+                    wireframe: m.wireframe,
+                })
+                .collect(),
             post_process: Some(PostProcessDto::from_settings(&self.scene_post_process)),
         }
     }
@@ -2668,6 +3385,11 @@ impl SplatGame {
         renderer.clear_gaussian_splats();
         self.active_splat = 0;
         self.pending_splats.lock().unwrap().clear();
+        for actor in self.scene_mujoco_actors.drain(..) {
+            for mesh_actor in &actor.mesh_geom_actors {
+                renderer.remove_actor(mesh_actor);
+            }
+        }
         self.selected = None;
         self.multi_selected.clear();
         self.context_menu = None;
@@ -2744,6 +3466,31 @@ impl SplatGame {
             self.game_camera.set_position(&arr_vec3(camera.position));
             self.game_camera.set_rotation(&arr_vec3(camera.rotation));
             renderer.set_camera(&self.game_camera);
+        }
+
+        for dto in &scene.mujoco_actors {
+            self.scene_mujoco_actors.push(MujocoSceneActor {
+                name: dto.name.clone(),
+                xml_path: dto.xml_path.clone(),
+                loaded_path: String::new(),
+                pending_path: None,
+                trajectory_path: dto.trajectory_path.clone(),
+                loaded_trajectory_path: String::new(),
+                pending_trajectory_path: None,
+                clip: None,
+                clip_time: 0.0,
+                looping: dto.looping,
+                position: arr_vec3(dto.position),
+                rotation: arr_quat(dto.rotation),
+                playing: dto.playing,
+                speed: dto.speed,
+                wireframe: dto.wireframe,
+                scene: None,
+                mesh_geom_actors: Vec::new(),
+                mesh_model_cache: std::collections::HashMap::new(),
+                #[cfg(target_arch = "wasm32")]
+                requested_meshes: std::collections::HashSet::new(),
+            });
         }
 
         // Scene-wide post-process (absent in scenes saved before it existed:
@@ -2884,7 +3631,7 @@ impl SplatGame {
         let mut skipped_splats = 0;
         for dto in &scene.splats {
             if dto.path.is_empty() {
-                // A cloud picked through a browser dialog: no re-readable path.
+                // Saved before splat paths were tracked: no re-readable source.
                 skipped_splats += 1;
                 continue;
             }
@@ -2905,6 +3652,91 @@ impl SplatGame {
     }
 }
 
+/// Imports a MuJoCo model's whole folder into IndexedDB, returning the key of
+/// its entry MJCF -- ready to drop straight into a `MujocoSceneActor`'s
+/// `xml_path`, since `MujocoScene::load_bundle`'s walk asks IndexedDB for
+/// exactly the keys written here. `Ok(None)` if the visitor picked nothing.
+///
+/// rfd has no folder picker on web (its wasm backend only wraps a plain
+/// `<input type="file">`), so this drives the element itself to get at
+/// `webkitdirectory` -- the one broadly-supported way a page can read a
+/// directory without asking the visitor to zip it first.
+///
+/// Nothing is uploaded: the files go from the visitor's disk straight into
+/// this origin's IndexedDB, and the model never leaves the device.
+#[cfg(target_arch = "wasm32")]
+async fn import_mujoco_model_folder() -> anyhow::Result<Option<String>> {
+    use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or_else(|| anyhow::anyhow!("no document"))?;
+    let input: web_sys::HtmlInputElement = document
+        .create_element("input")
+        .map_err(|e| anyhow::anyhow!("create <input>: {e:?}"))?
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("created element wasn't an <input>"))?;
+    input.set_type("file");
+    input.set_webkitdirectory(true);
+
+    // Resolve once the visitor confirms. A dismissed dialog fires no event in
+    // most browsers, so this can simply never resolve -- the task then parks
+    // forever holding just the input, which is why nothing else waits on it.
+    let input_for_cb = input.clone();
+    let chosen = js_sys::Promise::new(&mut move |resolve, _reject| {
+        let cb = Closure::once(Box::new(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        }) as Box<dyn FnOnce()>);
+        input_for_cb.set_onchange(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+    });
+    input.click();
+    wasm_bindgen_futures::JsFuture::from(chosen)
+        .await
+        .map_err(|e| anyhow::anyhow!("folder picker: {e:?}"))?;
+
+    let Some(files) = input.files() else {
+        return Ok(None);
+    };
+
+    // Every .xml's text, kept aside so the include graph can name the entry
+    // point once the whole folder is in (see `mujoco::find_root_mjcf`).
+    let mut mjcfs: Vec<(String, String)> = Vec::new();
+    for i in 0..files.length() {
+        let Some(file) = files.get(i) else { continue };
+        // webkitRelativePath ("panda/assets/link0_0.obj") is what makes this
+        // worth doing -- it's the model's own layout, which every <include>
+        // and <mesh file="..."> in the MJCF is written against. web-sys
+        // doesn't bind it (it's non-standard), hence the Reflect call.
+        let relative = js_sys::Reflect::get(&file, &JsValue::from_str("webkitRelativePath"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| file.name());
+        let key = format!("mujoco_scenes/{relative}");
+
+        let buffer = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+            .await
+            .map_err(|e| anyhow::anyhow!("read {relative}: {e:?}"))?;
+        let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+
+        if relative.to_ascii_lowercase().ends_with(".xml") {
+            if let Ok(text) = String::from_utf8(bytes.clone()) {
+                mjcfs.push((key.clone(), text));
+            }
+        }
+        black_splat::idb::put(&key, &bytes).await;
+    }
+
+    if mjcfs.is_empty() {
+        anyhow::bail!("no MJCF (.xml) file in the picked folder");
+    }
+    let root = black_splat::mujoco::find_root_mjcf(&mjcfs)
+        .ok_or_else(|| anyhow::anyhow!("every .xml in the folder is <include>d by another"))?;
+    log!("imported MuJoCo model: {} file(s), root {root}", files.length());
+    Ok(Some(root))
+}
+
 impl GameEngine for SplatGame {
     fn new(game_config: &Config) -> Self {
         log!("SplatGame::new()");
@@ -2916,6 +3748,12 @@ impl GameEngine for SplatGame {
             game_camera,
             scene_splats: Vec::new(),
             active_splat: 0,
+            scene_mujoco_actors: Vec::new(),
+            pending_mujoco_loads: Arc::new(Mutex::new(Vec::new())),
+            pending_mujoco_trajectories: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(target_arch = "wasm32")]
+            pending_mujoco_meshes: Arc::new(Mutex::new(Vec::new())),
+            picked_mujoco_trajectory: Arc::new(Mutex::new(None)),
             scene_actors: Vec::new(),
             scene_lights: Vec::new(),
             scene_particles: Vec::new(),
@@ -2951,6 +3789,7 @@ impl GameEngine for SplatGame {
             texture_resources: Vec::new(),
             model_resources: Vec::new(),
             picked_texture: Arc::new(Mutex::new(None)),
+            picked_mujoco_xml: Arc::new(Mutex::new(None)),
             name_edit: None,
             name_edit_buffer: String::new(),
             name_edit_focus: false,
@@ -3246,6 +4085,7 @@ impl GameEngine for SplatGame {
         let mut rename_actors: Vec<(usize, String)> = Vec::new();
         let mut rename_lights: Vec<(usize, String)> = Vec::new();
         let mut rename_particles: Vec<(usize, String)> = Vec::new();
+        let mut rename_mujoco_actors: Vec<(usize, String)> = Vec::new();
         // True when the Details panel or gizmo changed the selected object this
         // frame; the renderer's copy (actor / particle) is refreshed afterwards.
         let mut selection_edited = false;
@@ -3365,6 +4205,11 @@ impl GameEngine for SplatGame {
         let mut create_particle = false;
         let mut import_texture = false;
         let mut import_model = false;
+        // Set when the Details panel's Mujoco actor "Browse…" button is
+        // clicked; applied after the egui pass (self is still borrowed by
+        // the actor being inspected at that point).
+        let mut mujoco_xml_browse_request: Option<String> = None;
+        let mut mujoco_traj_browse_request: Option<String> = None;
         // Set to a catalog path when the user clicks a not-yet-loaded model tile
         // in the browser; applied after the egui pass (loads it, then selects).
         let mut model_load_request: Option<String> = None;
@@ -3575,15 +4420,21 @@ impl GameEngine for SplatGame {
         // Closed, it collapses to a small "Resources" tab at the bottom-left
         // corner; open, the grab strip along its top edge drags to resize.
         // The right-hand editor panel stops above it (panel_bottom).
+        const RESOURCES_COLLAPSE_HEIGHT: f32 = 60.0;
         let mut panel_bottom = screen.bottom();
         if editor {
             if self.resources_open {
                 let max_height = (screen.height() * 0.7).max(120.0);
                 self.resources_height = self.resources_height.clamp(120.0, max_height);
-                let top_y = screen.bottom() - self.resources_height;
-                panel_bottom = top_y;
+                panel_bottom = screen.bottom() - self.resources_height;
+                // Pivoted on its bottom-left corner (not positioned by top_y)
+                // so its bottom edge always sits exactly on the screen edge,
+                // even if the measured content height ever drifts from
+                // resources_height -- otherwise a gap opens below the panel
+                // and the 3D view shows through it.
                 egui::Area::new(egui::Id::new("resources_panel"))
-                    .fixed_pos(egui::pos2(screen.left(), top_y))
+                    .pivot(egui::Align2::LEFT_BOTTOM)
+                    .fixed_pos(screen.left_bottom())
                     .constrain_to(screen)
                     .show(&ctx, |ui| {
                         let frame = egui::Frame::side_top_panel(ui.style());
@@ -3599,9 +4450,17 @@ impl GameEngine for SplatGame {
                             );
                             let strip = strip.on_hover_cursor(egui::CursorIcon::ResizeVertical);
                             if strip.dragged() {
-                                self.resources_height = (self.resources_height
-                                    - strip.drag_delta().y)
-                                    .clamp(120.0, max_height);
+                                let new_height =
+                                    self.resources_height - strip.drag_delta().y;
+                                // Dragging it down past the collapse threshold
+                                // closes the panel instead of clamping to the
+                                // minimum height, so dragging to the bottom of
+                                // the screen hides it like the tab's own toggle.
+                                if new_height < RESOURCES_COLLAPSE_HEIGHT {
+                                    self.resources_open = false;
+                                } else {
+                                    self.resources_height = new_height.clamp(120.0, max_height);
+                                }
                             }
                             ui.painter().line_segment(
                                 [
@@ -4142,6 +5001,35 @@ impl GameEngine for SplatGame {
                                                 .on_hover_text("Add a particle system");
                                             },
                                         );
+
+                                        let mujoco_actor_names: Vec<String> = self
+                                            .scene_mujoco_actors
+                                            .iter()
+                                            .map(|m| m.name.clone())
+                                            .collect();
+                                        draw_outliner_section(
+                                            ui,
+                                            "Mujoco Actors",
+                                            Selection::MujocoActor,
+                                            &mujoco_actor_names,
+                                            self.selected,
+                                            &self.multi_selected,
+                                            &mut self.name_edit,
+                                            &mut self.name_edit_buffer,
+                                            &mut self.name_edit_focus,
+                                            &mut select_object,
+                                            &mut rename_mujoco_actors,
+                                            &mut self.confirm_delete,
+                                            |ui| {
+                                                if ui
+                                                    .small_button("+")
+                                                    .on_hover_text("Add a Mujoco actor")
+                                                    .clicked()
+                                                {
+                                                    do_add = Some(AddKind::MujocoActor);
+                                                }
+                                            },
+                                        );
                                     }
                                     EditorTab::Details => {
                                         // Speculative "before" snapshot: taken
@@ -4223,6 +5111,102 @@ impl GameEngine for SplatGame {
                                                 );
                                                 selection_edited |= changed;
                                                 details_edited |= changed;
+                                            }
+                                        }
+                                        Some(Selection::MujocoActor(i)) => {
+                                            if let Some(m) = self.scene_mujoco_actors.get_mut(i) {
+                                                let changed = editor::draw_properties(
+                                                    ui,
+                                                    m,
+                                                    &model_catalog,
+                                                    &material_resources,
+                                                    selected_model,
+                                                    &mut model_pick_request,
+                                                );
+                                                selection_edited |= changed;
+                                                details_edited |= changed;
+                                                ui.label("XML Path");
+                                                ui.horizontal(|ui| {
+                                                    // Display-only: xml_path is set exclusively via
+                                                    // Browse…, never typed, since on web it's an
+                                                    // IndexedDB cache key rather than a real path.
+                                                    let mut display = m.xml_path.clone();
+                                                    ui.add_enabled(
+                                                        false,
+                                                        egui::TextEdit::singleline(&mut display),
+                                                    );
+                                                    if ui.button("Browse…").clicked() {
+                                                        mujoco_xml_browse_request = Some(m.name.clone());
+                                                    }
+                                                });
+                                                ui.label("Trajectory");
+                                                ui.horizontal(|ui| {
+                                                    // Display-only, same as XML Path above.
+                                                    let mut display = m.trajectory_path.clone();
+                                                    ui.add_enabled(
+                                                        false,
+                                                        egui::TextEdit::singleline(&mut display),
+                                                    );
+                                                    if ui.button("Browse…").clicked() {
+                                                        mujoco_traj_browse_request = Some(m.name.clone());
+                                                    }
+                                                    if ui
+                                                        .add_enabled(
+                                                            !m.trajectory_path.is_empty(),
+                                                            egui::Button::new("Clear"),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        m.trajectory_path = String::new();
+                                                        selection_edited = true;
+                                                        details_edited = true;
+                                                    }
+                                                });
+                                                if let Some(clip) = &m.clip {
+                                                    let total =
+                                                        clip.frame_count() as f32 * clip.dt;
+                                                    ui.label(format!(
+                                                        "{} joints, {} frames ({:.1}s) — replaying \
+                                                         recorded qpos, physics off",
+                                                        clip.joints.len(),
+                                                        clip.frame_count(),
+                                                        total,
+                                                    ));
+                                                    let mut t = m.clip_time;
+                                                    if ui
+                                                        .add(
+                                                            egui::Slider::new(&mut t, 0.0..=total)
+                                                                .text("Time"),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        // Scrubbing is transient sim state, not a
+                                                        // property edit -- deliberately not
+                                                        // flagged for undo.
+                                                        m.clip_time = t;
+                                                    }
+                                                } else if !m.trajectory_path.is_empty() {
+                                                    ui.label("Loading trajectory…");
+                                                }
+                                                ui.separator();
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Step").clicked() {
+                                                        if let Some(scene) = &mut m.scene {
+                                                            scene.step_once();
+                                                        }
+                                                    }
+                                                    if ui.button("Reset").clicked() {
+                                                        m.clip_time = 0.0;
+                                                        if let Some(scene) = &mut m.scene {
+                                                            scene.reset();
+                                                        }
+                                                    }
+                                                });
+                                                if m.scene.is_none() && !m.xml_path.is_empty() {
+                                                    ui.label("Loading…");
+                                                } else if m.xml_path.is_empty() {
+                                                    ui.label("Set an XML Path to load a scene.");
+                                                }
                                             }
                                         }
                                         Some(Selection::PostProcess) => {
@@ -4757,6 +5741,11 @@ impl GameEngine for SplatGame {
                     self.gizmo.mode = *mode;
                 }
             }
+            if ctx.input(|input| {
+                input.key_pressed(egui::Key::S) && (input.modifiers.ctrl || input.modifiers.command)
+            }) {
+                do_save_scene = true;
+            }
         }
 
         // In-world editor icons for lights (clicking one selects it).  Kept for
@@ -4877,6 +5866,12 @@ impl GameEngine for SplatGame {
                         let u = s.transform.scale.x;
                         (s.transform.position, s.transform.rotation, CgVec3::new(u, u, u))
                     }),
+                    // No scale of its own -- feed the gizmo a fixed 1.0 so a
+                    // scale drag is a no-op rather than corrupting the sim.
+                    Selection::MujocoActor(i) => self
+                        .scene_mujoco_actors
+                        .get(i)
+                        .map(|m| (m.position, m.rotation, CG_VEC3_ONE)),
                     Selection::PostProcess => None,
                 };
                 if let Some((mut position, mut rotation, mut scale)) = current {
@@ -4935,6 +5930,12 @@ impl GameEngine for SplatGame {
                                     }
                                     let u = u.max(0.001);
                                     s.transform.scale = CgVec3::new(u, u, u);
+                                }
+                            }
+                            Selection::MujocoActor(i) => {
+                                if let Some(m) = self.scene_mujoco_actors.get_mut(i) {
+                                    m.position = position;
+                                    m.rotation = rotation;
                                 }
                             }
                             Selection::PostProcess => {}
@@ -5144,6 +6145,11 @@ impl GameEngine for SplatGame {
                 particle.name = new_name;
             }
         }
+        for (i, new_name) in rename_mujoco_actors {
+            if let Some(actor) = self.scene_mujoco_actors.get_mut(i) {
+                actor.name = new_name;
+            }
+        }
         if let Some(kind) = do_add {
             match kind {
                 AddKind::Actor => self.add_actor(renderer),
@@ -5152,6 +6158,7 @@ impl GameEngine for SplatGame {
                 // Splats come from a file, so "Add > Gaussian Splat" opens the
                 // same .ply picker as the load button.
                 AddKind::Splat => do_load = true,
+                AddKind::MujocoActor => self.add_mujoco_actor(),
             }
         }
         if let Some(sel) = delete_object {
@@ -5193,6 +6200,12 @@ impl GameEngine for SplatGame {
         }
         if import_model {
             self.open_model_picker();
+        }
+        if let Some(actor_name) = mujoco_xml_browse_request {
+            self.open_mujoco_xml_picker(actor_name);
+        }
+        if let Some(actor_name) = mujoco_traj_browse_request {
+            self.open_mujoco_trajectory_picker(actor_name);
         }
         // A model tile clicked while still unloaded: load it now (lazy), then
         // select it.  Native loads synchronously; web fetches in the background
@@ -5236,6 +6249,31 @@ impl GameEngine for SplatGame {
                         pending.lock().unwrap().push((path, bytes, false));
                     }
                 });
+            }
+        }
+        // A MuJoCo scene XML picked via the Details panel's Browse… button:
+        // assign it to the actor it was opened for. tick_mujoco_actors picks
+        // up the new xml_path next frame and (re)loads the scene.
+        let picked_mujoco_xml = self.picked_mujoco_xml.lock().unwrap().take();
+        if let Some((actor_name, path)) = picked_mujoco_xml {
+            if let Some(actor) = self
+                .scene_mujoco_actors
+                .iter_mut()
+                .find(|a| a.name == actor_name)
+            {
+                actor.xml_path = path;
+            }
+        }
+        // Likewise for a trajectory clip picked via its own Browse… button;
+        // tick_mujoco_actors retargets it against the loaded sim next frame.
+        let picked_mujoco_trajectory = self.picked_mujoco_trajectory.lock().unwrap().take();
+        if let Some((actor_name, path)) = picked_mujoco_trajectory {
+            if let Some(actor) = self
+                .scene_mujoco_actors
+                .iter_mut()
+                .find(|a| a.name == actor_name)
+            {
+                actor.trajectory_path = path;
             }
         }
         // Save requests from the browser tiles' disk buttons: write the file
@@ -5412,7 +6450,7 @@ impl GameEngine for SplatGame {
                 // filesystem).  Reject anything else rather than panic in the
                 // glb parser.
                 #[cfg(target_arch = "wasm32")]
-                let handle = if bytes.starts_with(b"glTF") {
+                let shandle = if bytes.starts_with(b"glTF") {
                     // Persist to IndexedDB in the background (bytes already in
                     // hand), and upload from those bytes for this session.
                     let (p, b) = (path.clone(), bytes.clone());
@@ -5424,7 +6462,7 @@ impl GameEngine for SplatGame {
                     None
                 };
 
-                self.status = Some(match handle {
+                self.status = Some(match shandle {
                     // The model is registered in the renderer's AssetManager by
                     // the load above; add its catalog entry so it lists too.
                     Some(_) => {
@@ -5480,6 +6518,25 @@ impl GameEngine for SplatGame {
         }
         // Upload splat clouds whose .ply bytes arrived from a scene load.
         self.drain_pending_splats(renderer);
+
+        // Reconcile + step + draw every MuJoCo actor.
+        self.tick_mujoco_actors(renderer, game_config);
+
+        // A skylight's "Bake Environment Cubemap" checkbox is a one-shot
+        // trigger (see Light::take_cubemap_bake_request): fire the bake and
+        // let the checkbox pop back up.
+        for light in &mut self.scene_lights {
+            if light.take_cubemap_bake_request() {
+                renderer.bake_skylight_cubemap(light.id, game_config);
+                renderer.add_or_update_light(light);
+            }
+            // Same one-shot pattern for "Clear Environment Cubemap": drop the
+            // baked GPU texture and fall back to the analytic gradient.
+            if light.take_cubemap_clear_request() {
+                renderer.clear_skylight_cubemap(light.id);
+                renderer.add_or_update_light(light);
+            }
+        }
 
         // Upload lazily-fetched model bytes that arrived this frame (web): browser
         // selects and scene actors whose model was still loading pop in here.
@@ -5590,8 +6647,9 @@ impl GameEngine for SplatGame {
                 Ok(info) => {
                     self.scene_splats.push(SceneSplat {
                         name: name.clone(),
-                        // Native picks give a re-readable path (stored in saved
-                        // scenes); browser picks don't.
+                        // Native: the file's real path. Web: an IndexedDB
+                        // cache key (see `open_ply_picker`). Either way,
+                        // re-readable by `load_binary` when the scene reloads.
                         path: path.unwrap_or_default(),
                         params: default_splat_params(),
                         transform: ActorTransform::from_position(CG_VEC3_ZERO),

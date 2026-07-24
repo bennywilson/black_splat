@@ -45,14 +45,20 @@ pub async fn load_binary(file_name: &str) -> anyhow::Result<Vec<u8>> {
 pub async fn load_string(file_name: &str) -> anyhow::Result<String> {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "wasm32")] {
-            let path = Path::new(file_name);
-            let file_name = format!("/rust_assets/{}", path.file_name().unwrap().to_str().unwrap());
-
-            let url = format_url(&file_name);
-            let txt = reqwest::get(url)
-                .await?
-                .text()
-                .await?;
+            // Same cache-then-fetch shape as load_binary: user-imported assets
+            // (e.g. a MuJoCo scene picked via a native-style file dialog) only
+            // ever exist in IndexedDB, since they were never on the server.
+            let txt = if let Some(cached) = crate::idb::get(file_name).await {
+                String::from_utf8(cached)?
+            } else {
+                let base = Path::new(file_name).file_name().unwrap().to_str().unwrap();
+                let url = format_url(&format!("/rust_assets/{}", base));
+                let resp = reqwest::get(url).await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("fetch {base} failed: HTTP {}", resp.status());
+                }
+                resp.text().await?
+            };
         } else {
             let txt = std::fs::read_to_string(file_name)?;
         }
@@ -620,8 +626,14 @@ impl AssetManager {
                         file_path.to_string()
                     }
                 };
-                let bytes = load_binary(&final_file_path).await.unwrap();
-                Model::from_bytes(&bytes, device_resource, self, use_holes).await
+                if final_file_path.to_ascii_lowercase().ends_with(".obj") {
+                    Model::from_obj_path(&final_file_path, device_resource, self)
+                        .await
+                        .unwrap_or_else(|e| panic!("failed to load OBJ model {final_file_path}: {e}"))
+                } else {
+                    let bytes = load_binary(&final_file_path).await.unwrap();
+                    Model::from_bytes(&bytes, device_resource, self, use_holes).await
+                }
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -636,7 +648,18 @@ impl AssetManager {
                     Some(buffer) => buffer.clone(),
                     None => load_binary(file_path).await.unwrap(),
                 };
-                Model::from_bytes(&byte_buffer, device_resource, self, use_holes).await
+                if file_path.to_ascii_lowercase().ends_with(".obj") {
+                    // MuJoCo mesh geoms (see crate::mujoco). No base_dir: an
+                    // imported model's files are in IndexedDB, not on a
+                    // filesystem a companion .mtl could be read from -- which
+                    // costs nothing here, since the geom's colour comes from
+                    // the MJCF <material> rather than the .mtl.
+                    Model::from_obj_bytes(&byte_buffer, None, device_resource, self)
+                        .await
+                        .unwrap_or_else(|e| panic!("failed to load OBJ model {file_path}: {e}"))
+                } else {
+                    Model::from_bytes(&byte_buffer, device_resource, self, use_holes).await
+                }
             }
         };
         log!("Model loaded");
@@ -663,13 +686,17 @@ impl AssetManager {
         new_handle
     }
 
-    /// Registers a model directly from in-memory glb/gltf bytes, keyed by
-    /// `file_path` (a later `load_model` with the same path returns this
-    /// handle).  Synchronous counterpart to [`load_model`](Self::load_model)
-    /// for the wasm frame tick, which can't `.await`: used by the editor's
-    /// web model import.  `Model::from_bytes` only awaits when resolving
-    /// URI-referenced external textures, which needs a filesystem and so never
-    /// happens on wasm, so the future is driven to completion in place.
+    /// Registers a model directly from in-memory bytes -- glb/gltf, or .obj
+    /// for MuJoCo mesh geoms -- keyed by `file_path` (a later `load_model`
+    /// with the same path returns this handle).  Synchronous counterpart to
+    /// [`load_model`](Self::load_model) for the wasm frame tick, which can't
+    /// `.await`: used by the editor's web model import and by
+    /// `MujocoSceneActor`'s mesh geoms.
+    ///
+    /// Both loaders only await to resolve an externally-referenced texture --
+    /// a glTF URI, or an .obj's .mtl `map_Kd` -- and neither can happen on
+    /// wasm: the first needs a filesystem, and the second needs a `base_dir`,
+    /// which is `None` here. So the future is driven to completion in place.
     #[cfg(target_arch = "wasm32")]
     pub fn add_model_from_bytes(
         &mut self,
@@ -679,13 +706,24 @@ impl AssetManager {
         use_holes: bool,
     ) -> ModelHandle {
         let bytes_vec = bytes.to_vec();
-        let new_model = crate::utils::now_or_never(Model::from_bytes(
-            &bytes_vec,
-            device_resource,
-            self,
-            use_holes,
-        ))
-        .expect("glb import future must not suspend on wasm");
+        let new_model = if file_path.to_ascii_lowercase().ends_with(".obj") {
+            crate::utils::now_or_never(Model::from_obj_bytes(
+                &bytes_vec,
+                None,
+                device_resource,
+                self,
+            ))
+            .expect("obj import future must not suspend on wasm")
+            .unwrap_or_else(|e| panic!("failed to load OBJ model {file_path}: {e}"))
+        } else {
+            crate::utils::now_or_never(Model::from_bytes(
+                &bytes_vec,
+                device_resource,
+                self,
+                use_holes,
+            ))
+            .expect("glb import future must not suspend on wasm")
+        };
 
         let mappings = &mut self.model_mappings;
         // Re-importing a name overwrites the model but keeps its handle valid.

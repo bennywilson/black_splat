@@ -21,7 +21,23 @@ json = "0.12.4"
 load_file = "1.0.1"
 log = "0.4"
 pollster = "0.3"
+# Minimal MJCF re-parse in src/mujoco.rs: resolves each <mesh>'s source .obj
+# path (mujoco-rs's own mesh_pathadr only exposes the raw, un-resolved `file`
+# attribute -- see `collect_mesh_paths`), and on wasm walks <include>/asset
+# references to gather every file the model needs (see `load_bundle`).
+roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Wavefront OBJ + MTL parsing, used by Model::from_obj_bytes (src/passes/model.rs)
+# to load MuJoCo mesh geoms straight from the .obj files MJCF <mesh> assets
+# reference.
+#
+# default-features = false to drop tobj's ahash feature. ahash is already in
+# the tree via egui, but with its runtime-rng default off; tobj would turn it
+# back on, pulling getrandom 0.3, which refuses to build for
+# wasm32-unknown-unknown without a cfg flag. tobj only uses ahash to hash
+# faster while parsing -- std's hasher is fine here.
+tobj = { version = "4.0", default-features = false }
 winit = "0.30.13"
 wgpu_text = "29"
 wasm-bindgen = "0.2.92"
@@ -36,6 +52,10 @@ features = ["png", "jpeg"]
 wgpu = "29"
 egui-winit = "0.35"
 tracy_full = {version = "1.7.1", features = ["enable"]}
+# FFI to the native MuJoCo library, backing src/mujoco.rs on native targets.
+# Optional (behind the "mujoco" feature) so games that don't use it aren't
+# forced to link/download MuJoCo.
+mujoco-rs = { version = "5.0.0", optional = true, default-features = false, features = ["auto-download-mujoco"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_log = { version = "0.2.0", features = [] }
@@ -66,3 +86,8 @@ web-sys = { version = "0.3.69", features = [
 wasm_include_2d = [] # feature has no explicit dependencies
 wasm_include_3d = [] # feature has no explicit dependencies
 wasm_include_key = [] # feature has no explicit dependencies
+# MJCF loading + wireframe rendering (src/mujoco.rs). Native drives MuJoCo
+# in-process via mujoco-rs; wasm bridges to DeepMind's official
+# `@mujoco/mujoco` wasm build running as a sibling JS-driven module (see the
+# module doc comment in src/mujoco.rs).
+mujoco = ["dep:mujoco-rs"]

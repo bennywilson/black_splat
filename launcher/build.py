@@ -47,6 +47,21 @@ WASM_ASSETS = {
         ("game_assets/models/**/*.jpg", "rust_assets"),
         ("game_assets/models/**/*.jpeg", "rust_assets"),
         ("game_assets/fx/*.png", "rust_assets"),
+        # DeepMind's official @mujoco/mujoco wasm build, for MujocoActor (see
+        # src/mujoco.rs's wasm_bridge module), plus the sample scene it can
+        # point at out of the box.
+        ("../../node_modules/@mujoco/mujoco/mujoco.js", "mujoco_web"),
+        ("../../node_modules/@mujoco/mujoco/mujoco.wasm", "mujoco_web"),
+        ("game_assets/*.xml", "rust_assets"),
+    ],
+    # DeepMind's official @mujoco/mujoco wasm build: a second, independent
+    # wasm module index.html loads alongside the app's own (see
+    # src/mujoco.rs's wasm_bridge module for the JS<->Rust handoff), plus the
+    # MJCF scene MujocoScene::load fetches at runtime.
+    "mujoco_test": [
+        ("../../node_modules/@mujoco/mujoco/mujoco.js", "mujoco_web"),
+        ("../../node_modules/@mujoco/mujoco/mujoco.wasm", "mujoco_web"),
+        ("game_assets/*.xml", "rust_assets"),
     ],
 }
 

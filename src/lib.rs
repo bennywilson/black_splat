@@ -18,8 +18,12 @@ pub mod game_object;
 #[cfg(target_arch = "wasm32")]
 pub mod idb;
 pub mod input;
+#[cfg(feature = "mujoco")]
+pub mod mujoco;
 pub mod renderer;
 pub mod resource;
+#[cfg(feature = "mujoco")]
+pub mod trajectory;
 #[cfg(target_arch = "wasm32")]
 pub mod text_agent;
 pub mod touch_pads;

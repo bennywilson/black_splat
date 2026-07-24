@@ -130,8 +130,18 @@ function ensure(name) {
 }
 
 async function init() {
-  const examples = await api('/api/examples');
+  let examples = await api('/api/examples');
   const host = document.getElementById('examples');
+
+  // Pull last used project from localStorage and move it to the front
+  const lastUsed = localStorage.getItem('last_used_project');
+  if (lastUsed) {
+    examples.sort((a, b) => {
+      if (a.name === lastUsed) return -1;
+      if (b.name === lastUsed) return 1;
+      return 0;
+    });
+  }
   for (const ex of examples) {
     ensure(ex.name);
     const card = document.createElement('div');
@@ -168,6 +178,7 @@ async function init() {
 }
 
 async function act(name, action) {
+  localStorage.setItem('last_used_project', name); // Save the choice
   const s = ensure(name);
   s.log = []; s.links = {}; s.qr = null; s.status = 'running';
   renderLinks(name); renderQr(name); renderStatus(name);
